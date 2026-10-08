@@ -148,7 +148,7 @@ export default function Landing() {
         className="pointer-events-none fixed inset-0 -z-10"
         style={{
           background:
-            "radial-gradient(900px 480px at 72% -8%, rgb(255 153 204 / 0.12), transparent 65%), radial-gradient(720px 420px at 8% 12%, rgb(135 206 235 / 0.10), transparent 60%), var(--background)",
+            "radial-gradient(900px 480px at 72% -8%, color-mix(in srgb, var(--primary) 14%, transparent), transparent 65%), radial-gradient(720px 420px at 8% 12%, color-mix(in srgb, var(--secondary) 12%, transparent), transparent 60%), var(--background)",
         }}
       />
 
@@ -498,7 +498,7 @@ export default function Landing() {
                 className="pointer-events-none absolute inset-0"
                 style={{
                   background:
-                    "radial-gradient(640px 300px at 50% -20%, rgb(255 153 204 / 0.16), transparent 70%)",
+                    "radial-gradient(640px 300px at 50% -20%, color-mix(in srgb, var(--primary) 18%, transparent), transparent 70%)",
                 }}
               />
               <h2 className="relative text-3xl font-semibold tracking-tight sm:text-4xl">
