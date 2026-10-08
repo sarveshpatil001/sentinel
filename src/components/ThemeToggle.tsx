@@ -1,11 +1,10 @@
 import { Moon, Sun } from "lucide-react";
 import { useEffect, useState } from "react";
-
-const STORAGE_KEY = "sp-theme";
+import { THEME_STORAGE_KEY, resolveTheme } from "@/lib/theme";
 
 function readTheme(): "dark" | "light" {
   try {
-    return localStorage.getItem(STORAGE_KEY) === "light" ? "light" : "dark";
+    return resolveTheme(localStorage.getItem(THEME_STORAGE_KEY));
   } catch {
     return "dark";
   }
@@ -18,7 +17,7 @@ export function ThemeToggle() {
   useEffect(() => {
     document.documentElement.classList.toggle("dark", theme === "dark");
     try {
-      localStorage.setItem(STORAGE_KEY, theme);
+      localStorage.setItem(THEME_STORAGE_KEY, theme);
     } catch {
       // storage unavailable — theme still applies for this session
     }
