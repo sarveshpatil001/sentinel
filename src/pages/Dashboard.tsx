@@ -18,6 +18,7 @@ import {
 } from "lucide-react";
 import { useNavigate } from "react-router";
 import logo from "@/assets/logo.svg";
+import { ThemeToggle } from "@/components/ThemeToggle";
 import OverviewPanel from "@/components/console/OverviewPanel";
 import DataPanel from "@/components/console/DataPanel";
 import StrategiesPanel from "@/components/console/StrategiesPanel";
@@ -89,6 +90,7 @@ export default function Dashboard() {
               <div className="text-xs font-medium">{user?.name ?? user?.email ?? "Operator"}</div>
               <div className="text-[10px] text-muted-foreground">authenticated session</div>
             </div>
+            <ThemeToggle />
             <Button
               type="button"
               variant="outline"

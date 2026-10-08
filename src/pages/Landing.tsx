@@ -21,6 +21,7 @@ import {
 } from "lucide-react";
 import { Link } from "react-router";
 import logo from "@/assets/logo.svg";
+import { ThemeToggle } from "@/components/ThemeToggle";
 
 const pipelineStages = [
   "Market Data",
@@ -169,6 +170,7 @@ export default function Landing() {
             <a href="#modes" className="transition-colors hover:text-foreground">Modes</a>
           </nav>
           <div className="flex items-center gap-2">
+            <ThemeToggle />
             <Link
               to="/auth"
               className="rounded-lg px-3.5 py-2 text-sm font-medium text-muted-foreground transition-colors hover:bg-muted hover:text-foreground"
