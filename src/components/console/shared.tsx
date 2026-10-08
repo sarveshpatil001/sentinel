@@ -61,6 +61,11 @@ const TONE_BY_STATE: Record<string, "ok" | "warn" | "bad" | "info" | "neutral" |
   // agents
   UNAVAILABLE: "warn",
   TIMEOUT: "warn",
+  // broker connections
+  PENDING_VERIFICATION: "warn",
+  VERIFIED_SIMULATED: "info",
+  ACTIVE: "ok",
+  DEGRADED: "warn",
   // misc
   SUCCESS: "ok",
   HEALTHY: "ok",

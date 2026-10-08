@@ -8,6 +8,7 @@ import {
   BadgeCheck,
   DatabaseZap,
   FlaskConical,
+  KeyRound,
   LayoutDashboard,
   LogOut,
   ScrollText,
@@ -23,6 +24,7 @@ import StrategiesPanel from "@/components/console/StrategiesPanel";
 import ValidationPanel from "@/components/console/ValidationPanel";
 import RiskPanel from "@/components/console/RiskPanel";
 import ExecutionPanel from "@/components/console/ExecutionPanel";
+import ConnectionsPanel from "@/components/console/ConnectionsPanel";
 import AgentsPanel from "@/components/console/AgentsPanel";
 import AuditPanel from "@/components/console/AuditPanel";
 import ConstitutionPanel from "@/components/console/ConstitutionPanel";
@@ -34,6 +36,7 @@ const TABS = [
   { id: "validation", label: "Validation", icon: FlaskConical },
   { id: "risk", label: "Risk & veto", icon: ShieldCheck },
   { id: "execution", label: "Execution", icon: Activity },
+  { id: "connections", label: "Broker & API keys", icon: KeyRound },
   { id: "agents", label: "Agents & learning", icon: Users },
   { id: "audit", label: "Audit", icon: ScrollText },
   { id: "constitution", label: "Constitution & reports", icon: TerminalSquare },
@@ -132,6 +135,7 @@ export default function Dashboard() {
         {tab === "validation" && <ValidationPanel />}
         {tab === "risk" && <RiskPanel />}
         {tab === "execution" && <ExecutionPanel />}
+        {tab === "connections" && <ConnectionsPanel />}
         {tab === "agents" && <AgentsPanel />}
         {tab === "audit" && <AuditPanel />}
         {tab === "constitution" && <ConstitutionPanel />}

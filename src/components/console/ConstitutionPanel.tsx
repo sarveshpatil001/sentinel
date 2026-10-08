@@ -44,6 +44,13 @@ const specGaps = [
     handling: "Agents are registered with deny-by-default scoped permissions and report UNAVAILABLE. No output is fabricated to simulate a model. Wiring an AI gateway requires provider keys and remains future approved work.",
     status: "OPEN",
   },
+  {
+    id: "SPEC-GAP-007",
+    domain: "Secrets / Credentials",
+    gap: "No KMS or secret vault exists in this environment, yet broker/platform API keys must be connected.",
+    handling: "The Broker & API keys panel stores ONLY a one-way fingerprint (SHA-256 via Web Crypto, algorithm recorded per record) plus a masked suffix; raw key material is dropped inside the register/rotate mutation and is never returned, logged or audited. A fingerprint is NOT a vault: production requires a KMS/vault integration plus provider-side revocation workflows before any live credential path is considered.",
+    status: "OPEN — VAULT REQUIRED FOR LIVE",
+  },
 ];
 
 const architectureConflicts = [

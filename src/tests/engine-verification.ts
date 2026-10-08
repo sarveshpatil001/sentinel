@@ -12,6 +12,12 @@ import { normalizeProviderResponse, validateAuthorizationScope, runPrechecks, Au
 import { validateCandles } from "../convex/lib/dataQuality";
 import { simulate, StrategyDefinition, ValidationConfig } from "../convex/lib/backtest";
 import { computeAuditHash, verifyAuditChain, AuditRecord } from "../convex/lib/audit";
+import {
+  fingerprintSecret,
+  maskKey,
+  redactedSummary,
+  validateCredentialInput,
+} from "../convex/lib/credentials";
 
 let pass = 0;
 let fail = 0;
@@ -158,6 +164,28 @@ rec.hash = computeAuditHash(rec);
 check("TEST-AUDIT-013 intact chain verifies", verifyAuditChain([rec]).valid);
 const tampered = { ...rec, detail: "forged" };
 check("TEST-AUDIT-014 tampered record detected", !verifyAuditChain([tampered]).valid);
+
+// TEST-SEC-CRED-* credential handling contract (Section 16 secret rules)
+const rawKey = "sk-live-ABCDEFGH1234567890";
+const fp1 = await fingerprintSecret(rawKey);
+const fp2 = await fingerprintSecret(rawKey);
+check("TEST-SEC-CRED-001 fingerprint is deterministic and never equals the raw key", fp1.fingerprint === fp2.fingerprint && fp1.fingerprint !== rawKey && fp1.fingerprint.length >= 16);
+const fpOther = await fingerprintSecret("sk-live-ZZZZZZZZ0000000000");
+check("TEST-SEC-CRED-002 distinct keys produce distinct fingerprints", fpOther.fingerprint !== fp1.fingerprint);
+const masked = maskKey(rawKey);
+check("TEST-SEC-CRED-003 mask reveals only the last 4 characters", masked.endsWith("7890") && !masked.includes("ABCDEFGH") && masked.includes("•"));
+const badLive = validateCredentialInput({ provider: "BINANCE", label: "ok label", environment: "CONTROLLED_LIVE", accountRef: "a1", apiKey: rawKey, permissions: ["READ_ACCOUNT"] });
+check("TEST-SEC-CRED-004a CONTROLLED_LIVE credential ingestion is refused", !badLive.ok && badLive.errors.some((e) => e.includes("Live credential ingestion is disabled")));
+const badKey = validateCredentialInput({ provider: "BINANCE", label: "ok label", environment: "PAPER", accountRef: "a1", apiKey: "short", permissions: ["READ_ACCOUNT"] });
+check("TEST-SEC-CRED-004b short key rejected", !badKey.ok);
+const badProvider = validateCredentialInput({ provider: "NOT_A_PROVIDER", label: "ok label", environment: "PAPER", accountRef: "a1", apiKey: rawKey, permissions: ["READ_ACCOUNT"] });
+check("TEST-SEC-CRED-004c unknown provider rejected", !badProvider.ok);
+const badPerms = validateCredentialInput({ provider: "BINANCE", label: "ok label", environment: "PAPER", accountRef: "a1", apiKey: rawKey, permissions: ["DROP_TABLES"] });
+check("TEST-SEC-CRED-004d unknown permissions rejected", !badPerms.ok);
+const goodInput = validateCredentialInput({ provider: "BINANCE", label: "Main demo", environment: "PAPER", accountRef: "a1", apiKey: rawKey, permissions: ["READ_ACCOUNT", "SUBMIT_ORDERS"] });
+check("TEST-SEC-CRED-006 valid PAPER input accepted", goodInput.ok);
+const summary = redactedSummary({ connectionId: "CONN-1", provider: "BINANCE", label: "Main demo", keyMasked: masked, keyFingerprint: fp1.fingerprint, status: "PENDING_VERIFICATION" });
+check("TEST-SEC-CRED-005 redacted summary contains no raw key material", !summary.includes(rawKey) && !summary.includes("ABCDEFGH") && summary.includes("••••"));
 
 console.log(`\n${pass} passed, ${fail} failed`);
 if (fail > 0) process.exit(1);

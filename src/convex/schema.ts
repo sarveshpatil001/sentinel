@@ -497,6 +497,50 @@ const schema = defineSchema(
     }).index("by_sequence", ["sequence"]),
 
     // -----------------------------------------------------------------------
+    // BROKER / PLATFORM CONNECTIONS + API CREDENTIALS (Section 16)
+    //
+    // Key material is NEVER persisted: only a non-reversible fingerprint and a
+    // masked suffix (last 4). Raw keys never leave the register/rotate mutation
+    // that receives them, are never returned to any client, and never appear in
+    // audit details (SECRET RULE: execution credentials -> execution only,
+    // frontend -> ZERO credentials, logs -> ZERO secrets).
+    // -----------------------------------------------------------------------
+    brokerConnections: defineTable({
+      connectionId: v.string(),
+      userId: v.string(),
+      provider: v.string(),
+      providerKind: v.string(),
+      label: v.string(),
+      environment: v.union(
+        v.literal("PAPER"),
+        v.literal("DEMO"),
+        v.literal("CONTROLLED_LIVE"),
+      ),
+      accountRef: v.string(),
+      permissions: v.array(v.string()),
+      keyFingerprint: v.string(),
+      fingerprintAlgo: v.string(),
+      keyMasked: v.string(),
+      secretFingerprint: v.optional(v.string()),
+      status: v.union(
+        v.literal("PENDING_VERIFICATION"),
+        v.literal("VERIFIED_SIMULATED"),
+        v.literal("ACTIVE"),
+        v.literal("DEGRADED"),
+        v.literal("REVOKED"),
+        v.literal("FAILED"),
+      ),
+      adapter: v.union(v.literal("SIMULATED"), v.literal("NOT_CONFIGURED")),
+      verificationNote: v.string(),
+      createdAt: v.number(),
+      updatedAt: v.number(),
+      rotatedAt: v.optional(v.number()),
+      revokedAt: v.optional(v.number()),
+    })
+      .index("by_connectionId", ["connectionId"])
+      .index("by_userId", ["userId"]),
+
+    // -----------------------------------------------------------------------
     // SYSTEM STATE — mode, kill switch, controlled-live gates (Section 30)
     // -----------------------------------------------------------------------
     systemState: defineTable({
