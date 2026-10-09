@@ -18,7 +18,12 @@ export default function AuditPanel() {
         action={
           data.chain.valid ? (
             <span className="inline-flex items-center gap-1.5 rounded-md border border-emerald-600/25 bg-emerald-600/10 px-2 py-1 text-[11px] font-semibold text-emerald-700 dark:text-emerald-300">
-              <Link2 className="size-3" /> chain verified ({data.events.length} records)
+              <Link2 className="size-3" />{" "}
+              {data.chain.scope === "FULL_CHAIN"
+                ? `full chain verified (${data.events.length} records)`
+                : data.chain.scope === "WINDOW"
+                  ? `window verified (${data.events.length} records) — earlier history NOT verified`
+                  : "no records — nothing verified"}
             </span>
           ) : (
             <span className="inline-flex items-center gap-1.5 rounded-md border border-red-600/25 bg-red-600/10 px-2 py-1 text-[11px] font-semibold text-red-700 dark:text-red-300">

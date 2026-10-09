@@ -91,7 +91,12 @@ export default function OverviewPanel() {
           action={
             data.auditChain.valid ? (
               <span className="inline-flex items-center gap-1.5 rounded-md border border-emerald-600/25 bg-emerald-600/10 px-2 py-1 text-[11px] font-semibold text-emerald-700 dark:text-emerald-300">
-                <Link2 className="size-3" /> chain verified
+                <Link2 className="size-3" />{" "}
+                {data.auditChain.scope === "FULL_CHAIN"
+                  ? "full chain verified from genesis"
+                  : data.auditChain.scope === "WINDOW"
+                    ? "window verified — earlier history NOT verified"
+                    : "no records — nothing verified"}
               </span>
             ) : (
               <span className="inline-flex items-center gap-1.5 rounded-md border border-red-600/25 bg-red-600/10 px-2 py-1 text-[11px] font-semibold text-red-700 dark:text-red-300">

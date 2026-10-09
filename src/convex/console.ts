@@ -26,13 +26,14 @@ import { canViewRecord } from "./lib/authz";
 
 /**
  * Anchor for verifying a recent WINDOW of the audit chain (see
- * verifyAuditChain): a mid-chain window is verified against its first
- * record's own prevHash — internal linkage and hashes are checked, the
- * anchor itself is trusted. A window starting at the chain head anchors
- * at GENESIS.
+ * verifyAuditChain): the window's FIRST record's own declared prevHash.
+ * That anchor is SELF-ATTESTED (it comes from the same log being verified),
+ * NOT independently trusted — verifyAuditChain therefore reports such
+ * ranges as `scope: "WINDOW"`, never as whole-history integrity. Only a
+ * range that genuinely starts at record 1 is ever reported as FULL_CHAIN.
  */
 function windowAnchor(sortedAsc: { sequence: number; prevHash: string }[]): string {
-  return sortedAsc.length > 0 && sortedAsc[0].sequence > 1 ? sortedAsc[0].prevHash : "GENESIS";
+  return sortedAsc.length > 0 ? sortedAsc[0].prevHash : "GENESIS";
 }
 
 async function requireUser(ctx: QueryCtx) {

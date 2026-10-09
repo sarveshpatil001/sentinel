@@ -202,6 +202,32 @@ check(
   !verifyAuditChain([rec2, windowTampered], rec2.prevHash).valid,
 );
 
+// Checkpoint honesty: a window verdict is never presented as whole-history
+// proof, and a mid-chain head claiming a GENESIS link cannot smuggle the
+// FULL_CHAIN label (the anchor is self-attested, never trusted for scope).
+check(
+  "TEST-AUDIT-017 a verified window is labeled WINDOW (history before the anchor is NOT verified)",
+  verifyAuditChain([rec2, rec3], rec2.prevHash).scope === "WINDOW" &&
+    verifyAuditChain([rec2, rec3], rec2.prevHash).note.includes("NOT verified"),
+);
+check(
+  "TEST-AUDIT-017b only a range starting at record 1 anchored at GENESIS is labeled FULL_CHAIN",
+  verifyAuditChain([rec, rec2, rec3]).scope === "FULL_CHAIN",
+);
+const spoofedHead: AuditRecord = { ...rec2, sequence: 2, prevHash: "GENESIS", hash: "" };
+spoofedHead.hash = computeAuditHash(spoofedHead);
+const spoofedNext: AuditRecord = { ...rec3, sequence: 3, prevHash: spoofedHead.hash, hash: "" };
+spoofedNext.hash = computeAuditHash(spoofedNext);
+check(
+  "TEST-AUDIT-018 a consistent mid-chain head claiming a GENESIS link is still labeled WINDOW",
+  verifyAuditChain([spoofedHead, spoofedNext], spoofedHead.prevHash).valid &&
+    verifyAuditChain([spoofedHead, spoofedNext], spoofedHead.prevHash).scope === "WINDOW",
+);
+check(
+  "TEST-AUDIT-018b an empty range reports EMPTY — nothing verified, never evidence of integrity",
+  verifyAuditChain([]).scope === "EMPTY" && verifyAuditChain([]).note.includes("NOT evidence"),
+);
+
 // TEST-SEC-CRED-* credential handling contract (Section 16 secret rules)
 const rawKey = "sk-live-ABCDEFGH1234567890";
 const fp1 = await fingerprintSecret(rawKey);

@@ -1277,5 +1277,24 @@ async function seedUsers(t: T) {
   );
 }
 
+{
+  const t = fresh();
+  const { userA } = await seedWorkspace(t, "ACK");
+  const asA = t.withIdentity({ subject: userA });
+  const empty = await asA.query(api.console.audit);
+  await seedAuthorization(t, { authorizationId: "AUTH-AUD", ownerUserId: userA });
+  await asA.mutation(api.workflows.placeOrder, placeArgs("AUTH-AUD", "IK-AUD"));
+  const after = await asA.query(api.console.audit);
+  check(
+    "DB-AUDIT-001 chain verdicts are scope-honest over the API (EMPTY / FULL_CHAIN / WINDOW, never oversold)",
+    empty.chain.scope === "EMPTY" &&
+      empty.chain.note.includes("NOT evidence") &&
+      after.chain.scope === "FULL_CHAIN" &&
+      after.chain.valid === true &&
+      after.chain.note.includes("NOT tamper-proof"),
+    JSON.stringify({ empty: empty.chain.scope, after: after.chain.scope }),
+  );
+}
+
 console.log(`\n${pass} passed, ${fail} failed`);
 if (fail > 0) process.exit(1);

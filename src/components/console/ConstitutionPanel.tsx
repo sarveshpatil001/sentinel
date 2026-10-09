@@ -51,6 +51,27 @@ const specGaps = [
     handling: "The Broker & API keys panel stores ONLY a one-way fingerprint (SHA-256 via Web Crypto, algorithm recorded per record) plus a masked suffix; raw key material is dropped inside the register/rotate mutation and is never returned, logged or audited. A fingerprint is NOT a vault: production requires a KMS/vault integration plus provider-side revocation workflows before any live credential path is considered.",
     status: "OPEN — VAULT REQUIRED FOR LIVE",
   },
+  {
+    id: "SPEC-GAP-008",
+    domain: "Authorization / Roles",
+    gap: "No process was specified for provisioning the initial administrator, yet initialization and privileged mutations require the admin role.",
+    handling: "Privileged operations are gated by the server-side admin role and every denial is audited. NOTHING is auto-provisioned (the first registered user is NOT admin). The supported out-of-band procedure is a Convex dashboard / deployment-admin role assignment; the operational runbook requires product-owner approval.",
+    status: "OPEN — PROVISIONING RUNBOOK REQUIRED",
+  },
+  {
+    id: "SPEC-GAP-009",
+    domain: "Execution / Accounts",
+    gap: "Multi-user execution on a SHARED paper account has no specified tenancy model: one user's UNKNOWN order blocks new exposure for everyone (deliberate, fail-closed) and risk accounting is pooled.",
+    handling: "DECISION A (recorded): the shared-account model is PRESERVED — the exposure gate stays GLOBAL and fail-closed while any order is UNKNOWN, and risk accounting stays account-global. Future multi-user execution requires ISOLATED per-user account ledgers with per-account exposure gates as a SEPARATE architectural requirement (docs/execution-architecture-decisions.md) — NOT implemented here.",
+    status: "OPEN — SEPARATE ARCHITECTURAL REQUIREMENT",
+  },
+  {
+    id: "SPEC-GAP-010",
+    domain: "Execution / Reconciliation",
+    gap: "No trusted server-side reconciliation service exists to resolve another user's UNKNOWN orders, and no authoritative provider ledger exists (all adapters SIMULATED/NOT_CONFIGURED).",
+    handling: "DECISION B (recorded): ordinary users may reconcile ONLY their own + shared system orders, with evidence-based transitions (an UNKNOWN order is NEVER inferred failed from a timeout), idempotent replays, state-transition validation and audit. The cross-owner trusted service is PROPOSED (smallest design in docs/execution-architecture-decisions.md) and NOT implemented — it requires approval of the evidence contract first.",
+    status: "OPEN — DESIGN AWAITING APPROVAL",
+  },
 ];
 
 const architectureConflicts = [
@@ -95,6 +116,7 @@ const architectureConflicts = [
 const securityRisks = [
   { risk: "Single-tenant demo deployment; role model (USER/ADMIN) exists but privileged-action MFA is not wired", level: "MEDIUM", mitigation: "Auth required on every query/mutation; role escalation paths documented; privileged MFA flagged for ADR." },
   { risk: "Audit chain is tamper-evident, not tamper-proof (FNV-1a, no external anchoring)", level: "MEDIUM", mitigation: "Chain verification runs in the console; SHA-256 + anchoring specified as required production work (SPEC-GAP-005)." },
+  { risk: "Console verifies a WINDOW of the audit chain (self-attested anchor) — window linkage is NOT whole-history proof", level: "MEDIUM", mitigation: "Results are labeled FULL_CHAIN vs WINDOW vs EMPTY; a range not starting at record 1 is never presented as whole-history integrity (docs/execution-architecture-decisions.md)." },
   { risk: "No real exchange/broker integration exists — provider adapters are simulated", level: "LOW (demo)", mitigation: "PROHIBITED PATHS structurally absent: no AI→exchange, frontend→exchange, learning→live-mutation code exists anywhere in the build." },
   { risk: "Prompt-injection surface exists when an AI gateway is later connected (news/web text)", level: "MEDIUM (future)", mitigation: "All external text is treated as untrusted input to scoped agents; agents hold no credentials or execution tools to steal." },
   { risk: "Secrets management: no secrets are stored in source; none are required by this build", level: "LOW", mitigation: "Environment keys are handled by the platform Keys UI; execution credentials would be isolated to the execution subsystem only." },

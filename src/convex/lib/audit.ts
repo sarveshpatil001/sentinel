@@ -56,34 +56,71 @@ export function computeAuditHash(record: Omit<AuditRecord, "hash">): string {
   return fnv1a64(canonical);
 }
 
+export type ChainScope = "FULL_CHAIN" | "WINDOW" | "EMPTY";
+
+export interface ChainVerification {
+  valid: boolean;
+  brokenAt: number | null;
+  reason: string | null;
+  /**
+   * What this verdict actually covers — never oversold:
+   *  - FULL_CHAIN: linkage verified from GENESIS over records 1..n —
+   *    whole-history integrity of THIS build's chain. It remains
+   *    tamper-EVIDENT FNV-1a, NOT tamper-proof (no external anchoring).
+   *  - WINDOW: linkage and record hashes INSIDE the verified range only,
+   *    against an anchor taken from the log ITSELF (self-attested, NOT
+   *    independently trusted). History BEFORE the anchor is NOT verified
+   *    and this result is NOT proof of it.
+   *  - EMPTY: no records in range — nothing was verified; not evidence.
+   */
+  scope: ChainScope;
+  note: string;
+}
+
 /**
  * Verify a chain — or a recent WINDOW of a longer chain; used by the console
  * to surface tamper evidence.
  *
- * `anchorPrevHash` is the hash the first record must link to. Defaults to
- * GENESIS (full chain). When verifying a WINDOW of a longer chain, pass the
- * window's first record's own prevHash: internal linkage and every record
- * hash are verified, and the anchor itself is TRUSTED — that trust is
- * declared here, never hidden.
+ * `anchorPrevHash` is the hash the first record must LINK to. Defaults to
+ * GENESIS. When verifying a WINDOW of a longer chain, pass the window's first
+ * record's own prevHash: internal linkage and every record hash are verified,
+ * and the anchor itself is TRUSTED — that trust is declared in the result
+ * (`scope: "WINDOW"`), never hidden. A range that does not start at record
+ * sequence 1 can NEVER be presented as whole-history integrity, whatever
+ * anchor it claims.
  */
 export function verifyAuditChain(
   records: AuditRecord[],
   anchorPrevHash: string = "GENESIS",
-): {
-  valid: boolean;
-  brokenAt: number | null;
-  reason: string | null;
-} {
+): ChainVerification {
+  const scope: ChainScope =
+    records.length === 0
+      ? "EMPTY"
+      : records[0].sequence === 1 && anchorPrevHash === "GENESIS"
+        ? "FULL_CHAIN"
+        : "WINDOW";
+  const note =
+    scope === "EMPTY"
+      ? "No records in the verified range — nothing was verified; this is NOT evidence of integrity."
+      : scope === "WINDOW"
+        ? "Window linkage and record hashes verified against an anchor taken from the log ITSELF (self-attested, NOT independently trusted). History BEFORE the anchor is NOT verified. Tamper-evident FNV-1a only — NOT tamper-proof."
+        : "Full chain verified from GENESIS. Tamper-evident FNV-1a chain — NOT tamper-proof (no external anchoring).";
   let prevHash = anchorPrevHash;
   for (const r of records) {
     if (r.prevHash !== prevHash) {
-      return { valid: false, brokenAt: r.sequence, reason: "prevHash linkage broken" };
+      return { valid: false, brokenAt: r.sequence, reason: "prevHash linkage broken", scope, note };
     }
     const expected = computeAuditHash({ ...r, hash: "" } as AuditRecord);
     if (expected !== r.hash) {
-      return { valid: false, brokenAt: r.sequence, reason: "record content does not match its hash" };
+      return {
+        valid: false,
+        brokenAt: r.sequence,
+        reason: "record content does not match its hash",
+        scope,
+        note,
+      };
     }
     prevHash = r.hash;
   }
-  return { valid: true, brokenAt: null, reason: null };
+  return { valid: true, brokenAt: null, reason: null, scope, note };
 }
