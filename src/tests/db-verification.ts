@@ -37,6 +37,7 @@ const modules: Record<string, () => Promise<unknown>> = {
   "../convex/workflows.ts": () => import("../convex/workflows"),
   "../convex/console.ts": () => import("../convex/console"),
   "../convex/users.ts": () => import("../convex/users"),
+  "../convex/seed.ts": () => import("../convex/seed"),
 };
 
 function fresh() {
@@ -117,6 +118,30 @@ async function seedWorkspace(
       checks: [],
       counts: { candles: 1, duplicates: 0, gaps: 0, ohlcViolations: 0, invalidValues: 0 },
       generatedAt: now,
+    });
+    // Shared SYSTEM strategy version (no ownerUserId): visible to every user,
+    // which keeps proposal/validation fixtures usable across identities.
+    await ctx.db.insert("strategyVersions", {
+      strategyVersionId: "SV-T",
+      strategyId: "STRAT-T",
+      version: 1,
+      status: "VERSION",
+      immutable: true,
+      definition: {
+        marketId: "MKT-T",
+        symbol: "BTC/USD",
+        timeframe: "1h",
+        entry: { indicator: "ema_cross", fast: 2, slow: 3 },
+        exit: { stopLossPct: 0.02, takeProfitPct: 0.02, timeExitBars: 100 },
+        filters: { rsiMin: null, rsiMax: null },
+        sizing: { kind: "fixed_fraction", fraction: 1 },
+      },
+      provenance: {
+        authorType: "HUMAN",
+        authorRef: "test-fixture",
+        rationale: "Shared system fixture version",
+        createdAt: now,
+      },
     });
     return { userA: String(userA), userB: String(userB) };
   });
@@ -720,6 +745,502 @@ const SEEDED_POLICY = {
   check(
     "DB-VAL-001b a blocked run produces metrics of nothing: no evidence, no fitness",
     evidence.length === 0 && runs.length === 1 && runs[0].metrics === null,
+  );
+}
+
+// ---------------------------------------------------------------------------
+// PRIORITY 4 EXTENSIONS — initialization auth, cross-user isolation,
+// duplicate-key disclosure, OVERLAPPING concurrency, privileged mutations
+// ---------------------------------------------------------------------------
+
+/** Users only — for tests that must start from an EMPTY deployment. */
+async function seedUsers(t: T) {
+  return await t.run(async (ctx) => {
+    const userA = await ctx.db.insert("users", { name: "User A" });
+    const userB = await ctx.db.insert("users", { name: "User B" });
+    return { userA: String(userA), userB: String(userB) };
+  });
+}
+
+// ---- DB-SEED-* — initialization is privileged, audited, idempotent --------
+
+{
+  const t = fresh();
+  const err = await t.mutation(api.seed.seed, {}).catch((e: unknown) => e);
+  const states = await t.run(async (ctx) => ctx.db.query("systemState").collect());
+  check(
+    "DB-SEED-001 unauthenticated seed is rejected and initializes nothing",
+    err instanceof Error && err.message.includes("UNAUTHENTICATED") && states.length === 0,
+    String(err),
+  );
+}
+
+{
+  const t = fresh();
+  const { userA } = await seedUsers(t);
+  const asA = t.withIdentity({ subject: userA });
+  const res = await asA.mutation(api.seed.seed, {});
+  const states = await t.run(async (ctx) => ctx.db.query("systemState").collect());
+  const denied = await t.run(async (ctx) =>
+    ctx.db
+      .query("auditEvents")
+      .filter((q) => q.eq(q.field("action"), "SYSTEM_INITIALIZATION_DENIED"))
+      .collect(),
+  );
+  check(
+    "DB-SEED-002 non-admin initialization is refused, audited, and writes no state",
+    "ok" in res && res.ok === false && states.length === 0 && denied.length === 1,
+    JSON.stringify(res),
+  );
+}
+
+{
+  const t = fresh();
+  const { userA } = await seedUsers(t);
+  // Test fixture only: SIMULATES the documented out-of-band admin provisioning
+  // (SPEC-GAP-008). Product code never provisions admin automatically.
+  await t.run(async (ctx) => ctx.db.patch(userA as never, { role: "admin" }));
+  const asAdmin = t.withIdentity({ subject: userA });
+  const res = await asAdmin.mutation(api.seed.seed, {});
+  const state = await t.run(async (ctx) => ctx.db.query("systemState").first());
+  const init = await t.run(async (ctx) =>
+    ctx.db
+      .query("auditEvents")
+      .filter((q) => q.eq(q.field("action"), "SYSTEM_INITIALIZED"))
+      .collect(),
+  );
+  check(
+    "DB-SEED-003 admin initialization works and leaves the kill-switch policy untouched (PAPER, released, no auto-resume)",
+    "alreadySeeded" in res &&
+      res.alreadySeeded === false &&
+      state?.mode === "PAPER" &&
+      state?.killSwitchEngaged === false &&
+      state?.liveAutoResume === false &&
+      init.length === 1 &&
+      init[0].actor === `user:${userA}`,
+    JSON.stringify({ res, mode: state?.mode, ks: state?.killSwitchEngaged }),
+  );
+}
+
+{
+  const t = fresh();
+  const { userA } = await seedUsers(t);
+  await t.run(async (ctx) => ctx.db.patch(userA as never, { role: "admin" }));
+  const asAdmin = t.withIdentity({ subject: userA });
+  await asAdmin.mutation(api.seed.seed, {});
+  await asAdmin.mutation(api.workflows.setKillSwitch, { engaged: true, reason: "db-verification" });
+  const again = await asAdmin.mutation(api.seed.seed, {});
+  const state = await t.run(async (ctx) => ctx.db.query("systemState").first());
+  const markets = await t.run(async (ctx) => ctx.db.query("markets").collect());
+  check(
+    "DB-SEED-004 re-running seed is a no-op: existing state (incl. engaged kill switch) is never reset",
+    "alreadySeeded" in again &&
+      again.alreadySeeded === true &&
+      state?.killSwitchEngaged === true &&
+      markets.length === 3,
+    JSON.stringify({ again, ks: state?.killSwitchEngaged, markets: markets.length }),
+  );
+}
+
+// ---- DB-AUTHZ-004 — private strategy versions are owner-bound -------------
+
+{
+  const t = fresh();
+  const { userA, userB } = await seedWorkspace(t, "ACK");
+  const now = Date.now();
+  await t.run(async (ctx) =>
+    ctx.db.insert("strategyVersions", {
+      strategyVersionId: "SV-PRIVATE-A",
+      strategyId: "STRAT-PRIV-A",
+      version: 1,
+      status: "VERSION",
+      immutable: true,
+      definition: {
+        marketId: "MKT-T",
+        symbol: "BTC/USD",
+        timeframe: "1h",
+        entry: { indicator: "ema_cross", fast: 2, slow: 3 },
+        exit: { stopLossPct: 0.02, takeProfitPct: 0.02, timeExitBars: 100 },
+        filters: { rsiMin: null, rsiMax: null },
+        sizing: { kind: "fixed_fraction", fraction: 1 },
+      },
+      provenance: {
+        authorType: "HUMAN",
+        authorRef: "test-fixture",
+        rationale: "Private fixture version owned by user A",
+        createdAt: now,
+      },
+      ownerUserId: userA,
+    }),
+  );
+  const asB = t.withIdentity({ subject: userB });
+  const proposal = await asB.mutation(api.workflows.submitTradeProposal, {
+    strategyVersionId: "SV-PRIVATE-A",
+    marketId: "MKT-T",
+    side: "BUY",
+    quantity: 0.1,
+    referencePrice: 62000,
+    idempotencyKey: "PK-PRIV",
+  });
+  const decisions = await t.run(async (ctx) => ctx.db.query("riskDecisions").collect());
+  check(
+    "DB-AUTHZ-004 a foreign strategy version cannot back a proposal (not-found ≡ not-owned)",
+    proposal.outcome === "BLOCK" &&
+      proposal.riskDecisionId === null &&
+      proposal.checks.some((c) => c.check === "strategy_version_access") &&
+      decisions.length === 0,
+    JSON.stringify(proposal.checks),
+  );
+  const validation = await asB.mutation(api.workflows.runValidation, {
+    strategyVersionId: "SV-PRIVATE-A",
+  });
+  const runs = await t.run(async (ctx) => ctx.db.query("validationRuns").collect());
+  check(
+    "DB-AUTHZ-004b a foreign strategy version cannot be validated (no validation record created)",
+    validation.ok === false && runs.length === 0,
+    JSON.stringify(validation),
+  );
+}
+
+// ---- DB-ISO-001 — five private record classes stay invisible -------------
+
+{
+  const t = fresh();
+  const { userA, userB } = await seedWorkspace(t, "ACK");
+  const now = Date.now();
+  await t.run(async (ctx) => {
+    await ctx.db.insert("strategies", {
+      strategyId: "STRAT-B",
+      name: "B private strategy",
+      description: "owned by user B",
+      marketId: "MKT-T",
+      timeframe: "1h",
+      ownerUserId: userB,
+      createdAt: now,
+    });
+    await ctx.db.insert("strategyVersions", {
+      strategyVersionId: "SV-B",
+      strategyId: "STRAT-B",
+      version: 1,
+      status: "VERSION",
+      immutable: true,
+      definition: { marketId: "MKT-T" },
+      provenance: {
+        authorType: "HUMAN",
+        authorRef: "test-fixture",
+        rationale: "private",
+        createdAt: now,
+      },
+      ownerUserId: userB,
+    });
+    await ctx.db.insert("validationRuns", {
+      validationId: "VAL-B",
+      strategyVersionId: "SV-B",
+      dataSnapshotId: "SNAP-B",
+      validationConfigVersion: "v",
+      engineVersion: "e",
+      featureVersion: "f",
+      costModelVersion: "c",
+      executionModelVersion: "x",
+      state: "COMPLETED",
+      integrity: [],
+      leakageState: "NOT_ASSESSABLE",
+      metrics: null,
+      stress: null,
+      oos: null,
+      createdAt: now,
+      completedAt: now,
+      ownerUserId: userB,
+    });
+    await ctx.db.insert("evidenceRecords", {
+      evidenceId: "EV-B",
+      validationId: "VAL-B",
+      strategyVersionId: "SV-B",
+      level: "WEAK",
+      rubricVersion: "r",
+      factors: {},
+      rationale: [],
+      createdAt: now,
+      ownerUserId: userB,
+    });
+    await ctx.db.insert("botFitnessRecords", {
+      fitnessId: "FIT-B",
+      strategyVersionId: "SV-B",
+      dimensions: {},
+      verdict: "MIXED",
+      createdAt: now,
+      ownerUserId: userB,
+    });
+    await ctx.db.insert("positions", {
+      positionId: "POS-B",
+      account: "PAPER:paper-account",
+      marketId: "MKT-T",
+      symbol: "BTC/USD",
+      side: "LONG",
+      quantity: 1,
+      avgEntryPrice: 100,
+      realizedPnl: 0,
+      source: "PAPER",
+      updatedAt: now,
+      ownerUserId: userB,
+    });
+    await ctx.db.insert("monitoringEvents", {
+      monitorId: "MON-B",
+      scope: "order",
+      scopeId: "ORD-B",
+      state: "WARNING",
+      observation: "user B private monitoring event",
+      recommendation: "none",
+      createdAt: now,
+      ownerUserId: userB,
+    });
+  });
+  await seedAuthorization(t, { authorizationId: "AUTH-ISO-B", ownerUserId: userB });
+  await t
+    .withIdentity({ subject: userB })
+    .mutation(api.workflows.placeOrder, placeArgs("AUTH-ISO-B", "IK-ISO-B"));
+
+  const asA = t.withIdentity({ subject: userA });
+  const stratsA = await asA.query(api.console.strategies);
+  const valA = await asA.query(api.console.validation);
+  const execA = await asA.query(api.console.execution);
+  const overviewA = await asA.query(api.console.overview);
+  check(
+    "DB-ISO-001 user A cannot see user B's private strategies or versions",
+    !stratsA.strategies.some((s) => s.strategyId === "STRAT-B") &&
+      !stratsA.versions.some((v) => v.strategyVersionId === "SV-B"),
+  );
+  check(
+    "DB-ISO-001b user A cannot see user B's private validation records (runs, evidence, fitness)",
+    !valA.runs.some((r) => r.validationId === "VAL-B") &&
+      !valA.evidence.some((e) => e.evidenceId === "EV-B") &&
+      !valA.fitness.some((f) => f.fitnessId === "FIT-B"),
+  );
+  check(
+    "DB-ISO-001c user A cannot see user B's private positions, monitoring events, or orders",
+    !execA.positions.some((p) => p.positionId === "POS-B") &&
+      !execA.monitoring.some((m) => m.monitorId === "MON-B") &&
+      !execA.orders.some((o) => o.ownerUserId === userB),
+  );
+  check(
+    "DB-ISO-001d overview aggregates never leak private validation records or foreign version counts",
+    !overviewA.latestValidations.some((r) => r.validationId === "VAL-B") &&
+      overviewA.strategyVersionCount === 1,
+    `count=${overviewA.strategyVersionCount}`,
+  );
+
+  const asB2 = t.withIdentity({ subject: userB });
+  const stratsB = await asB2.query(api.console.strategies);
+  const valB = await asB2.query(api.console.validation);
+  const execB = await asB2.query(api.console.execution);
+  const overviewB = await asB2.query(api.console.overview);
+  check(
+    "DB-ISO-001e the owner sees all of their own records (positive control)",
+    stratsB.strategies.some((s) => s.strategyId === "STRAT-B") &&
+      stratsB.versions.some((v) => v.strategyVersionId === "SV-B") &&
+      valB.runs.some((r) => r.validationId === "VAL-B") &&
+      valB.evidence.some((e) => e.evidenceId === "EV-B") &&
+      valB.fitness.some((f) => f.fitnessId === "FIT-B") &&
+      execB.positions.some((p) => p.positionId === "POS-B") &&
+      execB.monitoring.some((m) => m.monitorId === "MON-B") &&
+      execB.orders.some((o) => o.orderId === "ORD-IK-ISO-B") &&
+      overviewB.strategyVersionCount === 2,
+  );
+}
+
+// ---- DB-DISCLOSE-001 — duplicate-key responses leak nothing --------------
+
+{
+  const t = fresh();
+  const { userA, userB } = await seedWorkspace(t, "ACK");
+  await seedAuthorization(t, { authorizationId: "AUTH-D1", ownerUserId: userA });
+  await seedAuthorization(t, { authorizationId: "AUTH-D2", ownerUserId: userB });
+  const asA = t.withIdentity({ subject: userA });
+  const asB = t.withIdentity({ subject: userB });
+
+  await asA.mutation(api.workflows.placeOrder, placeArgs("AUTH-D1", "IK-SHARED"));
+  const probe = await asB.mutation(api.workflows.placeOrder, placeArgs("AUTH-D2", "IK-SHARED"));
+  const orders = await ordersIn(t);
+  check(
+    "DB-DISCLOSE-001 a duplicate-key response reveals no order id/state of another user",
+    probe.deduped === false &&
+      probe.orderId === null &&
+      probe.state === "REJECTED" &&
+      !probe.note.includes("ORD-") &&
+      !probe.note.includes("ACKNOWLEDGED") &&
+      orders.length === 1,
+    JSON.stringify(probe),
+  );
+  const auth2 = await t.run(async (ctx) =>
+    ctx.db
+      .query("executionAuthorizations")
+      .filter((q) => q.eq(q.field("authorizationId"), "AUTH-D2"))
+      .first(),
+  );
+  check(
+    "DB-DISCLOSE-001b the probe consumes nothing and the owner's order is untouched",
+    auth2?.state === "APPROVED" &&
+      orders[0].state === "ACKNOWLEDGED" &&
+      orders[0].ownerUserId === userA,
+  );
+  const ownerReplay = await asA.mutation(api.workflows.placeOrder, placeArgs("AUTH-D1", "IK-SHARED"));
+  check(
+    "DB-DISCLOSE-001c duplicate-submission protection is preserved for the owner",
+    ownerReplay.deduped === true && ownerReplay.orderId === "ORD-IK-SHARED",
+  );
+}
+
+// ---- DB-CONC-* — OVERLAPPING requests (same-tick dispatch) ----------------
+// Note (honest): convex-test serializes top-level transactions exactly as
+// Convex does; these tests dispatch the requests OVERLAPPING (one tick) and
+// assert the serialization invariant. True OCC retry interleaving is backend
+// behavior and is reported as untested.
+
+{
+  const t = fresh();
+  const { userA } = await seedWorkspace(t, "ACK");
+  await seedAuthorization(t, { authorizationId: "AUTH-Q", ownerUserId: userA });
+  const asA = t.withIdentity({ subject: userA });
+  const results = await Promise.all(
+    ["IK-Q1", "IK-Q2", "IK-Q3", "IK-Q4"].map((k) =>
+      asA.mutation(api.workflows.placeOrder, placeArgs("AUTH-Q", k)),
+    ),
+  );
+  const orders = await ordersIn(t);
+  const submitted = orders.filter((o) => o.state !== "REJECTED");
+  const states = results.map((r) => r.state).sort();
+  check(
+    "DB-CONC-001 four OVERLAPPING submissions of one authorization -> exactly one order intent survives",
+    submitted.length === 1 &&
+      orders.length === 4 &&
+      JSON.stringify(states) ===
+        JSON.stringify(["ACKNOWLEDGED", "REJECTED", "REJECTED", "REJECTED"]),
+    `states=${JSON.stringify(states)} orders=${orders.length}`,
+  );
+  const auth = await t.run(async (ctx) =>
+    ctx.db
+      .query("executionAuthorizations")
+      .filter((q) => q.eq(q.field("authorizationId"), "AUTH-Q"))
+      .first(),
+  );
+  check(
+    "DB-CONC-001b the surviving order owns the single consumption",
+    auth?.state === "CONSUMED" && auth?.consumedByOrderId === submitted[0]?.orderId,
+  );
+}
+
+{
+  const t = fresh();
+  const { userA, userB } = await seedWorkspace(t, "ACK");
+  await seedAuthorization(t, { authorizationId: "AUTH-RACE-A", ownerUserId: userA });
+  await seedAuthorization(t, { authorizationId: "AUTH-RACE-B", ownerUserId: userB });
+  const asA = t.withIdentity({ subject: userA });
+  const asB = t.withIdentity({ subject: userB });
+  // Two users race for ONE idempotency key with overlapping dispatch.
+  const [ra, rb] = await Promise.all([
+    asA.mutation(api.workflows.placeOrder, placeArgs("AUTH-RACE-A", "IK-RACE")),
+    asB.mutation(api.workflows.placeOrder, placeArgs("AUTH-RACE-B", "IK-RACE")),
+  ]);
+  const orders = await ordersIn(t);
+  const responses = [ra, rb];
+  const rejected = responses.filter((r) => r.state === "REJECTED");
+  const winners = responses.filter((r) => r.state !== "REJECTED");
+  check(
+    "DB-CONC-002 an overlapping duplicate-key race creates exactly one order intent",
+    orders.length === 1 && winners.length === 1,
+    `orders=${orders.length} winners=${winners.length}`,
+  );
+  check(
+    "DB-CONC-002b the losing response discloses nothing about the winning order",
+    rejected.length === 1 &&
+      rejected[0].orderId === null &&
+      !rejected[0].note.includes("ORD-") &&
+      !rejected[0].note.includes("ACKNOWLEDGED"),
+    JSON.stringify(rejected),
+  );
+}
+
+// ---- DB-PRIV-* — unauthorized users cannot perform privileged mutations ---
+
+{
+  const t = fresh();
+  const { userA, userB } = await seedWorkspace(t, "ACK");
+  await t.run(async (ctx) =>
+    ctx.db.insert("riskPolicies", { ...SEEDED_POLICY, createdAt: Date.now() }),
+  );
+  const asA = t.withIdentity({ subject: userA });
+
+  const roleRes = await asA.mutation(api.workflows.grantRole, {
+    targetUserId: userB,
+    role: "admin",
+    reason: "db-verification",
+  });
+  const users = await t.run(async (ctx) => ctx.db.query("users").collect());
+  const target = users.find((u) => u.name === "User B");
+  check(
+    "DB-PRIV-001 non-admin cannot change roles",
+    roleRes.ok === false && target?.role === undefined,
+  );
+
+  const polRes = await asA.mutation(api.workflows.approveRiskPolicy, {
+    policyId: "RISK-POLICY-CORE",
+    version: 1,
+    attestation: "db-verification",
+  });
+  const policy = await t.run(async (ctx) => ctx.db.query("riskPolicies").first());
+  check(
+    "DB-PRIV-002 non-admin cannot ratify a risk policy (it stays PROVISIONAL)",
+    polRes.ok === false && policy?.status === "PROVISIONAL",
+  );
+
+  const simRes = await asA.mutation(api.workflows.setSimulatedProviderBehavior, {
+    behavior: "FILL",
+    reason: "db-verification",
+  });
+  const state = await t.run(async (ctx) => ctx.db.query("systemState").first());
+  check(
+    "DB-PRIV-003 non-admin cannot change the simulation configuration",
+    simRes.ok === false && state?.simulatedProviderBehavior === "ACK",
+  );
+
+  const engage = await asA.mutation(api.workflows.setKillSwitch, {
+    engaged: true,
+    reason: "db-verification",
+  });
+  const release = await asA.mutation(api.workflows.setKillSwitch, {
+    engaged: false,
+    reason: "db-verification",
+  });
+  const state2 = await t.run(async (ctx) => ctx.db.query("systemState").first());
+  check(
+    "DB-PRIV-004 kill switch: engage is open (fail-safe), release is admin-only and it stays engaged",
+    engage.ok === true && release.ok === false && state2?.killSwitchEngaged === true,
+    JSON.stringify({ engage, release }),
+  );
+  const denials = await t.run(async (ctx) =>
+    ctx.db.query("auditEvents").filter((q) => q.eq(q.field("outcome"), "DENIED")).collect(),
+  );
+  check(
+    "DB-PRIV-004b every privileged denial is recorded in the audit log",
+    denials.length === 4,
+    `denials=${denials.length}`,
+  );
+}
+
+{
+  const t = fresh();
+  const err = await t
+    .mutation(api.workflows.grantRole, {
+      targetUserId: "u",
+      role: "admin",
+      reason: "db-verification",
+    })
+    .catch((e: unknown) => e);
+  const users = await t.run(async (ctx) => ctx.db.query("users").collect());
+  check(
+    "DB-PRIV-005 unauthenticated privileged mutations are rejected",
+    err instanceof Error && err.message.includes("UNAUTHENTICATED") && users.length === 0,
+    String(err),
   );
 }
 

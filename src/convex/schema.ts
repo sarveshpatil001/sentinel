@@ -275,6 +275,8 @@ const schema = defineSchema(
         promptConfigVersion: v.optional(v.string()),
         createdAt: v.number(),
       }),
+      // Owner of the version (server-derived; undefined = shared SYSTEM record).
+      ownerUserId: v.optional(v.string()),
     }).index("by_versionId", ["strategyVersionId"]),
 
     // -----------------------------------------------------------------------
@@ -303,6 +305,8 @@ const schema = defineSchema(
       oos: v.any(),
       createdAt: v.number(),
       completedAt: v.optional(v.number()),
+      // Owner of the run (server-derived; undefined = shared SYSTEM record).
+      ownerUserId: v.optional(v.string()),
     }).index("by_strategyVersion", ["strategyVersionId"]),
 
     evidenceRecords: defineTable({
@@ -314,6 +318,8 @@ const schema = defineSchema(
       factors: v.any(),
       rationale: v.array(v.string()),
       createdAt: v.number(),
+      // Owner (server-derived; undefined = shared SYSTEM record).
+      ownerUserId: v.optional(v.string()),
     }).index("by_strategyVersion", ["strategyVersionId"]),
 
     botFitnessRecords: defineTable({
@@ -322,6 +328,8 @@ const schema = defineSchema(
       dimensions: v.any(),
       verdict: v.string(),
       createdAt: v.number(),
+      // Owner (server-derived; undefined = shared SYSTEM record).
+      ownerUserId: v.optional(v.string()),
     }).index("by_strategyVersion", ["strategyVersionId"]),
 
     // -----------------------------------------------------------------------
@@ -444,6 +452,8 @@ const schema = defineSchema(
       realizedPnl: v.number(),
       source: v.string(),
       updatedAt: v.number(),
+      // Owner of the position (server-derived; undefined = shared SYSTEM record).
+      ownerUserId: v.optional(v.string()),
     }).index("by_market", ["marketId"]),
 
     // -----------------------------------------------------------------------
@@ -457,6 +467,8 @@ const schema = defineSchema(
       observation: v.string(),
       recommendation: v.optional(v.string()),
       createdAt: v.number(),
+      // Owner (server-derived; undefined = shared SYSTEM record).
+      ownerUserId: v.optional(v.string()),
     }).index("by_scopeId", ["scopeId"]),
 
     learningEvents: defineTable({

@@ -173,6 +173,28 @@ export const submitTradeProposal = mutation({
     const userId = await requireUser(ctx);
     const now = Date.now();
 
+    // OWNERSHIP: a proposal acts on a strategy version. Private versions are
+    // usable by their owner only — not-found and not-owned are
+    // indistinguishable (no IDOR oracle), and no risk decision is recorded.
+    const version = await ctx.db
+      .query("strategyVersions")
+      .withIndex("by_versionId", (q) => q.eq("strategyVersionId", args.strategyVersionId))
+      .first();
+    if (!version || !canViewRecord(version.ownerUserId, userId)) {
+      return {
+        riskDecisionId: null as string | null,
+        outcome: "BLOCK" as const,
+        authorizationId: null as string | null,
+        checks: [
+          {
+            check: "strategy_version_access",
+            status: "BLOCK" as const,
+            detail: "Strategy version not found.",
+          },
+        ],
+      };
+    }
+
     const { ctx: riskCtx, policy } = await loadRiskContext(ctx, {
       strategyVersionId: args.strategyVersionId,
       marketId: args.marketId,
@@ -311,11 +333,24 @@ export const placeOrder = mutation({
     const now = Date.now();
 
     // Idempotency: duplicate protection for every external financial mutation.
+    // The key namespace is GLOBAL (one key -> at most one external mutation),
+    // but the existing order's id and state are visible to its OWNER only — a
+    // duplicate key must never disclose another user's order (no IDOR oracle).
     const existing = await ctx.db
       .query("orders")
       .withIndex("by_idempotencyKey", (q) => q.eq("idempotencyKey", args.idempotencyKey))
       .first();
     if (existing) {
+      if (!canViewRecord(existing.ownerUserId, userId)) {
+        // Foreign key collision: indistinguishable from any other rejected
+        // intent. No order id, no state, no owner leaks — and no row is created.
+        return {
+          deduped: false as const,
+          orderId: null as string | null,
+          state: "REJECTED" as const,
+          note: "Order intent rejected — no external mutation performed.",
+        };
+      }
       return {
         deduped: true as const,
         orderId: existing.orderId,
@@ -443,9 +478,13 @@ export const placeOrder = mutation({
         // Canonical position accounting. `fillDelta` guards against duplicate
         // fill application (a repeated provider fill event adds 0).
         const delta = fillDelta(filledQuantity, 0);
+        // Position rows are USER-OWNED: a fill only ever updates the caller's
+        // own position. Shared SYSTEM rows (e.g. seeded demo positions) are
+        // never merged into — a new owner-bound row is created instead.
         const existingPos = await ctx.db
           .query("positions")
           .withIndex("by_market", (q) => q.eq("marketId", args.marketId))
+          .filter((q) => q.eq(q.field("ownerUserId"), userId))
           .first();
         const prev: PositionState | null = existingPos
           ? {
@@ -476,6 +515,7 @@ export const placeOrder = mutation({
             realizedPnl: next.realizedPnl,
             source: "PAPER",
             updatedAt: now + 6,
+            ownerUserId: userId,
           });
         }
 
@@ -559,7 +599,12 @@ export const reconcile = mutation({
   handler: async (ctx) => {
     const userId = await requireUser(ctx);
     const now = Date.now();
-    const orders = await ctx.db.query("orders").take(500);
+    // OWNERSHIP: reconciliation only touches records the caller may act on —
+    // their OWN orders plus shared SYSTEM records. A foreign UNKNOWN order is
+    // its owner's to reconcile; it stays fail-closed for everyone else.
+    const orders = (await ctx.db.query("orders").take(500)).filter((o) =>
+      canViewRecord(o.ownerUserId, userId),
+    );
 
     const resolved: { orderId: string; from: string; to: string }[] = [];
     const unresolved: string[] = [];
@@ -650,11 +695,16 @@ export const runValidation = mutation({
     const userId = await requireUser(ctx);
     const now = Date.now();
 
+    // OWNERSHIP: a validation run consumes a strategy version. Private
+    // versions belong to their owner — not-found and not-owned are
+    // indistinguishable (no IDOR oracle).
     const version = await ctx.db
       .query("strategyVersions")
       .withIndex("by_versionId", (q) => q.eq("strategyVersionId", args.strategyVersionId))
       .first();
-    if (!version) return { ok: false as const, reason: "Strategy version not found." };
+    if (!version || !canViewRecord(version.ownerUserId, userId)) {
+      return { ok: false as const, reason: "Strategy version not found." };
+    }
 
     const definition = version.definition as StrategyDefinition;
     const candles = (await ctx.db
@@ -736,6 +786,7 @@ export const runValidation = mutation({
       oos: run.oos,
       createdAt: now,
       completedAt: now,
+      ownerUserId: userId,
     });
 
     if (run.evidence) {
@@ -748,6 +799,7 @@ export const runValidation = mutation({
         factors: run.evidence.factors,
         rationale: run.evidence.rationale,
         createdAt: now,
+        ownerUserId: userId,
       });
     }
     if (run.fitness) {
@@ -757,6 +809,7 @@ export const runValidation = mutation({
         dimensions: run.fitness.dimensions,
         verdict: run.fitness.verdict,
         createdAt: now,
+        ownerUserId: userId,
       });
     }
 
@@ -931,6 +984,9 @@ export const proposeCandidateVersion = mutation({
         promptConfigVersion: "NOT_CONFIGURED",
         createdAt: now,
       },
+      // The candidate is created by the caller — a private record until a
+      // lifecycle process explicitly shares it.
+      ownerUserId: userId,
     });
 
     await ctx.db.patch(learning._id, { candidateStrategyVersionId: strategyVersionId });

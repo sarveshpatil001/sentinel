@@ -13,8 +13,10 @@
  *   - EUR/USD  : gap + OHLC violations + duplicate (provider DEGRADED) -> INVALID
  */
 
+import { getAuthUserId } from "@convex-dev/auth/server";
 import { mutation } from "./_generated/server";
 import { MutationCtx, appendAudit } from "./lib/store";
+import { requireRole } from "./lib/authz";
 import { validateCandles } from "./lib/dataQuality";
 import { CostModel, StrategyDefinition, ValidationConfig } from "./lib/backtest";
 import { runValidationPipeline, SnapshotBinding } from "./lib/pipeline";
@@ -261,12 +263,42 @@ const CONTROLLED_LIVE_GATES = [
 export const seed = mutation({
   args: {},
   handler: async (ctx: MutationCtx) => {
+    // PRIVILEGED INITIALIZATION (Section 12). The approved authorization
+    // mechanism is the server-side ADMIN ROLE, evaluated from the trusted auth
+    // identity — client claims are never consulted. SPEC-GAP-008: the initial
+    // admin is provisioned OUT-OF-BAND (Convex dashboard / deployment admin);
+    // there is no self-service path and the first registered user is NOT
+    // auto-provisioned. Unauthenticated callers cannot initialize anything.
+    const userId = await getAuthUserId(ctx);
+    if (userId === null) throw new Error("UNAUTHENTICATED");
+    const caller = await ctx.db.get(userId);
+    const role = caller?.role;
+    const now = Date.now();
+    if (!requireRole(role, "admin")) {
+      await appendAudit(
+        ctx,
+        {
+          actor: `user:${userId}`,
+          actorType: "USER",
+          action: "SYSTEM_INITIALIZATION_DENIED",
+          resourceType: "systemState",
+          resourceId: "global",
+          outcome: "DENIED",
+          correlationId: `seed-${now}`,
+          detail: `Initialization refused: admin role required (caller role: ${role ?? "none"}). No system state read or written.`,
+        },
+        now,
+      );
+      return { ok: false as const, reason: "Admin role required to initialize the system." };
+    }
+
+    // Idempotency: initialization runs at most once. An existing deployment is
+    // NEVER reset or rewritten here — including the kill-switch state.
     const existing = await ctx.db.query("systemState").first();
     if (existing) {
       return { alreadySeeded: true as const };
     }
 
-    const now = Date.now();
     const endTime = Math.floor(now / HOUR) * HOUR;
 
     // ---- System state: PAPER mode, live disabled, no auto-resume ----------
@@ -287,14 +319,14 @@ export const seed = mutation({
     await appendAudit(
       ctx,
       {
-        actor: "system:seed",
-        actorType: "SERVICE",
+        actor: `user:${userId}`,
+        actorType: "USER",
         action: "SYSTEM_INITIALIZED",
         resourceType: "systemState",
         resourceId: "global",
         outcome: "SUCCESS",
         correlationId: `seed-${now}`,
-        detail: "Sentinel Prime initialized in PAPER mode. Controlled live disabled. No automatic live activation or resume.",
+        detail: `Initialized by admin (user:${userId}) in PAPER mode. Controlled live disabled. No automatic live activation or resume.`,
       },
       now,
     );

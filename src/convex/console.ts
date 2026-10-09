@@ -4,6 +4,19 @@
  * Presentation layer. The frontend is never trusted (Section 04): these
  * queries only project deterministic state that the backend already computed.
  * Nothing here authorizes a financial action.
+ *
+ * RECORD CLASSIFICATION (every record returned here is one of):
+ *  - SHARED SYSTEM data — markets, candles, snapshots, quality reports, risk
+ *    policies, agents, systemState and seeded demo records (no ownerUserId):
+ *    visible to every authenticated user.
+ *  - USER-OWNED data — orders, authorizations, risk decisions, learning
+ *    events, strategies/versions/validation runs/evidence/fitness/positions/
+ *    monitoring events carrying ownerUserId: returned ONLY to their owner
+ *    (canViewRecord: own + shared system records, never another user's).
+ *  - ADMIN-ONLY data — none are returned by queries; privileged mutations are
+ *    admin-gated and record denials in the audit log.
+ * All scoping is enforced HERE on the server; frontend filtering is never the
+ * security boundary.
  */
 
 import { getAuthUserId } from "@convex-dev/auth/server";
@@ -20,7 +33,7 @@ async function requireUser(ctx: QueryCtx) {
 export const overview = query({
   args: {},
   handler: async (ctx) => {
-    await requireUser(ctx);
+    const userId = await requireUser(ctx);
     const state = await ctx.db.query("systemState").first();
     const markets = await ctx.db.query("markets").take(50);
     const quality = await ctx.db.query("dataQualityReports").take(50);
@@ -32,7 +45,6 @@ export const overview = query({
 
     // Owner scoping: a user sees their OWN private records plus shared SYSTEM
     // records — never another user's private records (IDOR protection).
-    const userId = await requireUser(ctx);
     const visibleOrders = orders.filter((o) => canViewRecord(o.ownerUserId, userId));
 
     const sortedAudit = audit
@@ -66,9 +78,9 @@ export const overview = query({
         symbol: q.symbol,
         state: q.state,
       })),
-      strategyVersionCount: versions.length,
+      strategyVersionCount: versions.filter((v) => canViewRecord(v.ownerUserId, userId)).length,
       latestValidations: validations
-        .slice()
+        .filter((v) => canViewRecord(v.ownerUserId, userId))
         .sort((a, b) => b.createdAt - a.createdAt)
         .slice(0, 3)
         .map((v) => ({
@@ -129,10 +141,19 @@ export const strategies = query({
   handler: async (ctx) => {
     await requireUser(ctx);
     const userId = await requireUser(ctx);
-    const strategies = await ctx.db.query("strategies").take(50);
-    const versions = await ctx.db.query("strategyVersions").take(100);
-    const evidence = await ctx.db.query("evidenceRecords").take(100);
-    const fitness = await ctx.db.query("botFitnessRecords").take(100);
+    // USER-OWNED records are owner-scoped HERE on the server (IDOR protection).
+    const strategies = (await ctx.db.query("strategies").take(50)).filter((s) =>
+      canViewRecord(s.ownerUserId, userId),
+    );
+    const versions = (await ctx.db.query("strategyVersions").take(100)).filter((v) =>
+      canViewRecord(v.ownerUserId, userId),
+    );
+    const evidence = (await ctx.db.query("evidenceRecords").take(100)).filter((e) =>
+      canViewRecord(e.ownerUserId, userId),
+    );
+    const fitness = (await ctx.db.query("botFitnessRecords").take(100)).filter((f) =>
+      canViewRecord(f.ownerUserId, userId),
+    );
     const learning = await ctx.db.query("learningEvents").take(50);
 
     return {
@@ -150,12 +171,16 @@ export const strategies = query({
 export const validation = query({
   args: {},
   handler: async (ctx) => {
-    await requireUser(ctx);
-    const runs = (await ctx.db.query("validationRuns").take(50)).sort(
-      (a, b) => b.createdAt - a.createdAt,
+    const userId = await requireUser(ctx);
+    const runs = (await ctx.db.query("validationRuns").take(50))
+      .filter((r) => canViewRecord(r.ownerUserId, userId))
+      .sort((a, b) => b.createdAt - a.createdAt);
+    const evidence = (await ctx.db.query("evidenceRecords").take(50)).filter((e) =>
+      canViewRecord(e.ownerUserId, userId),
     );
-    const evidence = await ctx.db.query("evidenceRecords").take(50);
-    const fitness = await ctx.db.query("botFitnessRecords").take(50);
+    const fitness = (await ctx.db.query("botFitnessRecords").take(50)).filter((f) =>
+      canViewRecord(f.ownerUserId, userId),
+    );
 
     return {
       runs,
@@ -188,8 +213,12 @@ export const execution = query({
     const orders = (await ctx.db.query("orders").take(100))
       .filter((o) => canViewRecord(o.ownerUserId, userId))
       .sort((a, b) => b.createdAt - a.createdAt);
-    const positions = await ctx.db.query("positions").take(50);
-    const monitoring = await ctx.db.query("monitoringEvents").take(50);
+    const positions = (await ctx.db.query("positions").take(50)).filter((p) =>
+      canViewRecord(p.ownerUserId, userId),
+    );
+    const monitoring = (await ctx.db.query("monitoringEvents").take(50)).filter((m) =>
+      canViewRecord(m.ownerUserId, userId),
+    );
     return { authorizations, orders, positions, monitoring };
   },
 });
