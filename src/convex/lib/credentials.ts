@@ -31,6 +31,7 @@ export const PROVIDERS: ProviderSpec[] = [
   { provider: "BINANCE", kind: "CRYPTO_EXCHANGE", adapter: "NOT_CONFIGURED", note: "No adapter implemented in this build — connection is recorded but connectivity stays NOT VERIFIED." },
   { provider: "COINBASE", kind: "CRYPTO_EXCHANGE", adapter: "NOT_CONFIGURED", note: "No adapter implemented in this build — connectivity NOT VERIFIED." },
   { provider: "KRAKEN", kind: "CRYPTO_EXCHANGE", adapter: "NOT_CONFIGURED", note: "No adapter implemented in this build — connectivity NOT VERIFIED." },
+  { provider: "DELTA_EXCHANGE_INDIA", kind: "CRYPTO_EXCHANGE", adapter: "NOT_CONFIGURED", note: "Delta Exchange India (delta.exchange) — INR-settled crypto derivatives venue. No adapter implemented in this build — connectivity NOT VERIFIED." },
   { provider: "METAAPI", kind: "PLATFORM_BRIDGE", adapter: "NOT_CONFIGURED", note: "Legacy ARISE bridge class — adapter NOT IMPLEMENTED here (see legacy component report)." },
   { provider: "METATRADER_5", kind: "PLATFORM_BRIDGE", adapter: "NOT_CONFIGURED", note: "Legacy ARISE platform class — adapter NOT IMPLEMENTED here." },
   { provider: "OANDA", kind: "FOREX_BROKER", adapter: "NOT_CONFIGURED", note: "No adapter implemented in this build — connectivity NOT VERIFIED." },

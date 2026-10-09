@@ -283,6 +283,16 @@ const badKey = validateCredentialInput({ provider: "BINANCE", label: "ok label",
 check("TEST-SEC-CRED-004b short key rejected", !badKey.ok);
 const badProvider = validateCredentialInput({ provider: "NOT_A_PROVIDER", label: "ok label", environment: "PAPER", accountRef: "a1", apiKey: rawKey, permissions: ["READ_ACCOUNT"] });
 check("TEST-SEC-CRED-004c unknown provider rejected", !badProvider.ok);
+// Provider catalog regression: Delta Exchange India (delta.exchange) is
+// registered and HONEST about its adapter — no connectivity claim without an
+// implemented adapter (Rule 18).
+const deltaSpec = PROVIDERS.find((p) => p.provider === "DELTA_EXCHANGE_INDIA");
+const okDelta = validateCredentialInput({ provider: "DELTA_EXCHANGE_INDIA", label: "delta india paper", environment: "PAPER", accountRef: "a1", apiKey: rawKey, permissions: ["READ_ACCOUNT"] });
+check(
+  "TEST-SEC-CRED-006 DELTA_EXCHANGE_INDIA is registered with an honest NOT_CONFIGURED adapter",
+  deltaSpec !== undefined && deltaSpec.kind === "CRYPTO_EXCHANGE" && deltaSpec.adapter === "NOT_CONFIGURED" && okDelta.ok,
+  JSON.stringify({ spec: deltaSpec ?? null, errors: okDelta.errors }),
+);
 const badPerms = validateCredentialInput({ provider: "BINANCE", label: "ok label", environment: "PAPER", accountRef: "a1", apiKey: rawKey, permissions: ["DROP_TABLES"] });
 check("TEST-SEC-CRED-004d unknown permissions rejected", !badPerms.ok);
 const goodInput = validateCredentialInput({ provider: "BINANCE", label: "Main demo", environment: "PAPER", accountRef: "a1", apiKey: rawKey, permissions: ["READ_ACCOUNT", "SUBMIT_ORDERS"] });
