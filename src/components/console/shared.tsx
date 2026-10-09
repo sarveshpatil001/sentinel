@@ -117,7 +117,7 @@ export function Panel({
 }) {
   return (
     <section className="rounded-2xl border border-border/70 bg-card shadow-[0_1px_2px_rgba(15,23,42,0.03)]">
-      <header className="flex flex-wrap items-start justify-between gap-3 border-b border-border/60 px-6 py-4">
+      <header className="flex flex-wrap items-start justify-between gap-3 border-b border-border/60 px-4 py-4 sm:px-6">
         <div>
           <h2 className="text-sm font-semibold tracking-tight">{title}</h2>
           {description && (
@@ -128,7 +128,7 @@ export function Panel({
         </div>
         {action}
       </header>
-      <div className="px-6 py-5">{children}</div>
+      <div className="px-4 py-5 sm:px-6">{children}</div>
     </section>
   );
 }

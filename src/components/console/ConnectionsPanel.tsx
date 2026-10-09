@@ -165,7 +165,7 @@ export default function ConnectionsPanel() {
               <select
                 value={provider}
                 onChange={(e) => setProvider(e.target.value)}
-                className="rounded-lg border border-border/80 bg-background px-3 py-2 text-xs text-foreground"
+                className="w-full rounded-lg border border-border/80 bg-background px-3 py-2 text-xs text-foreground"
               >
                 {catalog.providers.map((p) => (
                   <option key={p.provider} value={p.provider}>
@@ -179,7 +179,7 @@ export default function ConnectionsPanel() {
               <select
                 value={environment}
                 onChange={(e) => setEnvironment(e.target.value)}
-                className="rounded-lg border border-border/80 bg-background px-3 py-2 text-xs text-foreground"
+                className="w-full rounded-lg border border-border/80 bg-background px-3 py-2 text-xs text-foreground"
               >
                 {catalog.environments.map((env) => (
                   <option key={env} value={env}>{env}</option>
@@ -200,7 +200,7 @@ export default function ConnectionsPanel() {
                 minLength={3}
                 maxLength={64}
                 required
-                className="rounded-lg border border-border/80 bg-background px-3 py-2 text-xs text-foreground"
+                className="w-full rounded-lg border border-border/80 bg-background px-3 py-2 text-xs text-foreground"
               />
             </label>
             <label className="flex flex-col gap-1 text-[11px] font-medium text-muted-foreground">
@@ -211,7 +211,7 @@ export default function ConnectionsPanel() {
                 placeholder="acct-123456"
                 maxLength={128}
                 required
-                className="rounded-lg border border-border/80 bg-background px-3 py-2 text-xs text-foreground"
+                className="w-full rounded-lg border border-border/80 bg-background px-3 py-2 text-xs text-foreground"
               />
             </label>
             <label className="flex flex-col gap-1 text-[11px] font-medium text-muted-foreground">
@@ -226,7 +226,7 @@ export default function ConnectionsPanel() {
                 required
                 autoComplete="off"
                 spellCheck={false}
-                className="rounded-lg border border-border/80 bg-background px-3 py-2 text-xs text-foreground"
+                className="w-full rounded-lg border border-border/80 bg-background px-3 py-2 text-xs text-foreground"
               />
             </label>
             <label className="flex flex-col gap-1 text-[11px] font-medium text-muted-foreground">
@@ -239,7 +239,7 @@ export default function ConnectionsPanel() {
                 maxLength={256}
                 autoComplete="off"
                 spellCheck={false}
-                className="rounded-lg border border-border/80 bg-background px-3 py-2 text-xs text-foreground"
+                className="w-full rounded-lg border border-border/80 bg-background px-3 py-2 text-xs text-foreground"
               />
             </label>
           </div>
@@ -317,7 +317,7 @@ export default function ConnectionsPanel() {
                   <span className="ml-auto font-mono text-[11px] text-muted-foreground">{c.keyMasked}</span>
                 </div>
 
-                <div className="mt-2 flex flex-wrap gap-x-4 gap-y-1 font-mono text-[10px] text-muted-foreground">
+                <div className="mt-2 flex flex-wrap gap-x-4 gap-y-1 break-all font-mono text-[10px] text-muted-foreground">
                   <span>id: {c.connectionId}</span>
                   <span>fingerprint: {c.keyFingerprint.slice(0, 16)}… ({c.fingerprintAlgo})</span>
                   <span>created {fmtTime(c.createdAt)}</span>
@@ -388,7 +388,7 @@ export default function ConnectionsPanel() {
                         maxLength={256}
                         autoComplete="off"
                         spellCheck={false}
-                        className="rounded-lg border border-border/80 bg-background px-3 py-2 text-xs text-foreground"
+                        className="w-full rounded-lg border border-border/80 bg-background px-3 py-2 text-xs text-foreground"
                       />
                       <input
                         type="password"
@@ -398,7 +398,7 @@ export default function ConnectionsPanel() {
                         maxLength={256}
                         autoComplete="off"
                         spellCheck={false}
-                        className="rounded-lg border border-border/80 bg-background px-3 py-2 text-xs text-foreground"
+                        className="w-full rounded-lg border border-border/80 bg-background px-3 py-2 text-xs text-foreground"
                       />
                     </div>
                     <button

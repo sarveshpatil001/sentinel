@@ -160,7 +160,7 @@ export default function Landing() {
             <img src={logo} alt="Sentinel Prime" className="size-8 rounded-lg" />
             <div className="leading-tight">
               <div className="text-sm font-semibold tracking-tight">Sentinel Prime</div>
-              <div className="text-[11px] text-muted-foreground">Trading Intelligence System</div>
+              <div className="hidden text-[11px] text-muted-foreground sm:block">Trading Intelligence System</div>
             </div>
           </Link>
           <nav className="hidden items-center gap-7 text-sm text-muted-foreground md:flex">
@@ -173,7 +173,7 @@ export default function Landing() {
             <ThemeToggle />
             <Link
               to="/auth"
-              className="rounded-lg px-3.5 py-2 text-sm font-medium text-muted-foreground transition-colors hover:bg-muted hover:text-foreground"
+              className="hidden rounded-lg px-3.5 py-2 text-sm font-medium text-muted-foreground transition-colors hover:bg-muted hover:text-foreground sm:block"
             >
               Sign in
             </Link>

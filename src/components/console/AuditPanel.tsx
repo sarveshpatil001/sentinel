@@ -37,7 +37,7 @@ export default function AuditPanel() {
                 <span className="ml-auto text-[10px] text-muted-foreground">{fmtTime(e.at)}</span>
               </div>
               <p className="mt-1.5 text-[11px] leading-relaxed text-muted-foreground">{e.detail}</p>
-              <div className="mt-1.5 flex flex-wrap gap-x-4 gap-y-1 font-mono text-[9px] text-muted-foreground/70">
+              <div className="mt-1.5 flex flex-wrap gap-x-4 gap-y-1 break-all font-mono text-[9px] text-muted-foreground/70">
                 <span>actor: {e.actor} ({e.actorType})</span>
                 <span>resource: {e.resourceType}/{e.resourceId}</span>
                 <span>correlation: {e.correlationId}</span>

@@ -157,7 +157,7 @@ export default function ExecutionPanel() {
         description="Execution carries out already-authorized actions. Choose how the simulated external provider responds. A TIMEOUT after a possible submission produces ORDER = UNKNOWN: never assumed failed, never blindly retried — reconciled first."
       >
         <div className="flex flex-wrap items-end gap-3">
-          <label className="flex flex-col gap-1 text-[11px] font-medium text-muted-foreground">
+          <label className="flex min-w-0 w-full flex-col gap-1 text-[11px] font-medium text-muted-foreground sm:w-auto">
             Provider behavior (server-side config · admin)
             <select
               value={riskData.systemState?.simulatedProviderBehavior ?? "ACK"}
@@ -165,7 +165,7 @@ export default function ExecutionPanel() {
                 handleBehaviorChange(e.target.value as "ACK" | "FILL" | "PARTIAL" | "REJECT" | "TIMEOUT")
               }
               disabled={busy !== null}
-              className="rounded-lg border border-border/80 bg-background px-3 py-2 text-xs text-foreground"
+              className="w-full rounded-lg border border-border/80 bg-background px-3 py-2 text-xs text-foreground"
             >
               <option value="ACK">ACK → acknowledged</option>
               <option value="FILL">FILL → filled immediately</option>
@@ -174,12 +174,12 @@ export default function ExecutionPanel() {
               <option value="TIMEOUT">TIMEOUT → order becomes UNKNOWN</option>
             </select>
           </label>
-          <label className="flex flex-col gap-1 text-[11px] font-medium text-muted-foreground">
+          <label className="flex min-w-0 w-full flex-col gap-1 text-[11px] font-medium text-muted-foreground sm:w-auto">
             Quantity
             <input
               value={quantity}
               onChange={(e) => setQuantity(e.target.value)}
-              className="w-28 rounded-lg border border-border/80 bg-background px-3 py-2 text-xs text-foreground"
+              className="w-full rounded-lg border border-border/80 bg-background px-3 py-2 text-xs text-foreground sm:w-28"
             />
           </label>
           <button

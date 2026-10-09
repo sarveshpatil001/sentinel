@@ -75,12 +75,12 @@ export default function RiskPanel() {
 
       <Panel title="Submit a trade proposal" description="Proposal → deterministic risk evaluation → veto → authorization or block. Watch the checks — every one of them is computed, not asserted.">
         <div className="grid gap-3 sm:grid-cols-2 lg:grid-cols-5">
-          <label className="flex flex-col gap-1 text-[11px] font-medium text-muted-foreground">
+          <label className="flex min-w-0 w-full flex-col gap-1 text-[11px] font-medium text-muted-foreground sm:w-auto">
             Strategy version
             <select
               value={strategyVersionId}
               onChange={(e) => setStrategyVersionId(e.target.value)}
-              className="rounded-lg border border-border/80 bg-background px-3 py-2 text-xs text-foreground"
+              className="w-full rounded-lg border border-border/80 bg-background px-3 py-2 text-xs text-foreground"
             >
               <option value="">select…</option>
               {strategies.versions.map((v) => (
@@ -90,31 +90,31 @@ export default function RiskPanel() {
               ))}
             </select>
           </label>
-          <label className="flex flex-col gap-1 text-[11px] font-medium text-muted-foreground">
+          <label className="flex min-w-0 w-full flex-col gap-1 text-[11px] font-medium text-muted-foreground sm:w-auto">
             Side
             <select
               value={side}
               onChange={(e) => setSide(e.target.value as "BUY" | "SELL")}
-              className="rounded-lg border border-border/80 bg-background px-3 py-2 text-xs text-foreground"
+              className="w-full rounded-lg border border-border/80 bg-background px-3 py-2 text-xs text-foreground"
             >
               <option value="BUY">BUY</option>
               <option value="SELL">SELL</option>
             </select>
           </label>
-          <label className="flex flex-col gap-1 text-[11px] font-medium text-muted-foreground">
+          <label className="flex min-w-0 w-full flex-col gap-1 text-[11px] font-medium text-muted-foreground sm:w-auto">
             Quantity
             <input
               value={quantity}
               onChange={(e) => setQuantity(e.target.value)}
-              className="rounded-lg border border-border/80 bg-background px-3 py-2 text-xs text-foreground"
+              className="w-full rounded-lg border border-border/80 bg-background px-3 py-2 text-xs text-foreground"
             />
           </label>
-          <label className="flex flex-col gap-1 text-[11px] font-medium text-muted-foreground">
+          <label className="flex min-w-0 w-full flex-col gap-1 text-[11px] font-medium text-muted-foreground sm:w-auto">
             Reference price
             <input
               value={referencePrice}
               onChange={(e) => setReferencePrice(e.target.value)}
-              className="rounded-lg border border-border/80 bg-background px-3 py-2 text-xs text-foreground"
+              className="w-full rounded-lg border border-border/80 bg-background px-3 py-2 text-xs text-foreground"
             />
           </label>
           <button

@@ -73,7 +73,7 @@ export default function Dashboard() {
     <main className="min-h-screen bg-background text-foreground">
       {/* Header */}
       <header className="sticky top-0 z-40 border-b border-border/60 bg-background/85 backdrop-blur-md">
-        <div className="mx-auto flex h-16 w-full max-w-7xl items-center justify-between gap-4 px-6">
+        <div className="mx-auto flex h-16 w-full max-w-7xl items-center justify-between gap-4 px-4 sm:px-6">
           <div className="flex items-center gap-2.5">
             <img src={logo} alt="Sentinel Prime" className="size-8 rounded-lg" />
             <div className="leading-tight">
@@ -86,7 +86,7 @@ export default function Dashboard() {
               <Activity className="size-3" />
               deterministic authority chain active
             </div>
-            <div className="text-right leading-tight">
+            <div className="hidden text-right leading-tight sm:block">
               <div className="text-xs font-medium">{user?.name ?? user?.email ?? "Operator"}</div>
               <div className="text-[10px] text-muted-foreground">authenticated session</div>
             </div>
@@ -99,13 +99,13 @@ export default function Dashboard() {
               onClick={handleSignOut}
             >
               <LogOut className="size-3.5" />
-              Sign out
+              <span className="hidden sm:inline">Sign out</span>
             </Button>
           </div>
         </div>
 
         {/* Tabs */}
-        <div className="mx-auto w-full max-w-7xl px-6">
+        <div className="mx-auto w-full max-w-7xl px-4 sm:px-6">
           <nav className="flex gap-1 overflow-x-auto pb-2">
             {TABS.map((t) => {
               const active = tab === t.id;
@@ -130,7 +130,7 @@ export default function Dashboard() {
       </header>
 
       {/* Content */}
-      <div className="mx-auto w-full max-w-7xl px-6 py-6">
+      <div className="mx-auto w-full max-w-7xl px-4 py-6 sm:px-6">
         {tab === "overview" && <OverviewPanel />}
         {tab === "data" && <DataPanel />}
         {tab === "strategies" && <StrategiesPanel />}
@@ -144,7 +144,7 @@ export default function Dashboard() {
       </div>
 
       <footer className="border-t border-border/60 py-6">
-        <div className="mx-auto flex w-full max-w-7xl flex-wrap items-center gap-x-4 gap-y-1 px-6 text-[11px] text-muted-foreground">
+        <div className="mx-auto flex w-full max-w-7xl flex-wrap items-center gap-x-4 gap-y-1 px-4 text-[11px] text-muted-foreground sm:px-6">
           <span>Sentinel Prime · synthetic seeded data · paper execution</span>
           <span>·</span>
           <span>UNKNOWN stays UNKNOWN until verified</span>
