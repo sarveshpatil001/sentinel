@@ -454,7 +454,9 @@ const schema = defineSchema(
       updatedAt: v.number(),
       // Owner of the position (server-derived; undefined = shared SYSTEM record).
       ownerUserId: v.optional(v.string()),
-    }).index("by_market", ["marketId"]),
+    })
+      .index("by_market", ["marketId"])
+      .index("by_owner_market", ["ownerUserId", "marketId"]),
 
     // -----------------------------------------------------------------------
     // MONITORING + LEARNING (Sections 12–13)

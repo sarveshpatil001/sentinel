@@ -181,6 +181,27 @@ check("TEST-AUDIT-013 intact chain verifies", verifyAuditChain([rec]).valid);
 const tampered = { ...rec, detail: "forged" };
 check("TEST-AUDIT-014 tampered record detected", !verifyAuditChain([tampered]).valid);
 
+// Window verification: the console shows the newest N events of a longer
+// chain, so it verifies a WINDOW against a trusted anchor — the anchor is
+// declared, internal linkage and hashes are still fully checked.
+const rec2: AuditRecord = { ...rec, sequence: 2, at: 2, detail: "second", prevHash: rec.hash, hash: "" };
+rec2.hash = computeAuditHash(rec2);
+const rec3: AuditRecord = { ...rec2, sequence: 3, at: 3, detail: "third", prevHash: rec2.hash, hash: "" };
+rec3.hash = computeAuditHash(rec3);
+check(
+  "TEST-AUDIT-015 a mid-chain window verifies against its trusted anchor",
+  verifyAuditChain([rec2, rec3], rec2.prevHash).valid,
+);
+check(
+  "TEST-AUDIT-015b a mid-chain window without an anchor must NOT pass (GENESIS linkage would be fabricated)",
+  !verifyAuditChain([rec2, rec3]).valid,
+);
+const windowTampered = { ...rec3, detail: "forged in window" };
+check(
+  "TEST-AUDIT-016 tampering inside a window is still detected",
+  !verifyAuditChain([rec2, windowTampered], rec2.prevHash).valid,
+);
+
 // TEST-SEC-CRED-* credential handling contract (Section 16 secret rules)
 const rawKey = "sk-live-ABCDEFGH1234567890";
 const fp1 = await fingerprintSecret(rawKey);

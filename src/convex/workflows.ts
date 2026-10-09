@@ -32,10 +32,12 @@ async function requireUser(ctx: MutationCtx) {
 }
 
 /** Authenticated actor WITH server-side role. Role claims from clients are ignored. */
-async function requireActor(ctx: MutationCtx): Promise<{ userId: string; role: string | undefined }> {
+async function requireActor(
+  ctx: MutationCtx,
+): Promise<{ userId: string; role: string | undefined; isAnonymous: boolean }> {
   const userId = await requireUser(ctx);
   const user = await ctx.db.get(userId);
-  return { userId, role: user?.role };
+  return { userId, role: user?.role, isAnonymous: user?.isAnonymous === true };
 }
 
 export interface RiskContextBundle {
@@ -397,6 +399,11 @@ export const placeOrder = mutation({
       .withIndex("by_market_tf_time", (q) => q.eq("marketId", args.marketId).eq("timeframe", "1h"))
       .order("desc")
       .first();
+    // GLOBAL (all owners) BY DESIGN: an unresolved UNKNOWN order means the
+    // shared paper account's external state is unknown, so new exposure is
+    // blocked regardless of owner (fail-closed). Scoping this gate per owner
+    // is a product-tenancy decision left open as a spec gap — it is not
+    // silently weakened here.
     const allOrders = await ctx.db.query("orders").take(500);
 
     const precheck = runPrechecks(intent, {
@@ -483,8 +490,9 @@ export const placeOrder = mutation({
         // never merged into — a new owner-bound row is created instead.
         const existingPos = await ctx.db
           .query("positions")
-          .withIndex("by_market", (q) => q.eq("marketId", args.marketId))
-          .filter((q) => q.eq(q.field("ownerUserId"), userId))
+          .withIndex("by_owner_market", (q) =>
+            q.eq("ownerUserId", userId).eq("marketId", args.marketId),
+          )
           .first();
         const prev: PositionState | null = existingPos
           ? {
@@ -1018,12 +1026,37 @@ export const proposeCandidateVersion = mutation({
 export const setKillSwitch = mutation({
   args: { engaged: v.boolean(), reason: v.string() },
   handler: async (ctx, args) => {
-    const { userId, role } = await requireActor(ctx);
+    const { userId, role, isAnonymous } = await requireActor(ctx);
     const now = Date.now();
+
+    // The kill switch is GLOBAL. Anonymous guest sessions are free to create,
+    // so they must never be able to change it: engaging is a griefing/DoS
+    // vector against everyone, releasing is a privilege.
+    if (isAnonymous && !requireRole(role, "admin")) {
+      await appendAudit(
+        ctx,
+        {
+          actor: `user:${userId}`,
+          actorType: "USER",
+          action: "KILL_SWITCH_CHANGE_DENIED",
+          resourceType: "systemState",
+          resourceId: "global",
+          outcome: "DENIED",
+          correlationId: `KILL-${now}`,
+          detail: "Refused: anonymous guest sessions cannot change the global kill switch.",
+        },
+        now,
+      );
+      return {
+        ok: false as const,
+        reason: "Sign in with a verified account to change the kill switch.",
+      };
+    }
 
     if (!args.engaged) {
       // PRIVILEGED: resuming global execution requires the admin role
-      // (fail-safe direction: ENGAGING is always allowed, releasing is not).
+      // (fail-safe direction: ENGAGING is always allowed for verified
+      // accounts, releasing is not).
       if (!requireRole(role, "admin")) {
         await appendAudit(
           ctx,

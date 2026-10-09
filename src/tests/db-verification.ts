@@ -1244,5 +1244,38 @@ async function seedUsers(t: T) {
   );
 }
 
+{
+  const t = fresh();
+  const { userA } = await seedWorkspace(t, "ACK");
+  // Anonymous guest sessions are free to create — they must never be able to
+  // change the GLOBAL kill switch: engaging is a griefing/DoS vector against
+  // everyone, releasing is an admin privilege.
+  await t.run(async (ctx) => ctx.db.patch(userA as never, { isAnonymous: true }));
+  const asGuest = t.withIdentity({ subject: userA });
+  const engage = await asGuest.mutation(api.workflows.setKillSwitch, {
+    engaged: true,
+    reason: "db-verification",
+  });
+  const release = await asGuest.mutation(api.workflows.setKillSwitch, {
+    engaged: false,
+    reason: "db-verification",
+  });
+  const state = await t.run(async (ctx) => ctx.db.query("systemState").first());
+  const denials = await t.run(async (ctx) =>
+    ctx.db
+      .query("auditEvents")
+      .filter((q) => q.eq(q.field("action"), "KILL_SWITCH_CHANGE_DENIED"))
+      .collect(),
+  );
+  check(
+    "DB-PRIV-006 anonymous guest sessions cannot change the global kill switch (engage or release)",
+    engage.ok === false &&
+      release.ok === false &&
+      denials.length === 2 &&
+      state?.killSwitchEngaged === false,
+    JSON.stringify({ engage, release }),
+  );
+}
+
 console.log(`\n${pass} passed, ${fail} failed`);
 if (fail > 0) process.exit(1);

@@ -56,13 +56,25 @@ export function computeAuditHash(record: Omit<AuditRecord, "hash">): string {
   return fnv1a64(canonical);
 }
 
-/** Verify a whole chain; used by the console to surface tamper evidence. */
-export function verifyAuditChain(records: AuditRecord[]): {
+/**
+ * Verify a chain — or a recent WINDOW of a longer chain; used by the console
+ * to surface tamper evidence.
+ *
+ * `anchorPrevHash` is the hash the first record must link to. Defaults to
+ * GENESIS (full chain). When verifying a WINDOW of a longer chain, pass the
+ * window's first record's own prevHash: internal linkage and every record
+ * hash are verified, and the anchor itself is TRUSTED — that trust is
+ * declared here, never hidden.
+ */
+export function verifyAuditChain(
+  records: AuditRecord[],
+  anchorPrevHash: string = "GENESIS",
+): {
   valid: boolean;
   brokenAt: number | null;
   reason: string | null;
 } {
-  let prevHash = "GENESIS";
+  let prevHash = anchorPrevHash;
   for (const r of records) {
     if (r.prevHash !== prevHash) {
       return { valid: false, brokenAt: r.sequence, reason: "prevHash linkage broken" };

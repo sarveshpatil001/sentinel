@@ -24,6 +24,17 @@ import { query, QueryCtx } from "./_generated/server";
 import { verifyAuditChain, AuditRecord } from "./lib/audit";
 import { canViewRecord } from "./lib/authz";
 
+/**
+ * Anchor for verifying a recent WINDOW of the audit chain (see
+ * verifyAuditChain): a mid-chain window is verified against its first
+ * record's own prevHash — internal linkage and hashes are checked, the
+ * anchor itself is trusted. A window starting at the chain head anchors
+ * at GENESIS.
+ */
+function windowAnchor(sortedAsc: { sequence: number; prevHash: string }[]): string {
+  return sortedAsc.length > 0 && sortedAsc[0].sequence > 1 ? sortedAsc[0].prevHash : "GENESIS";
+}
+
 async function requireUser(ctx: QueryCtx) {
   const userId = await getAuthUserId(ctx);
   if (userId === null) throw new Error("UNAUTHENTICATED");
@@ -39,8 +50,13 @@ export const overview = query({
     const quality = await ctx.db.query("dataQualityReports").take(50);
     const versions = await ctx.db.query("strategyVersions").take(50);
     const validations = await ctx.db.query("validationRuns").take(50);
-    const orders = await ctx.db.query("orders").take(100);
-    const audit = await ctx.db.query("auditEvents").take(200);
+    // Newest first: the console shows recent state, never a stale oldest-N.
+    const orders = await ctx.db.query("orders").order("desc").take(100);
+    const audit = await ctx.db
+      .query("auditEvents")
+      .withIndex("by_sequence", (q) => q.gte("sequence", 0))
+      .order("desc")
+      .take(200);
     const agents = await ctx.db.query("agents").take(50);
 
     // Owner scoping: a user sees their OWN private records plus shared SYSTEM
@@ -97,9 +113,10 @@ export const overview = query({
         unknown: visibleOrders.filter((o) => o.state === "UNKNOWN").length,
         filled: visibleOrders.filter((o) => o.state === "FILLED").length,
       },
-      // Chain integrity is verified over the FULL chain; only the visible
-      // (own + system) events are returned to the client.
-      auditChain: verifyAuditChain(sortedAudit),
+      // Chain integrity is verified over this WINDOW (newest 200 events),
+      // anchored at the window's first prevHash; only the visible (own +
+      // system) events are returned to the client.
+      auditChain: verifyAuditChain(sortedAudit, windowAnchor(sortedAudit)),
       recentAudit: visibleAudit.slice(-6).reverse(),
       agentCounts: {
         total: agents.length,
@@ -210,12 +227,12 @@ export const execution = query({
     const authorizations = (await ctx.db.query("executionAuthorizations").take(50)).filter(
       (a) => canViewRecord(a.ownerUserId, userId),
     );
-    const orders = (await ctx.db.query("orders").take(100))
+    const orders = (await ctx.db.query("orders").order("desc").take(100))
       .filter((o) => canViewRecord(o.ownerUserId, userId))
       .sort((a, b) => b.createdAt - a.createdAt);
-    const positions = (await ctx.db.query("positions").take(50)).filter((p) =>
-      canViewRecord(p.ownerUserId, userId),
-    );
+    const positions = (await ctx.db.query("positions").take(100))
+      .filter((p) => canViewRecord(p.ownerUserId, userId))
+      .slice(0, 50);
     const monitoring = (await ctx.db.query("monitoringEvents").take(50)).filter((m) =>
       canViewRecord(m.ownerUserId, userId),
     );
@@ -239,7 +256,12 @@ export const audit = query({
   args: {},
   handler: async (ctx) => {
     const userId = await requireUser(ctx);
-    const rows = await ctx.db.query("auditEvents").take(250);
+    // Newest 250 events (never a stale oldest-N), verified as a WINDOW.
+    const rows = await ctx.db
+      .query("auditEvents")
+      .withIndex("by_sequence", (q) => q.gte("sequence", 0))
+      .order("desc")
+      .take(250);
     const sorted = rows
       .slice()
       .sort((a, b) => a.sequence - b.sequence)
@@ -263,6 +285,9 @@ export const audit = query({
     const visible = sorted.filter(
       (r) => r.actorType === "SERVICE" || r.actor === `user:${userId}`,
     );
-    return { events: visible.slice().reverse(), chain: verifyAuditChain(sorted) };
+    return {
+      events: visible.slice().reverse(),
+      chain: verifyAuditChain(sorted, windowAnchor(sorted)),
+    };
   },
 });
