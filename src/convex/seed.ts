@@ -17,7 +17,7 @@ import { mutation } from "./_generated/server";
 import { MutationCtx, appendAudit } from "./lib/store";
 import { validateCandles } from "./lib/dataQuality";
 import { CostModel, StrategyDefinition, ValidationConfig } from "./lib/backtest";
-import { runValidationPipeline } from "./lib/pipeline";
+import { runValidationPipeline, SnapshotBinding } from "./lib/pipeline";
 import { verifyAuditChain } from "./lib/audit";
 
 // ---------------------------------------------------------------------------
@@ -36,6 +36,7 @@ function mulberry32(seed: number) {
 
 const HOUR = 3600_000;
 const TIMEFRAME = "1h";
+const PAPER_EQUITY_BASE = 100000;
 
 interface MarketSpec {
   marketId: string;
@@ -275,6 +276,10 @@ export const seed = mutation({
       killSwitchEngaged: false,
       liveAutoResume: false,
       environment: "PAPER",
+      // Server-side test/demo configuration of the SIMULATED provider adapter.
+      simulatedProviderBehavior: "ACK" as const,
+      // Risk accounting state (maintained at fill time from here on).
+      peakEquity: PAPER_EQUITY_BASE,
       controlledLiveGates: CONTROLLED_LIVE_GATES,
       updatedAt: now,
     });
@@ -370,17 +375,29 @@ export const seed = mutation({
       );
     }
 
+    // Snapshot range is derived from the ACTUAL generated series (first bar
+    // opens at endTime - (bars + 1)h): the recorded snapshot must contain the
+    // data it names — binding is verified on every validation run.
     await ctx.db.insert("dataSnapshots", {
       snapshotId: "SNAP-SEED-0001",
       marketIds: MARKET_SPECS.map((s) => s.marketId),
       timeframe: TIMEFRAME,
-      rangeStart: endTime - MARKET_SPECS[0].bars * HOUR,
+      rangeStart: endTime - (MARKET_SPECS[0].bars + 1) * HOUR,
       rangeEnd: endTime,
       dataVersion: "synthetic-seeded-v1",
       qualitySummary,
       revision: 1,
       createdAt: now,
     });
+
+    const seedSnapshot: SnapshotBinding = {
+      snapshotId: "SNAP-SEED-0001",
+      marketIds: MARKET_SPECS.map((s) => s.marketId),
+      timeframe: TIMEFRAME,
+      rangeStart: endTime - (MARKET_SPECS[0].bars + 1) * HOUR,
+      rangeEnd: endTime,
+      dataVersion: "synthetic-seeded-v1",
+    };
 
     // ---- Risk policy (PROVISIONAL — numerics await ADR ratification) -----
     await ctx.db.insert("riskPolicies", {
@@ -538,6 +555,8 @@ export const seed = mutation({
         close: c.close,
         volume: c.volume,
         availabilityTime: c.availabilityTime,
+        marketId: c.marketId,
+        timeframe: c.timeframe,
       }));
 
     const btcQualityRow = await ctx.db
@@ -552,6 +571,7 @@ export const seed = mutation({
       definition: btcDefinition,
       config: validationConfig,
       cost,
+      snapshot: seedSnapshot,
       candles: btcCandles,
       quality: {
         state: btcQualityRow!.state,
@@ -621,6 +641,7 @@ export const seed = mutation({
       definition: eurDefinition,
       config: validationConfig,
       cost,
+      snapshot: seedSnapshot,
       candles: [],
       quality: {
         state: eurQualityRow!.state,

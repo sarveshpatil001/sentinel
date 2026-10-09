@@ -17,8 +17,10 @@ import { mutation } from "./_generated/server";
 import { MutationCtx, appendAudit } from "./lib/store";
 import { evaluateRisk, RiskContext, RiskPolicy, TradeProposal, vetoAllows } from "./lib/risk";
 import { CostModel, StrategyDefinition } from "./lib/backtest";
-import { runValidationPipeline } from "./lib/pipeline";
+import { runValidationPipeline, SnapshotBinding } from "./lib/pipeline";
 import { validateAuthorizationScope, runPrechecks, normalizeProviderResponse, OrderIntent, OrderState } from "./lib/execution";
+import { canUseAuthorization, canViewRecord, requireRole } from "./lib/authz";
+import { applyFill, fillDelta, PositionState } from "./lib/positions";
 
 const HOUR = 3600_000;
 const PAPER_EQUITY_BASE = 100000;
@@ -27,6 +29,13 @@ async function requireUser(ctx: MutationCtx) {
   const userId = await getAuthUserId(ctx);
   if (userId === null) throw new Error("UNAUTHENTICATED");
   return userId;
+}
+
+/** Authenticated actor WITH server-side role. Role claims from clients are ignored. */
+async function requireActor(ctx: MutationCtx): Promise<{ userId: string; role: string | undefined }> {
+  const userId = await requireUser(ctx);
+  const user = await ctx.db.get(userId);
+  return { userId, role: user?.role };
 }
 
 export interface RiskContextBundle {
@@ -82,6 +91,21 @@ export async function loadRiskContext(
   const equity = PAPER_EQUITY_BASE + realized;
   const openPositions = positions.filter((p) => p.quantity > 0).length;
 
+  // Daily-loss accounting: server-tracked UTC-day realized PnL. Legacy rows
+  // without day tracking fall back to the CUMULATIVE realized PnL — never
+  // zero (MISSING must not become a permissive default).
+  const dayKey = new Date().toISOString().slice(0, 10);
+  const realizedPnlToday =
+    state?.pnlDay === undefined
+      ? realized
+      : state.pnlDay === dayKey
+        ? (state.realizedPnlDay ?? 0)
+        : 0;
+  // Peak equity is server-maintained at fill time; the legacy fallback is the
+  // contribution base (never `equity` itself, which would force drawdown to 0).
+  const peakEquity = Math.max(state?.peakEquity ?? PAPER_EQUITY_BASE, equity);
+  const unresolvedUnknownOrders = orders.filter((o) => o.state === "UNKNOWN").length;
+
   const eligible =
     validation?.state === "COMPLETED" &&
     (evidence?.level === "STRONG" || evidence?.level === "MODERATE") &&
@@ -101,12 +125,13 @@ export async function loadRiskContext(
     dataQualityState: quality?.state ?? "MISSING",
     spreadBps: market?.assetClass === "FOREX" ? 8 : 2,
     openPositions,
-    realizedPnlToday: realized,
+    realizedPnlToday,
     equity,
-    peakEquity: Math.max(PAPER_EQUITY_BASE, equity),
+    peakEquity,
     consecutiveLosses: 0,
     existingOrderIdempotencyKeys: orders.map((o) => o.idempotencyKey),
     proposalIdempotencyKey: args.proposalIdempotencyKey,
+    unresolvedUnknownOrders,
   };
 
   return {
@@ -175,6 +200,7 @@ export const submitTradeProposal = mutation({
       checks: decision.checks,
       outcome: decision.outcome,
       actor: `user:${userId}`,
+      ownerUserId: userId,
       createdAt: now,
     });
 
@@ -230,6 +256,8 @@ export const submitTradeProposal = mutation({
       },
       state: "APPROVED",
       issuedAt: now,
+      // Capability token bound to the caller. Another user can never consume it.
+      ownerUserId: userId,
     });
 
     await appendAudit(
@@ -256,9 +284,12 @@ export type { OrderIntent, TradeProposal };
 /**
  * ORDER INTENT -> PRECHECK -> AUTHORIZATION VALIDATION -> PROVIDER -> ORDER STATE.
  *
- * `simulate` models the EXTERNAL provider's behavior in this paper/demo build:
+ * The SIMULATED provider adapter's behavior is selected by the SERVER-SIDE
+ * test/demo configuration `systemState.simulatedProviderBehavior` (admin-gated,
+ * PAPER/DEMO only) — never by a per-request client flag:
  *   - ACK    : provider accepts
  *   - FILL   : provider accepts and fills at the last close
+ *   - PARTIAL: provider partially fills (half), remainder stays open
  *   - REJECT : provider rejects
  *   - TIMEOUT: response lost after a possible submission -> order is UNKNOWN.
  *              The provider-side truth is ACCEPTED; the local state stays
@@ -269,21 +300,14 @@ export const placeOrder = mutation({
     authorizationId: v.string(),
     strategyVersionId: v.string(),
     marketId: v.string(),
-    symbol: v.string(),
     side: v.union(v.literal("BUY"), v.literal("SELL")),
     quantity: v.number(),
     orderType: v.string(),
     timeInForce: v.string(),
     idempotencyKey: v.string(),
-    simulate: v.union(
-      v.literal("ACK"),
-      v.literal("FILL"),
-      v.literal("REJECT"),
-      v.literal("TIMEOUT"),
-    ),
   },
   handler: async (ctx, args) => {
-    const userId = await requireUser(ctx);
+    const { userId } = await requireActor(ctx);
     const now = Date.now();
 
     // Idempotency: duplicate protection for every external financial mutation.
@@ -300,13 +324,22 @@ export const placeOrder = mutation({
       };
     }
 
+    // OWNERSHIP: an execution authorization is a capability token bound to its
+    // issuer. Not-found and not-owned are indistinguishable (no ID oracle).
     const auth = await ctx.db
       .query("executionAuthorizations")
       .withIndex("by_authorizationId", (q) => q.eq("authorizationId", args.authorizationId))
       .first();
-    if (!auth) {
+    if (!auth || !canUseAuthorization(auth.ownerUserId, userId)) {
       return { deduped: false as const, orderId: null as string | null, state: "REJECTED" as const, note: "Authorization not found — order intent rejected before submission." };
     }
+
+    // Symbol is SERVER-DERIVED from the market record — never client-trusted.
+    const market = await ctx.db
+      .query("markets")
+      .withIndex("by_marketId", (q) => q.eq("marketId", args.marketId))
+      .first();
+    const symbol = market?.symbol ?? "UNKNOWN";
 
     const intent: OrderIntent = {
       orderId: `ORD-${args.idempotencyKey}`,
@@ -314,7 +347,7 @@ export const placeOrder = mutation({
       authorizationId: args.authorizationId,
       strategyVersionId: args.strategyVersionId,
       marketId: args.marketId,
-      symbol: args.symbol,
+      symbol,
       side: args.side,
       quantity: args.quantity,
       orderType: args.orderType,
@@ -324,10 +357,6 @@ export const placeOrder = mutation({
 
     const scopeCheck = validateAuthorizationScope(auth as never, intent, now);
     const state = await ctx.db.query("systemState").first();
-    const market = await ctx.db
-      .query("markets")
-      .withIndex("by_marketId", (q) => q.eq("marketId", args.marketId))
-      .first();
     const lastCandle = await ctx.db
       .query("candles")
       .withIndex("by_market_tf_time", (q) => q.eq("marketId", args.marketId).eq("timeframe", "1h"))
@@ -338,12 +367,14 @@ export const placeOrder = mutation({
     const precheck = runPrechecks(intent, {
       systemEnabled: state?.mode !== "DISABLED",
       killSwitchEngaged: state?.killSwitchEngaged ?? true,
+      mode: state?.mode ?? "DISABLED",
       providerState: market?.providerState ?? "UNAVAILABLE",
       marketStatus: market?.status ?? "UNKNOWN",
       dataAgeMs: lastCandle ? now - lastCandle.availabilityTime : null,
       maxDataAgeMs: 2 * HOUR,
       now,
       existingIdempotencyKeys: allOrders.map((o) => o.idempotencyKey),
+      unresolvedUnknownOrders: allOrders.filter((o) => o.state === "UNKNOWN").length,
     });
 
     const passed = scopeCheck.ok && precheck.ok;
@@ -354,13 +385,14 @@ export const placeOrder = mutation({
     push("CREATED", now, "Order intent created from a scoped execution authorization.");
     push("VALIDATING", now + 1, scopeCheck.ok ? "Authorization scope validated." : `Scope validation FAILED: ${scopeCheck.checks.filter((c) => c.status !== "PASS").map((c) => c.check).join(", ")}`);
 
-    type FinalState = "REJECTED" | "UNKNOWN" | "ACKNOWLEDGED" | "FILLED";
+    type FinalState = "REJECTED" | "UNKNOWN" | "ACKNOWLEDGED" | "FILLED" | "PARTIALLY_FILLED";
     let finalState: FinalState = "REJECTED";
     let providerTruth: "ACCEPTED" | "REJECTED" | "NONE" = "NONE";
     let providerOrderId: string | undefined;
     let fillPrice: number | undefined;
     let fees: number | undefined;
     let slippage: number | undefined;
+    let filledQuantity = 0;
 
     if (!passed) {
       push("REJECTED", now + 2, `Precheck/authorization failed (${[...scopeCheck.checks, ...precheck.checks].filter((c) => c.status !== "PASS").map((c) => `${c.check}:${c.status}`).join(", ")}). FAIL CLOSED — nothing submitted.`);
@@ -370,38 +402,66 @@ export const placeOrder = mutation({
       push("SUBMITTING", now + 4, `Submitting to ${market?.provider ?? "provider"}.`);
       push("SUBMITTED", now + 5, "Submission issued to provider adapter.");
 
+      // ATOMIC CONSUMPTION: one authorization -> exactly one order intent.
+      // Convex mutations execute in a serializable transaction, so concurrent
+      // duplicate use of one authorization cannot both pass this write.
+      await ctx.db.patch(auth._id, { state: "CONSUMED", consumedByOrderId: intent.orderId });
+
+      // Provider behavior is a SERVER-SIDE test/demo configuration
+      // (systemState.simulatedProviderBehavior) — never a per-request client flag.
+      const behavior = state?.simulatedProviderBehavior ?? "ACK";
       const lastClose = lastCandle?.close ?? 0;
       const resp = normalizeProviderResponse(
-        args.simulate === "ACK"
+        behavior === "ACK"
           ? { kind: "ack", providerOrderId: `SIM-PROV-${now}` }
-          : args.simulate === "REJECT"
+          : behavior === "REJECT"
             ? { kind: "reject", reason: "SIMULATED_PROVIDER_REJECT" }
-            : args.simulate === "FILL"
+            : behavior === "FILL"
               ? { kind: "fill", providerOrderId: `SIM-PROV-${now}`, price: lastClose }
-              : { kind: "timeout" },
+              : behavior === "PARTIAL"
+                ? {
+                    kind: "partial_fill",
+                    providerOrderId: `SIM-PROV-${now}`,
+                    filled: args.quantity / 2,
+                    remaining: args.quantity - args.quantity / 2,
+                    price: lastClose,
+                  }
+                : { kind: "timeout" },
       );
-      providerOrderId = args.simulate === "TIMEOUT" ? `SIM-PROV-${now}` : providerOrderId;
-      providerTruth = args.simulate === "TIMEOUT" ? "ACCEPTED" : resp.providerTruth;
+      providerOrderId = behavior === "TIMEOUT" ? `SIM-PROV-${now}` : providerOrderId;
+      providerTruth = behavior === "TIMEOUT" ? "ACCEPTED" : resp.providerTruth;
       finalState = resp.state as FinalState;
-      push(resp.state, now + (args.simulate === "TIMEOUT" ? 90_000 : 6), resp.note);
+      push(resp.state, now + (behavior === "TIMEOUT" ? 90_000 : 6), resp.note);
 
-      if (args.simulate === "FILL") {
+      if (resp.state === "FILLED" || resp.state === "PARTIALLY_FILLED") {
+        filledQuantity = resp.state === "FILLED" ? args.quantity : args.quantity / 2;
         const slip = lastClose * 0.0005;
         fillPrice = lastClose + (args.side === "BUY" ? slip : -slip);
-        fees = fillPrice * args.quantity * 0.001;
-        slippage = slip * args.quantity;
+        fees = fillPrice * filledQuantity * 0.001;
+        slippage = slip * filledQuantity;
 
+        // Canonical position accounting. `fillDelta` guards against duplicate
+        // fill application (a repeated provider fill event adds 0).
+        const delta = fillDelta(filledQuantity, 0);
         const existingPos = await ctx.db
           .query("positions")
           .withIndex("by_market", (q) => q.eq("marketId", args.marketId))
           .first();
+        const prev: PositionState | null = existingPos
+          ? {
+              side: existingPos.side,
+              quantity: existingPos.quantity,
+              avgEntryPrice: existingPos.avgEntryPrice,
+              realizedPnl: existingPos.realizedPnl,
+            }
+          : null;
+        const next = applyFill(prev, { side: args.side, quantity: delta, price: fillPrice });
         if (existingPos) {
-          // Order state != position state; both are tracked explicitly.
-          const newQty = args.side === "BUY" ? existingPos.quantity + args.quantity : existingPos.quantity - args.quantity;
           await ctx.db.patch(existingPos._id, {
-            quantity: newQty,
-            side: newQty > 0 ? "LONG" : newQty < 0 ? "SHORT" : "FLAT",
-            avgEntryPrice: fillPrice,
+            side: next.side,
+            quantity: next.quantity,
+            avgEntryPrice: next.avgEntryPrice,
+            realizedPnl: next.realizedPnl,
             updatedAt: now + 6,
           });
         } else {
@@ -409,16 +469,33 @@ export const placeOrder = mutation({
             positionId: `POS-${args.idempotencyKey}`,
             account: `${auth.scope.mode}:paper-account`,
             marketId: args.marketId,
-            symbol: args.symbol,
-            side: args.side === "BUY" ? "LONG" : "SHORT",
-            quantity: args.quantity,
-            avgEntryPrice: fillPrice,
-            realizedPnl: 0,
+            symbol,
+            side: next.side,
+            quantity: next.quantity,
+            avgEntryPrice: next.avgEntryPrice,
+            realizedPnl: next.realizedPnl,
             source: "PAPER",
             updatedAt: now + 6,
           });
         }
-        await ctx.db.patch(auth._id, { state: "CONSUMED", consumedByOrderId: intent.orderId });
+
+        // Account-level risk accounting maintained server-side at fill time:
+        // daily realized PnL (UTC day) and all-time peak equity.
+        const realizedDelta = next.realizedPnl - (prev?.realizedPnl ?? 0);
+        const allPositions = await ctx.db.query("positions").take(100);
+        const totalRealized = allPositions.reduce((a, p) => a + p.realizedPnl, 0);
+        const equityNow = PAPER_EQUITY_BASE + totalRealized;
+        const dayKey = new Date(now).toISOString().slice(0, 10);
+        const realizedPnlDay =
+          state?.pnlDay === dayKey ? (state.realizedPnlDay ?? 0) + realizedDelta : realizedDelta;
+        if (state) {
+          await ctx.db.patch(state._id, {
+            peakEquity: Math.max(state.peakEquity ?? PAPER_EQUITY_BASE, equityNow),
+            pnlDay: dayKey,
+            realizedPnlDay,
+            updatedAt: now,
+          });
+        }
       }
     }
 
@@ -426,10 +503,12 @@ export const placeOrder = mutation({
       orderId: intent.orderId,
       idempotencyKey: args.idempotencyKey,
       authorizationId: args.authorizationId,
-      proposalId: `PROP-${args.idempotencyKey}`,
+      // Referential integrity: the order links to the REAL proposal the
+      // authorization was issued for (never a fabricated id).
+      proposalId: auth.proposalId,
       strategyVersionId: args.strategyVersionId,
       marketId: args.marketId,
-      symbol: args.symbol,
+      symbol,
       side: args.side,
       quantity: args.quantity,
       orderType: args.orderType,
@@ -439,10 +518,11 @@ export const placeOrder = mutation({
       providerOrderId,
       providerTruth,
       fillPrice,
-      fillQuantity: fillPrice !== undefined ? args.quantity : undefined,
+      fillQuantity: filledQuantity > 0 ? filledQuantity : undefined,
       fees,
       slippage,
       history,
+      ownerUserId: userId,
       createdAt: now,
       updatedAt: now + 100_000,
     });
@@ -460,7 +540,7 @@ export const placeOrder = mutation({
         detail:
           finalState === "UNKNOWN"
             ? "Provider timeout after possible submission -> ORDER UNKNOWN. NOT assumed failed. NOT retried. Reconciliation required."
-            : `Order ended in state ${finalState} (provider truth: ${providerTruth}).`,
+            : `Order ended in state ${finalState} (provider truth: ${providerTruth}). Authorization ${args.authorizationId} consumed atomically with this order intent (one authorization, one order).`,
       },
       now,
     );
@@ -591,6 +671,9 @@ export const runValidation = mutation({
         close: c.close,
         volume: c.volume,
         availabilityTime: c.availabilityTime,
+        // Identity carried so snapshot binding can verify it (never assumed).
+        marketId: c.marketId,
+        timeframe: c.timeframe,
       }));
 
     const qualityRow = await ctx.db
@@ -602,6 +685,16 @@ export const runValidation = mutation({
       .withIndex("by_marketId", (q) => q.eq("marketId", definition.marketId))
       .first();
     const snapshot = await ctx.db.query("dataSnapshots").first();
+    const snapshotBinding: SnapshotBinding | null = snapshot
+      ? {
+          snapshotId: snapshot.snapshotId,
+          marketIds: snapshot.marketIds,
+          timeframe: snapshot.timeframe,
+          rangeStart: snapshot.rangeStart,
+          rangeEnd: snapshot.rangeEnd,
+          dataVersion: snapshot.dataVersion,
+        }
+      : null;
 
     const run = runValidationPipeline({
       validationId: `VAL-${args.strategyVersionId}-${now}`,
@@ -610,6 +703,7 @@ export const runValidation = mutation({
       definition,
       config: DECLARED_VALIDATION_CONFIG,
       cost: DECLARED_COST,
+      snapshot: snapshotBinding,
       candles,
       quality: qualityRow
         ? { state: qualityRow.state, checks: qualityRow.checks, counts: qualityRow.counts }
@@ -724,6 +818,7 @@ export const recordLearningEvent = mutation({
       analysis: args.analysis,
       hypothesis: args.hypothesis,
       liveMutationAttempted: false,
+      ownerUserId: userId,
       createdAt: now,
     });
     await appendAudit(
@@ -770,7 +865,11 @@ export const proposeCandidateVersion = mutation({
       .query("learningEvents")
       .withIndex("by_learningEventId", (q) => q.eq("learningEventId", args.learningEventId))
       .first();
-    if (!learning) return { ok: false as const, reason: "Learning event not found." };
+    // Ownership: a user may only derive candidates from their own learning
+    // events (or shared SYSTEM records). Never another user's records.
+    if (!learning || !canViewRecord(learning.ownerUserId, userId)) {
+      return { ok: false as const, reason: "Learning event not found." };
+    }
 
     const sourceOrder = learning.sourceOrderId
       ? await ctx.db
@@ -863,11 +962,30 @@ export const proposeCandidateVersion = mutation({
 export const setKillSwitch = mutation({
   args: { engaged: v.boolean(), reason: v.string() },
   handler: async (ctx, args) => {
-    const userId = await requireUser(ctx);
+    const { userId, role } = await requireActor(ctx);
     const now = Date.now();
 
     if (!args.engaged) {
-      // Releasing requires healthy reconciliation — fail closed otherwise.
+      // PRIVILEGED: resuming global execution requires the admin role
+      // (fail-safe direction: ENGAGING is always allowed, releasing is not).
+      if (!requireRole(role, "admin")) {
+        await appendAudit(
+          ctx,
+          {
+            actor: `user:${userId}`,
+            actorType: "USER",
+            action: "KILL_SWITCH_RELEASE_DENIED",
+            resourceType: "systemState",
+            resourceId: "global",
+            outcome: "DENIED",
+            correlationId: `KILL-${now}`,
+            detail: `Release refused: admin role required to resume global execution (caller role: ${role ?? "none"}).`,
+          },
+          now,
+        );
+        return { ok: false as const, reason: "Admin role required to release the kill switch." };
+      }
+      // Releasing ALSO requires healthy reconciliation — fail closed otherwise.
       const unknownOrders = (await ctx.db.query("orders").take(500)).filter(
         (o) => o.state === "UNKNOWN",
       );
@@ -914,5 +1032,194 @@ export const setKillSwitch = mutation({
     );
 
     return { ok: true as const, engaged: args.engaged };
+  },
+});
+
+// ---------------------------------------------------------------------------
+// PRIVILEGED CONFIGURATION (Section 12: privileged changes are admin-only,
+// audited, and fail closed). SPEC-GAP-008: role provisioning is unspecified —
+// the initial admin must be provisioned out-of-band (e.g. Convex dashboard).
+// ---------------------------------------------------------------------------
+
+/** Permission changes are security-sensitive: admin-only + audited. */
+export const grantRole = mutation({
+  args: {
+    targetUserId: v.string(),
+    role: v.union(v.literal("admin"), v.literal("user"), v.literal("member")),
+    reason: v.string(),
+  },
+  handler: async (ctx, args) => {
+    const { userId, role } = await requireActor(ctx);
+    const now = Date.now();
+    if (!requireRole(role, "admin")) {
+      await appendAudit(
+        ctx,
+        {
+          actor: `user:${userId}`,
+          actorType: "USER",
+          action: "ROLE_CHANGE_DENIED",
+          resourceType: "user",
+          resourceId: args.targetUserId,
+          outcome: "DENIED",
+          correlationId: `ROLE-${now}`,
+          detail: `Role change refused: admin role required (caller role: ${role ?? "none"}).`,
+        },
+        now,
+      );
+      return { ok: false as const, reason: "Admin role required to change roles." };
+    }
+    const target = await ctx.db.get(args.targetUserId as never);
+    if (!target) return { ok: false as const, reason: "Target user not found." };
+    await ctx.db.patch(target._id, { role: args.role } as never);
+    await appendAudit(
+      ctx,
+      {
+        actor: `user:${userId}`,
+        actorType: "USER",
+        action: "ROLE_CHANGED",
+        resourceType: "user",
+        resourceId: args.targetUserId,
+        outcome: "SUCCESS",
+        correlationId: `ROLE-${now}`,
+        detail: `Role set to ${args.role}: ${args.reason}`,
+      },
+      now,
+    );
+    return { ok: true as const };
+  },
+});
+
+/**
+ * Records the RATIFICATION of an existing risk-policy version's declared
+ * limits. Values are never modified here (numerics are fixed by the ADR that
+ * ratifies them). SPEC-GAP-002: the external approval authority/process is not
+ * specified in-app — this mutation only records that ratification occurred.
+ */
+export const approveRiskPolicy = mutation({
+  args: { policyId: v.string(), version: v.number(), attestation: v.string() },
+  handler: async (ctx, args) => {
+    const { userId, role } = await requireActor(ctx);
+    const now = Date.now();
+    if (!requireRole(role, "admin")) {
+      await appendAudit(
+        ctx,
+        {
+          actor: `user:${userId}`,
+          actorType: "USER",
+          action: "RISK_POLICY_APPROVAL_DENIED",
+          resourceType: "riskPolicy",
+          resourceId: `${args.policyId}@v${args.version}`,
+          outcome: "DENIED",
+          correlationId: `POL-${now}`,
+          detail: `Policy approval refused: admin role required (caller role: ${role ?? "none"}).`,
+        },
+        now,
+      );
+      return { ok: false as const, reason: "Admin role required to approve risk policies." };
+    }
+    const policy = await ctx.db
+      .query("riskPolicies")
+      .withIndex("by_policyId", (q) => q.eq("policyId", args.policyId))
+      .first();
+    if (!policy || policy.version !== args.version) {
+      return { ok: false as const, reason: "Risk policy version not found." };
+    }
+    if (policy.status === "APPROVED") {
+      return { ok: false as const, reason: "Policy version is already APPROVED." };
+    }
+    await ctx.db.patch(policy._id, {
+      status: "APPROVED",
+      provenanceNote: `${policy.provenanceNote} | RATIFIED ${new Date(now).toISOString()} by user:${userId}: ${args.attestation}`,
+    });
+    await appendAudit(
+      ctx,
+      {
+        actor: `user:${userId}`,
+        actorType: "USER",
+        action: "RISK_POLICY_APPROVED",
+        resourceType: "riskPolicy",
+        resourceId: `${args.policyId}@v${args.version}`,
+        outcome: "SUCCESS",
+        correlationId: `POL-${now}`,
+        detail: `Risk policy ${args.policyId}@v${args.version} ratified (limits unchanged). Attestation: ${args.attestation}`,
+      },
+      now,
+    );
+    return { ok: true as const };
+  },
+});
+
+/**
+ * Controlled TEST/DEMO configuration: the behavior of the SIMULATED provider
+ * adapter. Admin-gated, mode-gated (PAPER/DEMO only — there is NO way to
+ * select simulation behavior in a live-capable mode), audited.
+ */
+export const setSimulatedProviderBehavior = mutation({
+  args: {
+    behavior: v.union(
+      v.literal("ACK"),
+      v.literal("FILL"),
+      v.literal("PARTIAL"),
+      v.literal("REJECT"),
+      v.literal("TIMEOUT"),
+    ),
+    reason: v.string(),
+  },
+  handler: async (ctx, args) => {
+    const { userId, role } = await requireActor(ctx);
+    const now = Date.now();
+    const state = await ctx.db.query("systemState").first();
+    const mode = state?.mode ?? "DISABLED";
+    if (mode !== "PAPER" && mode !== "DEMO") {
+      await appendAudit(
+        ctx,
+        {
+          actor: `user:${userId}`,
+          actorType: "USER",
+          action: "SIMULATION_CONFIG_DENIED",
+          resourceType: "systemState",
+          resourceId: "global",
+          outcome: "DENIED",
+          correlationId: `SIMCFG-${now}`,
+          detail: `Simulation behavior change refused in mode ${mode} (PAPER/DEMO only).`,
+        },
+        now,
+      );
+      return { ok: false as const, reason: "Simulation behavior can only be configured in PAPER/DEMO modes." };
+    }
+    if (!requireRole(role, "admin")) {
+      await appendAudit(
+        ctx,
+        {
+          actor: `user:${userId}`,
+          actorType: "USER",
+          action: "SIMULATION_CONFIG_DENIED",
+          resourceType: "systemState",
+          resourceId: "global",
+          outcome: "DENIED",
+          correlationId: `SIMCFG-${now}`,
+          detail: `Simulation behavior change refused: admin role required (caller role: ${role ?? "none"}).`,
+        },
+        now,
+      );
+      return { ok: false as const, reason: "Admin role required to change simulation configuration." };
+    }
+    if (!state) return { ok: false as const, reason: "System state missing — fail closed." };
+    await ctx.db.patch(state._id, { simulatedProviderBehavior: args.behavior, updatedAt: now });
+    await appendAudit(
+      ctx,
+      {
+        actor: `user:${userId}`,
+        actorType: "USER",
+        action: "SIMULATION_CONFIG_CHANGED",
+        resourceType: "systemState",
+        resourceId: "global",
+        outcome: "SUCCESS",
+        correlationId: `SIMCFG-${now}`,
+        detail: `Simulated provider behavior set to ${args.behavior} (mode ${mode}): ${args.reason}`,
+      },
+      now,
+    );
+    return { ok: true as const, behavior: args.behavior };
   },
 });

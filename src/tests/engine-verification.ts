@@ -17,7 +17,16 @@ import {
   maskKey,
   redactedSummary,
   validateCredentialInput,
+  PROVIDERS,
 } from "../convex/lib/credentials";
+import { canUseAuthorization, canViewRecord, requireRole, executionAllowedInMode } from "../convex/lib/authz";
+import { applyFill, fillDelta } from "../convex/lib/positions";
+import {
+  runValidationPipeline,
+  verifySnapshotBinding,
+  featureCausalityCheck,
+  SnapshotBinding,
+} from "../convex/lib/pipeline";
 import { readFileSync } from "node:fs";
 import { THEME_STORAGE_KEY, resolveTheme } from "../lib/theme";
 
@@ -28,8 +37,12 @@ function check(name: string, cond: boolean, detail = "") {
   else { fail++; console.log(`FAIL  ${name} ${detail}`); }
 }
 
+// NOTE (contract change): the shared fixture is an APPROVED policy. Policy
+// STATUS is now enforced by the risk engine (TEST-RISK-009/010 cover the
+// PROVISIONAL/SUPERSEDED rejection), so the old PROVISIONAL fixture would
+// have masked the very checks these tests intend to exercise.
 const policy: RiskPolicy = {
-  policyId: "P", version: 1, status: "PROVISIONAL",
+  policyId: "P", version: 1, status: "APPROVED",
   limits: {
     maxNotionalPerTrade: 25000, maxOpenPositions: 3, maxDailyLoss: 2000,
     maxDrawdown: 0.15, maxConsecutiveLosses: 4, maxSpreadBps: 15, maxDataAgeMs: 7200000,
@@ -42,6 +55,7 @@ const baseCtx: RiskContext = {
   dataAgeMs: 60000, dataQualityState: "VALID", spreadBps: 2, openPositions: 1,
   realizedPnlToday: 100, equity: 100100, peakEquity: 100100, consecutiveLosses: 0,
   existingOrderIdempotencyKeys: [], proposalIdempotencyKey: "k1",
+  unresolvedUnknownOrders: 0,
 };
 const proposal: TradeProposal = { proposalId: "P1", side: "BUY", quantity: 0.1, referencePrice: 62000, orderType: "MARKET", mode: "PAPER" };
 
@@ -94,11 +108,11 @@ check("TEST-EXEC-004 wrong quantity rejected", !validateAuthorizationScope(auth,
 check("TEST-EXEC-005 expired authorization rejected", !validateAuthorizationScope({ ...auth, scope: { ...auth.scope, expiresAt: Date.now() - 1 } }, intent, Date.now()).ok);
 check("TEST-EXEC-006 consumed authorization rejected", !validateAuthorizationScope({ ...auth, state: "CONSUMED" }, intent, Date.now()).ok);
 
-const pc = runPrechecks(intent, { systemEnabled: true, killSwitchEngaged: false, providerState: "AVAILABLE", marketStatus: "OPEN", dataAgeMs: 1000, maxDataAgeMs: 7200000, now: Date.now(), existingIdempotencyKeys: [] });
+const pc = runPrechecks(intent, { systemEnabled: true, killSwitchEngaged: false, mode: "PAPER", providerState: "AVAILABLE", marketStatus: "OPEN", dataAgeMs: 1000, maxDataAgeMs: 7200000, now: Date.now(), existingIdempotencyKeys: [], unresolvedUnknownOrders: 0 });
 check("TEST-EXEC-007 precheck passes clean", pc.ok);
-const pc2 = runPrechecks(intent, { systemEnabled: true, killSwitchEngaged: false, providerState: "AVAILABLE", marketStatus: "OPEN", dataAgeMs: 1000, maxDataAgeMs: 7200000, now: Date.now(), existingIdempotencyKeys: ["k1"] });
+const pc2 = runPrechecks(intent, { systemEnabled: true, killSwitchEngaged: false, mode: "PAPER", providerState: "AVAILABLE", marketStatus: "OPEN", dataAgeMs: 1000, maxDataAgeMs: 7200000, now: Date.now(), existingIdempotencyKeys: ["k1"], unresolvedUnknownOrders: 0 });
 check("TEST-EXEC-008 idempotency duplicate -> precheck fails", !pc2.ok);
-const pc3 = runPrechecks(intent, { systemEnabled: true, killSwitchEngaged: false, providerState: "DEGRADED", marketStatus: "OPEN", dataAgeMs: 1000, maxDataAgeMs: 7200000, now: Date.now(), existingIdempotencyKeys: [] });
+const pc3 = runPrechecks(intent, { systemEnabled: true, killSwitchEngaged: false, mode: "PAPER", providerState: "DEGRADED", marketStatus: "OPEN", dataAgeMs: 1000, maxDataAgeMs: 7200000, now: Date.now(), existingIdempotencyKeys: [], unresolvedUnknownOrders: 0 });
 check("TEST-EXEC-009 degraded provider -> precheck fails (unknown -> blocked)", !pc3.ok);
 
 // TEST-DATA semantics
@@ -188,6 +202,238 @@ const goodInput = validateCredentialInput({ provider: "BINANCE", label: "Main de
 check("TEST-SEC-CRED-006 valid PAPER input accepted", goodInput.ok);
 const summary = redactedSummary({ connectionId: "CONN-1", provider: "BINANCE", label: "Main demo", keyMasked: masked, keyFingerprint: fp1.fingerprint, status: "PENDING_VERIFICATION" });
 check("TEST-SEC-CRED-005 redacted summary contains no raw key material", !summary.includes(rawKey) && !summary.includes("ABCDEFGH") && summary.includes("••••"));
+
+// ---------------------------------------------------------------------------
+// AUDIT-REPAIR REGRESSION SUITE (authorization, risk lifecycle, execution,
+// reconciliation, leakage, live-mode restrictions)
+// ---------------------------------------------------------------------------
+
+// TEST-RISK policy lifecycle + input validity
+const d9 = evaluateRisk(proposal, baseCtx, { ...policy, status: "PROVISIONAL" });
+check(
+  "TEST-RISK-009 PROVISIONAL policy cannot authorize execution",
+  d9.outcome === "BLOCK" && !vetoAllows(d9.outcome) && d9.checks.some((c) => c.check === "policy_status" && c.status === "BLOCK"),
+);
+const d10 = evaluateRisk(proposal, baseCtx, { ...policy, status: "SUPERSEDED" });
+check("TEST-RISK-010 SUPERSEDED policy cannot authorize execution", d10.outcome === "BLOCK" && !vetoAllows(d10.outcome));
+const d11 = evaluateRisk({ ...proposal, quantity: NaN }, baseCtx, policy);
+check(
+  "TEST-RISK-011 NaN quantity -> BLOCK (invalid input never approves)",
+  d11.outcome === "BLOCK" && !vetoAllows(d11.outcome) && d11.checks.some((c) => c.check === "input_validity" && c.status === "BLOCK"),
+);
+check(
+  "TEST-RISK-011b negative quantity -> BLOCK",
+  evaluateRisk({ ...proposal, quantity: -1 }, baseCtx, policy).outcome === "BLOCK",
+);
+check(
+  "TEST-RISK-011c zero reference price -> BLOCK",
+  evaluateRisk({ ...proposal, referencePrice: 0 }, baseCtx, policy).outcome === "BLOCK",
+);
+const d12 = evaluateRisk(proposal, baseCtx, { ...policy, limits: { ...policy.limits, maxDrawdown: NaN } });
+check(
+  "TEST-RISK-012 malformed policy limit (NaN) -> BLOCK, never APPROVE",
+  d12.outcome === "BLOCK" && d12.checks.some((c) => c.check === "policy_validity" && c.status === "BLOCK"),
+);
+const d13 = evaluateRisk({ ...proposal, mode: "CONTROLLED_LIVE" }, baseCtx, policy);
+check(
+  "TEST-RISK-013 CONTROLLED_LIVE mode -> BLOCK (live execution not authorized in this build)",
+  d13.outcome === "BLOCK" && !vetoAllows(d13.outcome),
+);
+const d14 = evaluateRisk(proposal, { ...baseCtx, unresolvedUnknownOrders: 2 }, policy);
+check(
+  "TEST-RISK-014 unresolved UNKNOWN orders -> BLOCK (new exposure blocked)",
+  d14.outcome === "BLOCK" && d14.checks.some((c) => c.check === "reconciliation_state" && c.status === "BLOCK"),
+);
+
+// TEST-EXEC mode gate + reconciliation gate + partial fills
+const pc4 = runPrechecks(intent, { systemEnabled: true, killSwitchEngaged: false, mode: "CONTROLLED_LIVE", providerState: "AVAILABLE", marketStatus: "OPEN", dataAgeMs: 1000, maxDataAgeMs: 7200000, now: Date.now(), existingIdempotencyKeys: [], unresolvedUnknownOrders: 0 });
+check(
+  "TEST-EXEC-011 CONTROLLED_LIVE mode -> submission precheck fails",
+  !pc4.ok && pc4.checks.some((c) => c.check === "mode" && c.status === "BLOCK"),
+);
+const pc5 = runPrechecks(intent, { systemEnabled: true, killSwitchEngaged: false, mode: "PAPER", providerState: "AVAILABLE", marketStatus: "OPEN", dataAgeMs: 1000, maxDataAgeMs: 7200000, now: Date.now(), existingIdempotencyKeys: [], unresolvedUnknownOrders: 1 });
+check(
+  "TEST-EXEC-012 unresolved UNKNOWN order -> precheck fails (exposure blocked)",
+  !pc5.ok && pc5.checks.some((c) => c.check === "reconciliation_state" && c.status === "BLOCK"),
+);
+const t2 = normalizeProviderResponse({ kind: "partial_fill", providerOrderId: "P1", filled: 0.5, remaining: 0.5, price: 100 });
+check(
+  "TEST-EXEC-013 partial fill -> PARTIALLY_FILLED, truth ACCEPTED, remainder open",
+  t2.state === "PARTIALLY_FILLED" && t2.providerTruth === "ACCEPTED" && t2.note.includes("remainder open"),
+);
+
+// TEST-AUTHZ authorization boundary (capability tokens, roles, visibility)
+check(
+  "TEST-AUTHZ-001 execution authorization is owner-bound (missing owner fails closed)",
+  canUseAuthorization("u1", "u1") && !canUseAuthorization("u2", "u1") && !canUseAuthorization(undefined, "u1") && !canUseAuthorization(null, "u1"),
+);
+check(
+  "TEST-AUTHZ-002 privileged ops require exact admin role (missing role is never admin)",
+  requireRole("admin", "admin") && !requireRole("user", "admin") && !requireRole(undefined, "admin") && !requireRole(null, "admin"),
+);
+check(
+  "TEST-AUTHZ-003 record visibility: own + system records only, never other users'",
+  canViewRecord("u1", "u1") && canViewRecord(undefined, "u1") && !canViewRecord("u2", "u1"),
+);
+
+// TEST-POS canonical position accounting + duplicate-fill protection
+const p1 = applyFill(null, { side: "BUY", quantity: 1, price: 100 });
+const p2 = applyFill(p1, { side: "BUY", quantity: 1, price: 110 });
+check(
+  "TEST-POS-001 adds use the weighted average entry price",
+  p2.side === "LONG" && p2.quantity === 2 && Math.abs(p2.avgEntryPrice - 105) < 1e-9,
+);
+const p3 = applyFill(p2, { side: "SELL", quantity: 0.5, price: 120 });
+check(
+  "TEST-POS-002 partial close realizes (exit - entry) * qty",
+  p3.quantity === 1.5 && Math.abs(p3.realizedPnl - 7.5) < 1e-9,
+);
+const p4 = applyFill(p3, { side: "SELL", quantity: 1.5, price: 90 });
+check(
+  "TEST-POS-003 close to FLAT realizes the remainder exactly once",
+  p4.side === "FLAT" && p4.quantity === 0 && Math.abs(p4.realizedPnl - -15) < 1e-9,
+);
+const p5 = applyFill({ side: "LONG", quantity: 1, avgEntryPrice: 100, realizedPnl: 0 }, { side: "SELL", quantity: 1.5, price: 110 });
+check(
+  "TEST-POS-004 over-close flips through FLAT to the opposite side",
+  p5.side === "SHORT" && p5.quantity === 0.5 && Math.abs(p5.realizedPnl - 10) < 1e-9,
+);
+check(
+  "TEST-POS-005 repeated provider fill event yields zero delta (no double accounting)",
+  fillDelta(0.5, 0.5) === 0 && fillDelta(0.5, 0.25) === 0.25 && fillDelta(NaN, 0) === 0,
+);
+
+// TEST-LEAK look-ahead protection is COMPUTED, not asserted
+const barsPerturbed = bars.map((b, i) =>
+  i === bars.length - 1 ? { ...b, open: 999, high: 9999, low: 1, close: 4242 } : b,
+);
+const simPert = simulate(barsPerturbed, def, config, { kind: "percentage", version: "c", feeRate: 0, slippageBps: 0 });
+const earlier = (s: { trades: { exitIndex: number }[] }) =>
+  s.trades.filter((t) => t.exitIndex < bars.length - 1);
+check(
+  "TEST-LEAK-001 perturbing FUTURE bars cannot change earlier trade decisions",
+  JSON.stringify(earlier(sim)) === JSON.stringify(earlier(simPert)),
+);
+// Causality needs a series beyond the feature warm-up window; a series too
+// short to assess must report UNKNOWN — never an unsupported PASS.
+const causalityBars: {
+  eventTime: number; open: number; high: number; low: number; close: number; volume: number; availabilityTime: number;
+}[] = [];
+let px = 100;
+for (let i = 0; i < 60; i++) {
+  const o = px;
+  const c = px * (1 + Math.sin(i / 3) * 0.01 + (i % 7) * 0.001);
+  causalityBars.push({
+    eventTime: i * 3600000,
+    open: o,
+    high: Math.max(o, c) * 1.005,
+    low: Math.min(o, c) * 0.995,
+    close: c,
+    volume: 100,
+    availabilityTime: i * 3600000 + 3600000,
+  });
+  px = c;
+}
+check(
+  "TEST-LEAK-002 feature causality (prefix recomputation) verifies on the engine",
+  featureCausalityCheck(causalityBars, def).status === "PASS",
+  `got ${featureCausalityCheck(causalityBars, def).status}`,
+);
+check(
+  "TEST-LEAK-002b series too short to assess reports UNKNOWN, never an unsupported PASS",
+  featureCausalityCheck(bars, def).status === "UNKNOWN",
+);
+const lateCandles = good.map((c, i) =>
+  i === 1 ? { ...c, availabilityTime: c.eventTime + 2 * 3600000 } : c,
+);
+const testSnapshot: SnapshotBinding = {
+  snapshotId: "SNAP-T",
+  marketIds: ["M"],
+  timeframe: "1h",
+  rangeStart: -1,
+  rangeEnd: 10 * 3600000,
+  dataVersion: "test-v1",
+};
+const cleanQuality = {
+  state: "VALID" as const,
+  checks: [],
+  counts: { candles: 3, duplicates: 0, gaps: 0, ohlcViolations: 0, invalidValues: 0 },
+};
+const leakRun = runValidationPipeline({
+  validationId: "V-LEAK",
+  strategyVersionId: "SV-LEAK",
+  dataSnapshotId: "SNAP-T",
+  definition: def,
+  config,
+  cost: { kind: "percentage", version: "c", feeRate: 0, slippageBps: 0 },
+  snapshot: testSnapshot,
+  candles: lateCandles,
+  quality: cleanQuality,
+  marketMeta: { marketId: "M", symbol: "BTC/USD", timeframe: "1h", assetClass: "CRYPTO", spreadBps: 2, liquidityNote: "test" },
+});
+check(
+  "TEST-LEAK-003 late-available bar fails the availability rule (leakage detected, not asserted PASS)",
+  leakRun.leakageState === "POSSIBLE_LEAKAGE" &&
+    leakRun.integrity.some((c) => c.check === "availability_time_rule" && c.status === "FAIL"),
+);
+
+// TEST-VALID snapshot binding
+const badBinding = verifySnapshotBinding({ ...testSnapshot, rangeStart: 2 * 3600000 }, def, good);
+check(
+  "TEST-VALID-013 mismatched snapshot is REJECTED (rows outside the declared range)",
+  badBinding.some((c) => c.check === "snapshot_range" && c.status === "FAIL"),
+);
+const blockedRun = runValidationPipeline({
+  validationId: "V-BLOCKED",
+  strategyVersionId: "SV-BLOCKED",
+  dataSnapshotId: "SNAP-T",
+  definition: def,
+  config,
+  cost: { kind: "percentage", version: "c", feeRate: 0, slippageBps: 0 },
+  snapshot: { ...testSnapshot, rangeStart: 2 * 3600000 },
+  candles: good,
+  quality: cleanQuality,
+  marketMeta: { marketId: "M", symbol: "BTC/USD", timeframe: "1h", assetClass: "CRYPTO", spreadBps: 2, liquidityNote: "test" },
+});
+check(
+  "TEST-VALID-014 snapshot binding failure BLOCKS the run (no metrics, no evidence)",
+  blockedRun.state === "BLOCKED" && blockedRun.metrics === null && blockedRun.evidence === null,
+);
+const okBinding = verifySnapshotBinding(testSnapshot, def, good);
+check(
+  "TEST-VALID-015 matching snapshot binding verifies all binding checks",
+  okBinding.length > 0 && okBinding.every((c) => c.status === "PASS"),
+);
+check(
+  "TEST-VALID-016 missing snapshot is rejected (binding fails closed)",
+  verifySnapshotBinding(null, def, good).some((c) => c.check === "snapshot_exists" && c.status === "FAIL"),
+);
+
+// TEST-LIVE live-mode restrictions
+check(
+  "TEST-LIVE-001 no real provider adapter exists (all SIMULATED or NOT_CONFIGURED)",
+  PROVIDERS.every((p) => p.adapter === "SIMULATED" || p.adapter === "NOT_CONFIGURED"),
+);
+check(
+  "TEST-LIVE-002 submission is PAPER/DEMO only; CONTROLLED_LIVE and DISABLED are denied",
+  executionAllowedInMode("PAPER") && executionAllowedInMode("DEMO") && !executionAllowedInMode("CONTROLLED_LIVE") && !executionAllowedInMode("DISABLED"),
+);
+
+// TEST-WIRE server-side enforcement wiring (the frontend is never the boundary)
+const wfSrc = readFileSync(new URL("../convex/workflows.ts", import.meta.url), "utf8");
+const authGateCalls = (wfSrc.match(/requireActor\(ctx\)|requireUser\(ctx\)/g) ?? []).length;
+const mutationBlocks = (wfSrc.match(/mutation\(\{/g) ?? []).length;
+check(
+  "TEST-WIRE-001 every workflows mutation authenticates the caller server-side",
+  authGateCalls >= mutationBlocks,
+  `gates=${authGateCalls} mutations=${mutationBlocks}`,
+);
+check(
+  "TEST-WIRE-002 placeOrder enforces authorization ownership and consumes atomically; no client simulate flag",
+  wfSrc.includes("canUseAuthorization(auth.ownerUserId, userId)") &&
+    wfSrc.includes('state: "CONSUMED"') &&
+    !wfSrc.includes("args.simulate"),
+);
 
 // TEST-THEME-* dark theme mode wiring (current UI changes)
 check("TEST-THEME-001 dark is the default for missing/unknown stored values", resolveTheme(null) === "dark" && resolveTheme(undefined) === "dark" && resolveTheme("blue") === "dark");

@@ -360,8 +360,13 @@ const schema = defineSchema(
       ),
       outcome: riskOutcomeValidator,
       actor: v.string(),
+      // Owner of the record (server-derived from auth, never client-supplied).
+      // Optional for pre-existing/system rows; undefined = shared system record.
+      ownerUserId: v.optional(v.string()),
       createdAt: v.number(),
-    }).index("by_proposalId", ["proposalId"]),
+    })
+      .index("by_proposalId", ["proposalId"])
+      .index("by_ownerUserId", ["ownerUserId"]),
 
     // -----------------------------------------------------------------------
     // EXECUTION (Section 11) — authorization, order lifecycle, reconciliation
@@ -386,7 +391,11 @@ const schema = defineSchema(
       issuedAt: v.number(),
       consumedByOrderId: v.optional(v.string()),
       revocationReason: v.optional(v.string()),
-    }).index("by_authorizationId", ["authorizationId"]),
+      // Capability tokens are owner-bound: only the issuing user may consume.
+      ownerUserId: v.optional(v.string()),
+    })
+      .index("by_authorizationId", ["authorizationId"])
+      .index("by_ownerUserId", ["ownerUserId"]),
 
     orders: defineTable({
       orderId: v.string(),
@@ -417,9 +426,12 @@ const schema = defineSchema(
           note: v.string(),
         }),
       ),
+      ownerUserId: v.optional(v.string()),
       createdAt: v.number(),
       updatedAt: v.number(),
-    }).index("by_idempotencyKey", ["idempotencyKey"]),
+    })
+      .index("by_idempotencyKey", ["idempotencyKey"])
+      .index("by_ownerUserId", ["ownerUserId"]),
 
     positions: defineTable({
       positionId: v.string(),
@@ -456,8 +468,11 @@ const schema = defineSchema(
       candidateStrategyVersionId: v.optional(v.string()),
       // LEARNING ISOLATION: learning never mutates a live/validated version.
       liveMutationAttempted: v.boolean(),
+      ownerUserId: v.optional(v.string()),
       createdAt: v.number(),
-    }).index("by_learningEventId", ["learningEventId"]),
+    })
+      .index("by_learningEventId", ["learningEventId"])
+      .index("by_ownerUserId", ["ownerUserId"]),
 
     // -----------------------------------------------------------------------
     // AGENTS (Section 05) — registry, scoped permissions
@@ -550,6 +565,22 @@ const schema = defineSchema(
       killSwitchReason: v.optional(v.string()),
       liveAutoResume: v.boolean(),
       environment: v.string(),
+      // Controlled TEST/DEMO configuration: which behavior the SIMULATED
+      // provider adapter exhibits. Server-side config, never a per-request
+      // client flag (admin-gated + mode-gated mutation).
+      simulatedProviderBehavior: v.optional(
+        v.union(
+          v.literal("ACK"),
+          v.literal("FILL"),
+          v.literal("PARTIAL"),
+          v.literal("REJECT"),
+          v.literal("TIMEOUT"),
+        ),
+      ),
+      // Risk accounting state (derived server-side at fill time only).
+      peakEquity: v.optional(v.number()),
+      pnlDay: v.optional(v.string()),
+      realizedPnlDay: v.optional(v.number()),
       controlledLiveGates: v.array(
         v.object({ gate: v.string(), satisfied: v.boolean(), note: v.string() }),
       ),

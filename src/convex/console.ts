@@ -9,6 +9,7 @@
 import { getAuthUserId } from "@convex-dev/auth/server";
 import { query, QueryCtx } from "./_generated/server";
 import { verifyAuditChain, AuditRecord } from "./lib/audit";
+import { canViewRecord } from "./lib/authz";
 
 async function requireUser(ctx: QueryCtx) {
   const userId = await getAuthUserId(ctx);
@@ -29,6 +30,11 @@ export const overview = query({
     const audit = await ctx.db.query("auditEvents").take(200);
     const agents = await ctx.db.query("agents").take(50);
 
+    // Owner scoping: a user sees their OWN private records plus shared SYSTEM
+    // records — never another user's private records (IDOR protection).
+    const userId = await requireUser(ctx);
+    const visibleOrders = orders.filter((o) => canViewRecord(o.ownerUserId, userId));
+
     const sortedAudit = audit
       .slice()
       .sort((a, b) => a.sequence - b.sequence)
@@ -48,6 +54,9 @@ export const overview = query({
           hash: r.hash,
         }),
       );
+    const visibleAudit = sortedAudit.filter(
+      (r) => r.actorType === "SERVICE" || r.actor === `user:${userId}`,
+    );
 
     return {
       systemState: state ?? null,
@@ -72,12 +81,14 @@ export const overview = query({
           maxDrawdown: v.metrics?.maxDrawdown ?? null,
         })),
       orderCounts: {
-        total: orders.length,
-        unknown: orders.filter((o) => o.state === "UNKNOWN").length,
-        filled: orders.filter((o) => o.state === "FILLED").length,
+        total: visibleOrders.length,
+        unknown: visibleOrders.filter((o) => o.state === "UNKNOWN").length,
+        filled: visibleOrders.filter((o) => o.state === "FILLED").length,
       },
+      // Chain integrity is verified over the FULL chain; only the visible
+      // (own + system) events are returned to the client.
       auditChain: verifyAuditChain(sortedAudit),
-      recentAudit: sortedAudit.slice(-6).reverse(),
+      recentAudit: visibleAudit.slice(-6).reverse(),
       agentCounts: {
         total: agents.length,
         deterministic: agents.filter((a) => a.isDeterministic).length,
@@ -117,6 +128,7 @@ export const strategies = query({
   args: {},
   handler: async (ctx) => {
     await requireUser(ctx);
+    const userId = await requireUser(ctx);
     const strategies = await ctx.db.query("strategies").take(50);
     const versions = await ctx.db.query("strategyVersions").take(100);
     const evidence = await ctx.db.query("evidenceRecords").take(100);
@@ -130,7 +142,7 @@ export const strategies = query({
         evidence: evidence.find((e) => e.strategyVersionId === v.strategyVersionId) ?? null,
         fitness: fitness.find((f) => f.strategyVersionId === v.strategyVersionId) ?? null,
       })),
-      learningEvents: learning,
+      learningEvents: learning.filter((l) => canViewRecord(l.ownerUserId, userId)),
     };
   },
 });
@@ -156,11 +168,11 @@ export const validation = query({
 export const risk = query({
   args: {},
   handler: async (ctx) => {
-    await requireUser(ctx);
+    const userId = await requireUser(ctx);
     const policies = await ctx.db.query("riskPolicies").take(20);
-    const decisions = (await ctx.db.query("riskDecisions").take(50)).sort(
-      (a, b) => b.createdAt - a.createdAt,
-    );
+    const decisions = (await ctx.db.query("riskDecisions").take(50))
+      .filter((d) => canViewRecord(d.ownerUserId, userId))
+      .sort((a, b) => b.createdAt - a.createdAt);
     const state = await ctx.db.query("systemState").first();
     return { policies, decisions, systemState: state ?? null };
   },
@@ -169,11 +181,13 @@ export const risk = query({
 export const execution = query({
   args: {},
   handler: async (ctx) => {
-    await requireUser(ctx);
-    const authorizations = await ctx.db.query("executionAuthorizations").take(50);
-    const orders = (await ctx.db.query("orders").take(100)).sort(
-      (a, b) => b.createdAt - a.createdAt,
+    const userId = await requireUser(ctx);
+    const authorizations = (await ctx.db.query("executionAuthorizations").take(50)).filter(
+      (a) => canViewRecord(a.ownerUserId, userId),
     );
+    const orders = (await ctx.db.query("orders").take(100))
+      .filter((o) => canViewRecord(o.ownerUserId, userId))
+      .sort((a, b) => b.createdAt - a.createdAt);
     const positions = await ctx.db.query("positions").take(50);
     const monitoring = await ctx.db.query("monitoringEvents").take(50);
     return { authorizations, orders, positions, monitoring };
@@ -183,11 +197,11 @@ export const execution = query({
 export const agents = query({
   args: {},
   handler: async (ctx) => {
-    await requireUser(ctx);
+    const userId = await requireUser(ctx);
     const agents = await ctx.db.query("agents").take(50);
-    const learning = (await ctx.db.query("learningEvents").take(50)).sort(
-      (a, b) => b.createdAt - a.createdAt,
-    );
+    const learning = (await ctx.db.query("learningEvents").take(50))
+      .filter((l) => canViewRecord(l.ownerUserId, userId))
+      .sort((a, b) => b.createdAt - a.createdAt);
     return { agents, learningEvents: learning };
   },
 });
@@ -195,7 +209,7 @@ export const agents = query({
 export const audit = query({
   args: {},
   handler: async (ctx) => {
-    await requireUser(ctx);
+    const userId = await requireUser(ctx);
     const rows = await ctx.db.query("auditEvents").take(250);
     const sorted = rows
       .slice()
@@ -216,6 +230,10 @@ export const audit = query({
           hash: r.hash,
         }),
       );
-    return { events: sorted.slice().reverse(), chain: verifyAuditChain(sorted) };
+    // Integrity over the FULL chain; only own + system events are returned.
+    const visible = sorted.filter(
+      (r) => r.actorType === "SERVICE" || r.actor === `user:${userId}`,
+    );
+    return { events: visible.slice().reverse(), chain: verifyAuditChain(sorted) };
   },
 });

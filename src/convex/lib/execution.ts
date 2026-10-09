@@ -65,12 +65,16 @@ export interface OrderIntent {
 export interface PrecheckContext {
   systemEnabled: boolean;
   killSwitchEngaged: boolean;
+  /** Effective execution mode. Only PAPER/DEMO may submit. */
+  mode: string;
   providerState: "AVAILABLE" | "DEGRADED" | "UNAVAILABLE";
   marketStatus: string;
   dataAgeMs: number | null;
   maxDataAgeMs: number | null;
   now: number;
   existingIdempotencyKeys: string[];
+  /** Orders in UNKNOWN state awaiting reconciliation. > 0 blocks exposure. */
+  unresolvedUnknownOrders: number;
 }
 
 export interface PrecheckResult {
@@ -125,8 +129,27 @@ export function runPrechecks(intent: OrderIntent, ctx: PrecheckContext): Prechec
   if (!ctx.systemEnabled) add("system_enabled", "BLOCK", "Execution subsystem disabled.");
   else add("system_enabled", "PASS", "Execution subsystem enabled.");
 
+  // Submission is permitted in PAPER/DEMO ONLY. CONTROLLED_LIVE is never
+  // reachable here: live activation is a separate, explicitly approved
+  // operation and is not implemented in this build.
+  if (ctx.mode !== "PAPER" && ctx.mode !== "DEMO")
+    add(
+      "mode",
+      "BLOCK",
+      `Mode ${ctx.mode} permits no order submission (PAPER/DEMO only; live execution is not authorized in this build).`,
+    );
+  else add("mode", "PASS", `Mode ${ctx.mode} permits simulated submission.`);
+
   if (ctx.killSwitchEngaged) add("kill_switch", "BLOCK", "Kill switch ENGAGED.");
   else add("kill_switch", "PASS", "Kill switch released.");
+
+  if (ctx.unresolvedUnknownOrders > 0)
+    add(
+      "reconciliation_state",
+      "BLOCK",
+      `${ctx.unresolvedUnknownOrders} order(s) in UNKNOWN state await reconciliation — new exposure blocked until external state is known.`,
+    );
+  else add("reconciliation_state", "PASS", "No unresolved UNKNOWN order state.");
 
   if (ctx.providerState !== "AVAILABLE")
     add("provider_status", "UNKNOWN", `Provider ${ctx.providerState} — submission safety unknown; do not submit.`);

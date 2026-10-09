@@ -10,8 +10,8 @@ export default function ExecutionPanel() {
   const placeOrder = useMutation(api.workflows.placeOrder);
   const reconcile = useMutation(api.workflows.reconcile);
   const setKillSwitch = useMutation(api.workflows.setKillSwitch);
+  const setProviderBehavior = useMutation(api.workflows.setSimulatedProviderBehavior);
 
-  const [simulate, setSimulate] = useState<"ACK" | "FILL" | "REJECT" | "TIMEOUT">("TIMEOUT");
   const [quantity, setQuantity] = useState("0.1");
   const [busy, setBusy] = useState<string | null>(null);
   const [notice, setNotice] = useState<string | null>(null);
@@ -23,6 +23,24 @@ export default function ExecutionPanel() {
   const pendingAuth = data.authorizations.find((a) => a.state === "APPROVED");
   const unknownOrders = data.orders.filter((o) => o.state === "UNKNOWN");
 
+  const handleBehaviorChange = async (behavior: "ACK" | "FILL" | "PARTIAL" | "REJECT" | "TIMEOUT") => {
+    setBusy("behavior");
+    setNotice(null);
+    try {
+      const res = await setProviderBehavior({
+        behavior,
+        reason: "Operator configured the simulated provider adapter from the console (test/demo configuration).",
+      });
+      setNotice(
+        "ok" in res && res.ok
+          ? `Simulated provider behavior set to ${behavior} (server-side config).`
+          : `Simulation config change refused: ${"reason" in res ? res.reason : "denied"}`,
+      );
+    } finally {
+      setBusy(null);
+    }
+  };
+
   const handlePlace = async () => {
     if (!pendingAuth) return;
     setBusy("place");
@@ -33,17 +51,11 @@ export default function ExecutionPanel() {
         authorizationId: pendingAuth.authorizationId,
         strategyVersionId: pendingAuth.scope.strategyVersionId,
         marketId: pendingAuth.scope.marketId,
-        symbol: pendingAuth.scope.marketId.includes("BTC")
-          ? "BTC/USD"
-          : pendingAuth.scope.marketId.includes("ETH")
-            ? "ETH/USD"
-            : "EUR/USD",
         side: pendingAuth.scope.side as "BUY" | "SELL",
         quantity: Number(quantity),
         orderType: "MARKET",
         timeInForce: "GTC",
         idempotencyKey: key,
-        simulate,
       });
       setNotice(
         res.deduped
@@ -65,25 +77,21 @@ export default function ExecutionPanel() {
         authorizationId: pendingAuth.authorizationId,
         strategyVersionId: pendingAuth.scope.strategyVersionId,
         marketId: pendingAuth.scope.marketId,
-        symbol: "BTC/USD",
         side: pendingAuth.scope.side as "BUY" | "SELL",
         quantity: Number(quantity),
         orderType: "MARKET",
         timeInForce: "GTC",
         idempotencyKey: key,
-        simulate: "ACK",
       });
       const second = await placeOrder({
         authorizationId: pendingAuth.authorizationId,
         strategyVersionId: pendingAuth.scope.strategyVersionId,
         marketId: pendingAuth.scope.marketId,
-        symbol: "BTC/USD",
         side: pendingAuth.scope.side as "BUY" | "SELL",
         quantity: Number(quantity),
         orderType: "MARKET",
         timeInForce: "GTC",
         idempotencyKey: key,
-        simulate: "ACK",
       });
       setNotice(
         `Idempotency test: first submit → ${first.state}; identical resubmit → ${second.deduped ? `deduplicated (${second.state}) — duplicate order prevented` : "NOT DEDUPLICATED (violation)"}.`,
@@ -150,16 +158,20 @@ export default function ExecutionPanel() {
       >
         <div className="flex flex-wrap items-end gap-3">
           <label className="flex flex-col gap-1 text-[11px] font-medium text-muted-foreground">
-            Provider behavior
+            Provider behavior (server-side config · admin)
             <select
-              value={simulate}
-              onChange={(e) => setSimulate(e.target.value as typeof simulate)}
+              value={riskData.systemState?.simulatedProviderBehavior ?? "ACK"}
+              onChange={(e) =>
+                handleBehaviorChange(e.target.value as "ACK" | "FILL" | "PARTIAL" | "REJECT" | "TIMEOUT")
+              }
+              disabled={busy !== null}
               className="rounded-lg border border-border/80 bg-background px-3 py-2 text-xs text-foreground"
             >
-              <option value="TIMEOUT">TIMEOUT → order becomes UNKNOWN</option>
               <option value="ACK">ACK → acknowledged</option>
               <option value="FILL">FILL → filled immediately</option>
+              <option value="PARTIAL">PARTIAL → half-filled, remainder open</option>
               <option value="REJECT">REJECT → provider rejects</option>
+              <option value="TIMEOUT">TIMEOUT → order becomes UNKNOWN</option>
             </select>
           </label>
           <label className="flex flex-col gap-1 text-[11px] font-medium text-muted-foreground">

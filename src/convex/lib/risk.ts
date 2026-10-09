@@ -56,6 +56,8 @@ export interface RiskContext {
   consecutiveLosses: number;
   existingOrderIdempotencyKeys: string[];
   proposalIdempotencyKey: string;
+  /** Orders in UNKNOWN state awaiting reconciliation. > 0 blocks new exposure. */
+  unresolvedUnknownOrders: number;
 }
 
 export interface TradeProposal {
@@ -75,6 +77,55 @@ export interface RiskDecisionResult {
 
 const UNKNOWN_BLOCKS = true; // fail-closed invariant
 
+const finite = (x: unknown): x is number =>
+  typeof x === "number" && Number.isFinite(x);
+
+/**
+ * Required-input validation. Invalid or non-finite values must NEVER produce
+ * an approval (Section 10): a malformed proposal or policy is a deterministic
+ * BLOCK, and numeric limit evaluation is skipped rather than fed NaN.
+ */
+function validateInputs(
+  proposal: TradeProposal,
+  ctx: RiskContext,
+  policy: RiskPolicy,
+): { problems: string[]; malformedPolicy: boolean } {
+  const problems: string[] = [];
+  if (!finite(proposal.quantity) || proposal.quantity <= 0)
+    problems.push("proposal.quantity must be a finite number > 0");
+  if (!finite(proposal.referencePrice) || proposal.referencePrice <= 0)
+    problems.push("proposal.referencePrice must be a finite number > 0");
+  if (!finite(ctx.equity) || ctx.equity < 0) problems.push("ctx.equity invalid");
+  if (!finite(ctx.peakEquity) || ctx.peakEquity <= 0)
+    problems.push("ctx.peakEquity invalid");
+  if (!finite(ctx.realizedPnlToday)) problems.push("ctx.realizedPnlToday invalid");
+  if (!finite(ctx.openPositions) || ctx.openPositions < 0)
+    problems.push("ctx.openPositions invalid");
+  if (!finite(ctx.consecutiveLosses) || ctx.consecutiveLosses < 0)
+    problems.push("ctx.consecutiveLosses invalid");
+  if (!finite(ctx.unresolvedUnknownOrders) || ctx.unresolvedUnknownOrders < 0)
+    problems.push("ctx.unresolvedUnknownOrders invalid");
+
+  let malformedPolicy = false;
+  const limits: (keyof RiskPolicyLimits)[] = [
+    "maxNotionalPerTrade",
+    "maxOpenPositions",
+    "maxDailyLoss",
+    "maxDrawdown",
+    "maxConsecutiveLosses",
+    "maxSpreadBps",
+    "maxDataAgeMs",
+  ];
+  for (const key of limits) {
+    const v = policy.limits[key];
+    if (v !== null && !finite(v)) {
+      malformedPolicy = true;
+      problems.push(`policy.limits.${key} is neither null nor a finite number`);
+    }
+  }
+  return { problems, malformedPolicy };
+}
+
 export function evaluateRisk(
   proposal: TradeProposal,
   ctx: RiskContext,
@@ -83,6 +134,30 @@ export function evaluateRisk(
   const checks: RiskCheck[] = [];
   const push = (check: string, status: RiskCheckStatus, detail: string) =>
     checks.push({ check, status, detail });
+
+  // --- Required inputs + policy shape (fail closed on garbage) -----------
+  const { problems, malformedPolicy } = validateInputs(proposal, ctx, policy);
+  if (problems.length > 0) {
+    push(
+      malformedPolicy ? "policy_validity" : "input_validity",
+      "BLOCK",
+      `Invalid risk inputs — evaluation refused (fail closed): ${problems.join("; ")}.`,
+    );
+    return { outcome: "BLOCK", checks, policyRef: `${policy.policyId}@v${policy.version} (${policy.status})` };
+  }
+  push("input_validity", "PASS", "All required risk inputs are finite and valid.");
+
+  // --- Policy eligibility (approved lifecycle only) ----------------------
+  // Unapproved or provisional policies must NOT authorize execution (Section 10).
+  if (policy.status !== "APPROVED") {
+    push(
+      "policy_status",
+      "BLOCK",
+      `Risk policy ${policy.policyId}@v${policy.version} is ${policy.status} — only an APPROVED policy version may authorize execution.`,
+    );
+    return { outcome: "BLOCK", checks, policyRef: `${policy.policyId}@v${policy.version} (${policy.status})` };
+  }
+  push("policy_status", "PASS", `Risk policy ${policy.policyId}@v${policy.version} is APPROVED.`);
 
   // --- System gates -------------------------------------------------------
   if (ctx.killSwitchEngaged) {
@@ -95,8 +170,25 @@ export function evaluateRisk(
     push("mode", "BLOCK", "System mode DISABLED — no new execution.");
   } else if (proposal.mode === "RESEARCH" || proposal.mode === "BACKTEST" || proposal.mode === "OUT_OF_SAMPLE") {
     push("mode", "BLOCK", `Mode ${proposal.mode} has no external execution path.`);
+  } else if (proposal.mode === "CONTROLLED_LIVE") {
+    // Live activation is a separate, explicitly authorized operation. It is
+    // NOT reachable in this build — never a side effect of any other action.
+    push("mode", "BLOCK", "CONTROLLED_LIVE execution is NOT authorized in this build (live activation prohibited — requires a separate, approved live-readiness process). ");
   } else {
     push("mode", "PASS", `Mode ${proposal.mode} permits simulated/authorized execution.`);
+  }
+
+  // --- Reconciliation state ----------------------------------------------
+  // Unresolved UNKNOWN order state makes risk evaluation unreliable; new
+  // exposure is blocked until reconciliation resolves it.
+  if (ctx.unresolvedUnknownOrders > 0) {
+    push(
+      "reconciliation_state",
+      "BLOCK",
+      `${ctx.unresolvedUnknownOrders} order(s) in UNKNOWN state await reconciliation — new exposure is blocked until external state is known.`,
+    );
+  } else {
+    push("reconciliation_state", "PASS", "No unresolved UNKNOWN order state.");
   }
 
   // --- Strategy eligibility ----------------------------------------------
