@@ -25,6 +25,18 @@ import { applyFill, fillDelta, PositionState } from "./lib/positions";
 const HOUR = 3600_000;
 const PAPER_EQUITY_BASE = 100000;
 
+// BOUNDED-SCAN SAFETY: safety-relevant reads must be COMPLETE at any database
+// size and record age — never a bounded scan that silently undercounts
+// exposure. Convex allows at most 16,384 documents per query and only one
+// paginated query per function execution, so unbounded aggregation inside a
+// single transaction is not possible. The enforced rule throughout this file:
+//  - prefer INDEXED existence checks (complete at any table size), and
+//  - where a scan is unavoidable, detect saturation explicitly: if a capped
+//    scan returns the full cap, completeness CANNOT be established — the risk
+//    context reports `accountStateComplete: false` and the engine fails
+//    CLOSED (UNKNOWN -> no new exposure), never a silent undercount.
+const SCAN_CAP = 2000;
+
 async function requireUser(ctx: MutationCtx) {
   const userId = await getAuthUserId(ctx);
   if (userId === null) throw new Error("UNAUTHENTICATED");
@@ -86,8 +98,20 @@ export async function loadRiskContext(
     .order("desc")
     .first()) ?? null;
 
-  const positions = await ctx.db.query("positions").take(100);
-  const orders = await ctx.db.query("orders").take(500);
+  // BOUNDED-SCAN SAFETY: positions are read with saturation detection (see
+  // SCAN_CAP). The UNKNOWN-gate and duplicate-key reads below are INDEXED
+  // checks — complete at any table size and any record age.
+  const positions = await ctx.db.query("positions").take(SCAN_CAP);
+  const unknownRows = await ctx.db
+    .query("orders")
+    .withIndex("by_state", (q) => q.eq("state", "UNKNOWN"))
+    .take(SCAN_CAP);
+  const duplicateKeyOrder = await ctx.db
+    .query("orders")
+    .withIndex("by_idempotencyKey", (q) => q.eq("idempotencyKey", args.proposalIdempotencyKey))
+    .first();
+  // Completeness CANNOT be established past the cap -> fail closed upstream.
+  const accountStateComplete = positions.length < SCAN_CAP && unknownRows.length < SCAN_CAP;
 
   const realized = positions.reduce((a, p) => a + p.realizedPnl, 0);
   const equity = PAPER_EQUITY_BASE + realized;
@@ -106,7 +130,11 @@ export async function loadRiskContext(
   // Peak equity is server-maintained at fill time; the legacy fallback is the
   // contribution base (never `equity` itself, which would force drawdown to 0).
   const peakEquity = Math.max(state?.peakEquity ?? PAPER_EQUITY_BASE, equity);
-  const unresolvedUnknownOrders = orders.filter((o) => o.state === "UNKNOWN").length;
+  // Indexed state read: detection of unresolved UNKNOWN orders is complete at
+  // any table size (the count is exact below SCAN_CAP; at/above the cap the
+  // exact total is unknown — `accountStateComplete` is false and exposure is
+  // blocked regardless).
+  const unresolvedUnknownOrders = unknownRows.length;
 
   const eligible =
     validation?.state === "COMPLETED" &&
@@ -131,9 +159,12 @@ export async function loadRiskContext(
     equity,
     peakEquity,
     consecutiveLosses: 0,
-    existingOrderIdempotencyKeys: orders.map((o) => o.idempotencyKey),
+    // Targeted indexed lookup: only the collision candidate (never a bounded
+    // key list) — the engine checks membership for duplicate detection.
+    existingOrderIdempotencyKeys: duplicateKeyOrder ? [args.proposalIdempotencyKey] : [],
     proposalIdempotencyKey: args.proposalIdempotencyKey,
     unresolvedUnknownOrders,
+    accountStateComplete,
   };
 
   return {
@@ -404,7 +435,13 @@ export const placeOrder = mutation({
     // blocked regardless of owner (fail-closed). Scoping this gate per owner
     // is a product-tenancy decision left open as a spec gap — it is not
     // silently weakened here.
-    const allOrders = await ctx.db.query("orders").take(500);
+    // BOUNDED-SCAN SAFETY: the UNKNOWN gate is an INDEXED state read —
+    // complete at any database size/age; the duplicate-key input reuses the
+    // targeted lookup already performed above (never a bounded global scan).
+    const unknownRows = await ctx.db
+      .query("orders")
+      .withIndex("by_state", (q) => q.eq("state", "UNKNOWN"))
+      .take(SCAN_CAP);
 
     const precheck = runPrechecks(intent, {
       systemEnabled: state?.mode !== "DISABLED",
@@ -415,8 +452,8 @@ export const placeOrder = mutation({
       dataAgeMs: lastCandle ? now - lastCandle.availabilityTime : null,
       maxDataAgeMs: 2 * HOUR,
       now,
-      existingIdempotencyKeys: allOrders.map((o) => o.idempotencyKey),
-      unresolvedUnknownOrders: allOrders.filter((o) => o.state === "UNKNOWN").length,
+      existingIdempotencyKeys: existing ? [args.idempotencyKey] : [],
+      unresolvedUnknownOrders: unknownRows.length,
     });
 
     const passed = scopeCheck.ok && precheck.ok;
@@ -530,7 +567,12 @@ export const placeOrder = mutation({
         // Account-level risk accounting maintained server-side at fill time:
         // daily realized PnL (UTC day) and all-time peak equity.
         const realizedDelta = next.realizedPnl - (prev?.realizedPnl ?? 0);
-        const allPositions = await ctx.db.query("positions").take(100);
+        // BOUNDED-SCAN SAFETY: saturation-aware read (see SCAN_CAP). If the
+        // scan ever saturates, `loadRiskContext` reports incompleteness and
+        // ALL new exposure is blocked fail-closed (UNKNOWN verdict), so a
+        // fill-time equity figure can only undercount inside a regime where no
+        // new authorization can be granted anyway.
+        const allPositions = await ctx.db.query("positions").take(SCAN_CAP);
         const totalRealized = allPositions.reduce((a, p) => a + p.realizedPnl, 0);
         const equityNow = PAPER_EQUITY_BASE + totalRealized;
         const dayKey = new Date(now).toISOString().slice(0, 10);
@@ -610,7 +652,28 @@ export const reconcile = mutation({
     // OWNERSHIP: reconciliation only touches records the caller may act on —
     // their OWN orders plus shared SYSTEM records. A foreign UNKNOWN order is
     // its owner's to reconcile; it stays fail-closed for everyone else.
-    const orders = (await ctx.db.query("orders").take(500)).filter((o) =>
+    // BOUNDED-SCAN SAFETY: the scan is over the RELEVANT states via index (not
+    // a limited global scan), so any order that can be reconciled is found at
+    // any table size. If a state scan saturates, completeness cannot be
+    // established: unreconciled orders are reported, `healthy` stays false and
+    // new shared-account exposure stays blocked (fail-closed).
+    const unknownRows = await ctx.db
+      .query("orders")
+      .withIndex("by_state", (q) => q.eq("state", "UNKNOWN"))
+      .take(SCAN_CAP);
+    const submittingRows = await ctx.db
+      .query("orders")
+      .withIndex("by_state", (q) => q.eq("state", "SUBMITTING"))
+      .take(SCAN_CAP);
+    const submittedRows = await ctx.db
+      .query("orders")
+      .withIndex("by_state", (q) => q.eq("state", "SUBMITTED"))
+      .take(SCAN_CAP);
+    const scanComplete =
+      unknownRows.length < SCAN_CAP &&
+      submittingRows.length < SCAN_CAP &&
+      submittedRows.length < SCAN_CAP;
+    const orders = [...unknownRows, ...submittingRows, ...submittedRows].filter((o) =>
       canViewRecord(o.ownerUserId, userId),
     );
 
@@ -655,7 +718,8 @@ export const reconcile = mutation({
       }
     }
 
-    const healthy = unresolved.length === 0;
+    // Completeness cannot be established over a saturated scan -> NOT healthy.
+    const healthy = scanComplete && unresolved.length === 0;
     await appendAudit(
       ctx,
       {
@@ -668,7 +732,7 @@ export const reconcile = mutation({
         correlationId: `RECON-${now}`,
         detail: healthy
           ? `Orders/fills/positions reconciled against provider ledger. Resolved: ${resolved.map((r) => `${r.orderId} ${r.from}->${r.to}`).join(", ") || "none"}.`
-          : `Unresolved orders remain: ${unresolved.join(", ")}. NEW EXPOSURE IS BLOCKED until reconciliation succeeds.`,
+          : `${scanComplete ? "" : "Order scan saturated — additional orders may remain unreconciled. "}${unresolved.length > 0 ? `Unresolved orders remain: ${unresolved.join(", ")}. ` : ""}NEW EXPOSURE IS BLOCKED until reconciliation succeeds.`,
       },
       now,
     );
@@ -1075,9 +1139,13 @@ export const setKillSwitch = mutation({
         return { ok: false as const, reason: "Admin role required to release the kill switch." };
       }
       // Releasing ALSO requires healthy reconciliation — fail closed otherwise.
-      const unknownOrders = (await ctx.db.query("orders").take(500)).filter(
-        (o) => o.state === "UNKNOWN",
-      );
+      // BOUNDED-SCAN SAFETY: indexed state read — complete at any table size
+      // (an UNKNOWN order beyond a scan boundary must never slip past this
+      // release gate).
+      const unknownOrders = await ctx.db
+        .query("orders")
+        .withIndex("by_state", (q) => q.eq("state", "UNKNOWN"))
+        .take(SCAN_CAP);
       if (unknownOrders.length > 0) {
         await appendAudit(
           ctx,

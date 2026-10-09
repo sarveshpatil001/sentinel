@@ -75,6 +75,12 @@ export interface ChainVerification {
    */
   scope: ChainScope;
   note: string;
+  /**
+   * Number of records whose linkage AND content hash actually passed in this
+   * run — NOT the number of records visible after user filtering. On a broken
+   * chain this counts only records verified BEFORE the break.
+   */
+  verifiedCount: number;
 }
 
 /**
@@ -84,10 +90,13 @@ export interface ChainVerification {
  * `anchorPrevHash` is the hash the first record must LINK to. Defaults to
  * GENESIS. When verifying a WINDOW of a longer chain, pass the window's first
  * record's own prevHash: internal linkage and every record hash are verified,
- * and the anchor itself is TRUSTED — that trust is declared in the result
- * (`scope: "WINDOW"`), never hidden. A range that does not start at record
- * sequence 1 can NEVER be presented as whole-history integrity, whatever
- * anchor it claims.
+ * and the anchor itself is SELF-ATTESTED — it is NOT independently trusted
+ * unless checked against a separately protected checkpoint. That limitation
+ * is declared in the result (`scope: "WINDOW"`), never hidden. A range that
+ * does not start at record sequence 1 can NEVER be presented as whole-history
+ * integrity, whatever anchor it claims. Sequence numbers within the verified
+ * range must be consecutive: missing, duplicated or reordered records FAIL
+ * verification.
  */
 export function verifyAuditChain(
   records: AuditRecord[],
@@ -106,9 +115,31 @@ export function verifyAuditChain(
         ? "Window linkage and record hashes verified against an anchor taken from the log ITSELF (self-attested, NOT independently trusted). History BEFORE the anchor is NOT verified. Tamper-evident FNV-1a only — NOT tamper-proof."
         : "Full chain verified from GENESIS. Tamper-evident FNV-1a chain — NOT tamper-proof (no external anchoring).";
   let prevHash = anchorPrevHash;
+  // Sequence continuity WITHIN the verified range: missing, duplicated or
+  // out-of-order sequence numbers mean records were removed, replayed or
+  // reordered — the range is not a faithful chain segment.
+  let expectedSequence = records.length > 0 ? records[0].sequence : 0;
+  let verifiedCount = 0;
   for (const r of records) {
+    if (r.sequence !== expectedSequence) {
+      return {
+        valid: false,
+        brokenAt: r.sequence,
+        reason: `sequence numbers not consecutive: expected ${expectedSequence}, found ${r.sequence} (missing, duplicated or reordered records)`,
+        scope,
+        note,
+        verifiedCount,
+      };
+    }
     if (r.prevHash !== prevHash) {
-      return { valid: false, brokenAt: r.sequence, reason: "prevHash linkage broken", scope, note };
+      return {
+        valid: false,
+        brokenAt: r.sequence,
+        reason: "prevHash linkage broken",
+        scope,
+        note,
+        verifiedCount,
+      };
     }
     const expected = computeAuditHash({ ...r, hash: "" } as AuditRecord);
     if (expected !== r.hash) {
@@ -118,9 +149,12 @@ export function verifyAuditChain(
         reason: "record content does not match its hash",
         scope,
         note,
+        verifiedCount,
       };
     }
     prevHash = r.hash;
+    expectedSequence += 1;
+    verifiedCount += 1;
   }
-  return { valid: true, brokenAt: null, reason: null, scope, note };
+  return { valid: true, brokenAt: null, reason: null, scope, note, verifiedCount };
 }

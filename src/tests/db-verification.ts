@@ -24,6 +24,8 @@
 import { convexTest } from "convex-test";
 import schema from "../convex/schema";
 import { api } from "../convex/_generated/api";
+import { loadRiskContext } from "../convex/workflows";
+import { evaluateRisk, vetoAllows, type RiskPolicy, type TradeProposal } from "../convex/lib/risk";
 
 // Bun has no `import.meta.glob`, so the module map for convex-test is built
 // explicitly. The `_generated` entry is required: convex-test derives the
@@ -202,6 +204,63 @@ function placeArgs(authorizationId: string, idempotencyKey: string, side: "BUY" 
 
 const ordersIn = (t: T) =>
   t.run(async (ctx) => ctx.db.query("orders").collect());
+
+type OrderRow = {
+  orderId: string;
+  state: "UNKNOWN" | "ACKNOWLEDGED";
+  providerTruth?: "ACCEPTED" | "REJECTED" | "NONE";
+  ownerUserId?: string;
+};
+
+/** Schema-complete fixture orders, inserted in one transaction. */
+async function insertOrderRows(t: T, rows: OrderRow[]) {
+  const now = Date.now();
+  await t.run(async (ctx) => {
+    for (const r of rows) {
+      await ctx.db.insert("orders", {
+        orderId: r.orderId,
+        idempotencyKey: `IK-${r.orderId}`,
+        authorizationId: `AUTH-${r.orderId}`,
+        proposalId: "PROP-BOUNDS",
+        strategyVersionId: "SV-T",
+        marketId: "MKT-T",
+        symbol: "BTC/USD",
+        side: "BUY",
+        quantity: 1,
+        orderType: "MARKET",
+        timeInForce: "GTC",
+        mode: "PAPER",
+        state: r.state,
+        providerTruth: r.providerTruth,
+        history: [{ state: r.state, at: now, note: "fixture row (bounds regression)" }],
+        ownerUserId: r.ownerUserId,
+        createdAt: now,
+        updatedAt: now,
+      });
+    }
+  });
+}
+
+/** Fixture positions with known realized PnL, inserted in one transaction. */
+async function insertPositionRows(t: T, count: number, realizedEach: number) {
+  const now = Date.now();
+  await t.run(async (ctx) => {
+    for (let i = 0; i < count; i++) {
+      await ctx.db.insert("positions", {
+        positionId: `POS-B${i}`,
+        account: "PAPER:paper-account",
+        marketId: "MKT-T",
+        symbol: "BTC/USD",
+        side: "LONG",
+        quantity: 1,
+        avgEntryPrice: 100,
+        realizedPnl: realizedEach,
+        source: "PAPER",
+        updatedAt: now,
+      });
+    }
+  });
+}
 
 // ---------------------------------------------------------------------------
 // DB-POLICY-* — provisional policy rejection, end to end through the mutation
@@ -1293,6 +1352,186 @@ async function seedUsers(t: T) {
       after.chain.valid === true &&
       after.chain.note.includes("NOT tamper-proof"),
     JSON.stringify({ empty: empty.chain.scope, after: after.chain.scope }),
+  );
+}
+
+// ---------------------------------------------------------------------------
+// DB-BOUNDS-* — bounded-query safety. Regression for the old
+// orders.take(500) / positions.take(100) scans: a safety-relevant record
+// beyond those boundaries must never slip past the fail-closed exposure gate
+// or silently undercount risk accounting.
+// ---------------------------------------------------------------------------
+
+{
+  const t = fresh();
+  const { userA } = await seedWorkspace(t, "ACK");
+  const asA = t.withIdentity({ subject: userA });
+
+  // 550 orders: 549 resolved noise rows, then the UNKNOWN order at insertion
+  // position 550 — BEYOND the old orders.take(500) boundary (and the gate must
+  // find it regardless of record age/position).
+  const rows: OrderRow[] = [];
+  for (let i = 1; i <= 549; i++) rows.push({ orderId: `ORD-B${i}`, state: "ACKNOWLEDGED" });
+  rows.push({
+    orderId: "ORD-B550",
+    state: "UNKNOWN",
+    providerTruth: "NONE",
+    ownerUserId: userA,
+  });
+  await insertOrderRows(t, rows);
+
+  // 1) The risk context SEES the UNKNOWN order beyond the old boundary.
+  const { ctx: riskCtx } = await t.run(async (ctx) =>
+    loadRiskContext(ctx, {
+      strategyVersionId: "SV-T",
+      marketId: "MKT-T",
+      proposalIdempotencyKey: "IK-BOUNDS-1",
+    }),
+  );
+  check(
+    "DB-BOUNDS-001a risk context detects the UNKNOWN order beyond the old take(500) boundary",
+    riskCtx.unresolvedUnknownOrders >= 1,
+    `unresolvedUnknownOrders=${riskCtx.unresolvedUnknownOrders}`,
+  );
+
+  // 2) The deterministic veto over that REAL DB-derived context blocks
+  //    authorization at the reconciliation gate. TEST FIXTURE policy: the
+  //    exact declared limits of RISK-POLICY-CORE (nothing invented), with
+  //    status overridden to APPROVED ONLY to reach the gate under test — the
+  //    DB policy stays PROVISIONAL and this fixture is never persisted.
+  const fixturePolicy: RiskPolicy = {
+    policyId: "TEST-FIXTURE-NOT-RATIFIED",
+    version: 1,
+    status: "APPROVED",
+    limits: SEEDED_POLICY.limits,
+  };
+  const proposal: TradeProposal = {
+    proposalId: "PROP-BOUNDS",
+    side: "BUY",
+    quantity: 0.1,
+    referencePrice: CLOSE,
+    orderType: "MARKET",
+    mode: "PAPER",
+  };
+  const verdict = evaluateRisk(proposal, riskCtx, fixturePolicy);
+  check(
+    "DB-BOUNDS-001b risk authorization is blocked by the UNKNOWN gate beyond the boundary (fail-closed)",
+    verdict.outcome === "BLOCK" &&
+      !vetoAllows(verdict.outcome) &&
+      verdict.checks.some((c) => c.check === "reconciliation_state" && c.status === "BLOCK"),
+    JSON.stringify(verdict.checks.filter((c) => c.status !== "PASS")),
+  );
+
+  // 3) End-to-end: no risk authorization is issued by the real mutation.
+  const res = await asA.mutation(api.workflows.submitTradeProposal, {
+    strategyVersionId: "SV-T",
+    marketId: "MKT-T",
+    side: "BUY",
+    quantity: 0.1,
+    referencePrice: CLOSE,
+    idempotencyKey: "PK-BOUNDS-1",
+  });
+  check(
+    "DB-BOUNDS-001c submitTradeProposal issues no authorization (fail closed)",
+    res.outcome !== "APPROVE" && res.authorizationId === null,
+  );
+
+  // 4) Order submission is rejected at the same gate even with a valid token.
+  await seedAuthorization(t, { authorizationId: "AUTH-BOUNDS", ownerUserId: userA });
+  const placed = await asA.mutation(api.workflows.placeOrder, placeArgs("AUTH-BOUNDS", "IK-BOUNDS-PLACE"));
+  check(
+    "DB-BOUNDS-001d order submission is rejected while the UNKNOWN order sits beyond the old boundary",
+    placed.state === "REJECTED" && placed.note.includes("reconciliation_state"),
+    placed.note,
+  );
+}
+
+{
+  const t = fresh();
+  await seedWorkspace(t, "ACK");
+  // 150 positions with known realized PnL (+10 each = +1500) — beyond the old
+  // positions.take(100) boundary.
+  await insertPositionRows(t, 150, 10);
+  const { ctx: riskCtx } = await t.run(async (ctx) =>
+    loadRiskContext(ctx, {
+      strategyVersionId: "SV-T",
+      marketId: "MKT-T",
+      proposalIdempotencyKey: "IK-BOUNDS-2",
+    }),
+  );
+  check(
+    "DB-BOUNDS-002a open position count is complete beyond the old take(100) boundary",
+    riskCtx.openPositions === 150,
+    `openPositions=${riskCtx.openPositions}`,
+  );
+  check(
+    "DB-BOUNDS-002b equity does not silently undercount realized PnL across all 150 rows",
+    riskCtx.equity === 100000 + 1500,
+    `equity=${riskCtx.equity}`,
+  );
+  check(
+    "DB-BOUNDS-002c completeness is established below the cap (no false fail-closed)",
+    riskCtx.accountStateComplete === true,
+    `accountStateComplete=${String(riskCtx.accountStateComplete)}`,
+  );
+}
+
+{
+  const t = fresh();
+  await seedWorkspace(t, "ACK");
+  // Saturate the bounded read entirely (SCAN_CAP = 2000): completeness can no
+  // longer be established and must surface as fail-closed, never a silent
+  // undercount.
+  await insertPositionRows(t, 2000, 0);
+  const { ctx: riskCtx } = await t.run(async (ctx) =>
+    loadRiskContext(ctx, {
+      strategyVersionId: "SV-T",
+      marketId: "MKT-T",
+      proposalIdempotencyKey: "IK-BOUNDS-3",
+    }),
+  );
+  check(
+    "DB-BOUNDS-002d scan saturation -> accountStateComplete=false (incomplete = blocked, never silent)",
+    riskCtx.accountStateComplete === false,
+    `accountStateComplete=${String(riskCtx.accountStateComplete)}`,
+  );
+}
+
+{
+  const t = fresh();
+  const { userA, userB } = await seedWorkspace(t, "ACK");
+  const asA = t.withIdentity({ subject: userA });
+
+  // 550 orders; the three reconcilable ones sit at positions 548–550 — BEYOND
+  // the old take(500) boundary: own (A), foreign (B) and shared SYSTEM.
+  const rows: OrderRow[] = [];
+  for (let i = 1; i <= 547; i++) rows.push({ orderId: `ORD-R${i}`, state: "ACKNOWLEDGED" });
+  rows.push({ orderId: "ORD-R548", state: "UNKNOWN", providerTruth: "ACCEPTED", ownerUserId: userA });
+  rows.push({ orderId: "ORD-R549", state: "UNKNOWN", providerTruth: "ACCEPTED", ownerUserId: userB });
+  rows.push({ orderId: "ORD-R550", state: "UNKNOWN", providerTruth: "REJECTED" }); // shared SYSTEM row
+  await insertOrderRows(t, rows);
+
+  const result = await asA.mutation(api.workflows.reconcile, {});
+  const resolvedIds = result.resolved.map((r) => r.orderId);
+  check(
+    "DB-BOUNDS-003a reconciliation discovers own + shared orders beyond the old take(500) boundary",
+    resolvedIds.includes("ORD-R548") && resolvedIds.includes("ORD-R550") && resolvedIds.length === 2,
+    JSON.stringify(result.resolved),
+  );
+  const states = await t.run(async (ctx) => {
+    const all = await ctx.db.query("orders").collect();
+    const by = (id: string) => all.find((o) => o.orderId === id)?.state;
+    return { a: by("ORD-R548"), b: by("ORD-R549"), shared: by("ORD-R550") };
+  });
+  check(
+    "DB-BOUNDS-003b only authorized transitions applied (own + shared resolved, foreign untouched)",
+    states.a === "ACKNOWLEDGED" && states.b === "UNKNOWN" && states.shared === "REJECTED",
+    JSON.stringify(states),
+  );
+  check(
+    "DB-BOUNDS-003c the foreign order is never exposed in the result payload (no cross-user leak)",
+    !JSON.stringify(result).includes("ORD-R549"),
+    JSON.stringify(result),
   );
 }
 

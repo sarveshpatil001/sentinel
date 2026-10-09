@@ -282,7 +282,11 @@ export const audit = query({
           hash: r.hash,
         }),
       );
-    // Integrity over the FULL chain; only own + system events are returned.
+    // Integrity over the FETCHED WINDOW (newest 250 events) — NOT the whole
+    // chain; whole-history verification needs the FULL_CHAIN scope from
+    // sequence 1. `chain.verifiedCount` reports the records whose linkage and
+    // hash ACTUALLY passed, independent of user filtering; only own + system
+    // events are returned to the client.
     const visible = sorted.filter(
       (r) => r.actorType === "SERVICE" || r.actor === `user:${userId}`,
     );

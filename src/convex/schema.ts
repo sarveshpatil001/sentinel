@@ -439,7 +439,11 @@ const schema = defineSchema(
       updatedAt: v.number(),
     })
       .index("by_idempotencyKey", ["idempotencyKey"])
-      .index("by_ownerUserId", ["ownerUserId"]),
+      .index("by_ownerUserId", ["ownerUserId"])
+      // Exhaustive state lookup (UNKNOWN exposure gate, reconciliation):
+      // indexed existence checks stay complete at any table size — safety
+      // decisions must never depend on a bounded scan.
+      .index("by_state", ["state"]),
 
     positions: defineTable({
       positionId: v.string(),

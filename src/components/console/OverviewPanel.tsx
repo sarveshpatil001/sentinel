@@ -92,10 +92,12 @@ export default function OverviewPanel() {
             data.auditChain.valid ? (
               <span className="inline-flex items-center gap-1.5 rounded-md border border-emerald-600/25 bg-emerald-600/10 px-2 py-1 text-[11px] font-semibold text-emerald-700 dark:text-emerald-300">
                 <Link2 className="size-3" />{" "}
+                {/* verifiedCount = records actually verified (linkage+hash),
+                    not the visible list below. */}
                 {data.auditChain.scope === "FULL_CHAIN"
-                  ? "full chain verified from genesis"
+                  ? `full chain verified from genesis (${data.auditChain.verifiedCount} records verified)`
                   : data.auditChain.scope === "WINDOW"
-                    ? "window verified — earlier history NOT verified"
+                    ? `window verified (${data.auditChain.verifiedCount} records verified) — earlier history NOT verified`
                     : "no records — nothing verified"}
               </span>
             ) : (

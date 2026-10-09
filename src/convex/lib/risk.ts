@@ -58,6 +58,13 @@ export interface RiskContext {
   proposalIdempotencyKey: string;
   /** Orders in UNKNOWN state awaiting reconciliation. > 0 blocks new exposure. */
   unresolvedUnknownOrders: number;
+  /**
+   * False when the account state could NOT be read completely (bounded-scan
+   * saturation at the data layer). Incompleteness must never silently
+   * undercount exposure: false forces an UNKNOWN verdict (no trade).
+   * Omitted = complete (pure-function callers/tests that provide full inputs).
+   */
+  accountStateComplete?: boolean;
 }
 
 export interface TradeProposal {
@@ -189,6 +196,20 @@ export function evaluateRisk(
     );
   } else {
     push("reconciliation_state", "PASS", "No unresolved UNKNOWN order state.");
+  }
+
+  // --- Account-state completeness ---------------------------------------
+  // Fail-closed: if the data layer could not establish that risk inputs are
+  // complete (bounded scan saturated), exposure may be undercounted. Unknown
+  // must never become approved.
+  if (ctx.accountStateComplete === false) {
+    push(
+      "account_state_completeness",
+      "UNKNOWN",
+      "Account state could not be read completely (scan saturation) — exposure may be undercounted; no new exposure until completeness is re-established.",
+    );
+  } else {
+    push("account_state_completeness", "PASS", "Account risk inputs read completely.");
   }
 
   // --- Strategy eligibility ----------------------------------------------

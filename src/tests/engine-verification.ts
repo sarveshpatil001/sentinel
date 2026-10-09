@@ -182,8 +182,10 @@ const tampered = { ...rec, detail: "forged" };
 check("TEST-AUDIT-014 tampered record detected", !verifyAuditChain([tampered]).valid);
 
 // Window verification: the console shows the newest N events of a longer
-// chain, so it verifies a WINDOW against a trusted anchor — the anchor is
-// declared, internal linkage and hashes are still fully checked.
+// chain, so it verifies a WINDOW against an anchor taken from the log ITSELF —
+// the anchor is SELF-ATTESTED (NOT independently trusted unless checked
+// against a separately protected checkpoint); that limitation is declared,
+// and internal linkage and hashes are still fully checked.
 const rec2: AuditRecord = { ...rec, sequence: 2, at: 2, detail: "second", prevHash: rec.hash, hash: "" };
 rec2.hash = computeAuditHash(rec2);
 const rec3: AuditRecord = { ...rec2, sequence: 3, at: 3, detail: "third", prevHash: rec2.hash, hash: "" };
@@ -226,6 +228,44 @@ check(
 check(
   "TEST-AUDIT-018b an empty range reports EMPTY — nothing verified, never evidence of integrity",
   verifyAuditChain([]).scope === "EMPTY" && verifyAuditChain([]).note.includes("NOT evidence"),
+);
+
+// P1 sequence continuity: within any verified range the sequence numbers must
+// be consecutive — missing, duplicated or reordered records FAIL
+// verification even when every hash and link is self-consistent.
+const gapRec: AuditRecord = { ...rec2, sequence: 4, at: 4, detail: "after a gap", prevHash: rec2.hash, hash: "" };
+gapRec.hash = computeAuditHash(gapRec);
+const gapVerdict = verifyAuditChain([rec2, gapRec], rec2.prevHash);
+check(
+  "TEST-AUDIT-019 a missing sequence number inside the range fails",
+  !gapVerdict.valid && (gapVerdict.reason ?? "").includes("sequence"),
+);
+const dupRec: AuditRecord = { ...rec3, sequence: 3, at: 4, detail: "replayed", prevHash: rec3.hash, hash: "" };
+dupRec.hash = computeAuditHash(dupRec);
+const dupVerdict = verifyAuditChain([rec2, rec3, dupRec], rec2.prevHash);
+check(
+  "TEST-AUDIT-019b a duplicated sequence number fails (replay)",
+  !dupVerdict.valid && (dupVerdict.reason ?? "").includes("sequence"),
+);
+const reorderVerdict = verifyAuditChain([rec3, rec2], rec3.prevHash);
+check(
+  "TEST-AUDIT-019c reordered records fail (out-of-order sequences)",
+  !reorderVerdict.valid && (reorderVerdict.reason ?? "").includes("sequence"),
+);
+const brokenLink: AuditRecord = { ...rec3, prevHash: "deadbeefdeadbeef", hash: "" };
+brokenLink.hash = computeAuditHash(brokenLink);
+const brokenVerdict = verifyAuditChain([rec2, brokenLink], rec2.prevHash);
+check(
+  "TEST-AUDIT-019d a broken prevHash link fails even with self-consistent hashes",
+  !brokenVerdict.valid && brokenVerdict.reason === "prevHash linkage broken",
+);
+// verifiedCount = records ACTUALLY verified (linkage + hash), never the
+// visible/filtered count: 0 on empty, n on intact, pre-break on tampered.
+check(
+  "TEST-AUDIT-020 verifiedCount reports records actually verified",
+  verifyAuditChain([]).verifiedCount === 0 &&
+    verifyAuditChain([rec, rec2, rec3]).verifiedCount === 3 &&
+    verifyAuditChain([rec2, windowTampered], rec2.prevHash).verifiedCount === 1,
 );
 
 // TEST-SEC-CRED-* credential handling contract (Section 16 secret rules)
@@ -290,6 +330,21 @@ const d14 = evaluateRisk(proposal, { ...baseCtx, unresolvedUnknownOrders: 2 }, p
 check(
   "TEST-RISK-014 unresolved UNKNOWN orders -> BLOCK (new exposure blocked)",
   d14.outcome === "BLOCK" && d14.checks.some((c) => c.check === "reconciliation_state" && c.status === "BLOCK"),
+);
+// P0 fail-closed completeness: bounded-scan saturation at the data layer must
+// surface as UNKNOWN (no trade) — never a silent exposure undercount.
+const d15 = evaluateRisk(proposal, { ...baseCtx, accountStateComplete: false }, policy);
+check(
+  "TEST-RISK-015 account state incomplete (scan saturation) -> UNKNOWN, veto denies",
+  d15.outcome === "UNKNOWN" &&
+    !vetoAllows(d15.outcome) &&
+    d15.checks.some((c) => c.check === "account_state_completeness" && c.status === "UNKNOWN"),
+);
+const d15b = evaluateRisk(proposal, { ...baseCtx, accountStateComplete: true }, policy);
+check(
+  "TEST-RISK-015b explicit completeness -> PASS, clean proposal still approved",
+  d15b.outcome === "APPROVE" &&
+    d15b.checks.some((c) => c.check === "account_state_completeness" && c.status === "PASS"),
 );
 
 // TEST-EXEC mode gate + reconciliation gate + partial fills

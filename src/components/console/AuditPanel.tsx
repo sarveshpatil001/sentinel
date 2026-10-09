@@ -19,15 +19,18 @@ export default function AuditPanel() {
           data.chain.valid ? (
             <span className="inline-flex items-center gap-1.5 rounded-md border border-emerald-600/25 bg-emerald-600/10 px-2 py-1 text-[11px] font-semibold text-emerald-700 dark:text-emerald-300">
               <Link2 className="size-3" />{" "}
+              {/* verifiedCount = records whose linkage+hash actually passed —
+                  NOT the filtered list below (user filtering only changes
+                  what is displayed, never what was verified). */}
               {data.chain.scope === "FULL_CHAIN"
-                ? `full chain verified (${data.events.length} records)`
+                ? `full chain verified (${data.chain.verifiedCount} records verified)`
                 : data.chain.scope === "WINDOW"
-                  ? `window verified (${data.events.length} records) — earlier history NOT verified`
+                  ? `window verified (${data.chain.verifiedCount} records verified) — earlier history NOT verified`
                   : "no records — nothing verified"}
             </span>
           ) : (
             <span className="inline-flex items-center gap-1.5 rounded-md border border-red-600/25 bg-red-600/10 px-2 py-1 text-[11px] font-semibold text-red-700 dark:text-red-300">
-              <ShieldAlert className="size-3" /> chain broken at #{data.chain.brokenAt}: {data.chain.reason}
+              <ShieldAlert className="size-3" /> chain broken at #{data.chain.brokenAt} after {data.chain.verifiedCount} verified records: {data.chain.reason}
             </span>
           )
         }
