@@ -31,6 +31,7 @@ import ConnectionsPanel from "@/components/console/ConnectionsPanel";
 import AgentsPanel from "@/components/console/AgentsPanel";
 import AuditPanel from "@/components/console/AuditPanel";
 import ConstitutionPanel from "@/components/console/ConstitutionPanel";
+import DatabricksPanel from "@/components/console/DatabricksPanel";
 
 const ALL_TABS = [
   { id: "overview", label: "Overview", simpleLabel: "Dashboard", icon: LayoutDashboard, proOnly: false },
@@ -43,6 +44,7 @@ const ALL_TABS = [
   { id: "agents", label: "AI Helpers", simpleLabel: "AI Helpers", icon: Users, proOnly: true },
   { id: "audit", label: "Activity Log", simpleLabel: "Activity Log", icon: ScrollText, proOnly: true },
   { id: "constitution", label: "System Rules", simpleLabel: "System Rules", icon: TerminalSquare, proOnly: true },
+  { id: "databricks", label: "Databricks", simpleLabel: "Databricks", icon: DatabaseZap, proOnly: true },
 ] as const;
 
 type TabId = (typeof ALL_TABS)[number]["id"];
@@ -183,6 +185,7 @@ export default function Dashboard() {
         {tab === "agents" && <AgentsPanel />}
         {tab === "audit" && <AuditPanel />}
         {tab === "constitution" && <ConstitutionPanel />}
+        {tab === "databricks" && <DatabricksPanel />}
       </div>
 
       <footer className="border-t border-border/60 py-6">

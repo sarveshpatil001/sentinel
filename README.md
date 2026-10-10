@@ -29,6 +29,15 @@ The convex server has a separate set of environment variables that are accessibl
 
 Currently, these variables include auth-specific keys: JWKS, JWT_PRIVATE_KEY, and SITE_URL.
 
+### Databricks workspace check
+
+Add these server-side variables in the Keys tab to use the Databricks check in the dashboard:
+
+- `DATABRICKS_HOST` — your Databricks workspace origin, such as `https://<workspace-host>` (HTTPS only; do not include a path).
+- `DATABRICKS_TOKEN` — a Databricks personal access token with permission to read the current user's SCIM profile (`Me`). Keep this secret on the server.
+
+The check calls the read-only `GET /api/2.0/preview/scim/v2/Me` endpoint. It only confirms that the workspace and token can return the current user; it does not connect to trading or place orders. The endpoint is in Public Preview. See the [Databricks Workspace User API](https://docs.databricks.com/api/scim/v1/workspace-user) and [API scopes](https://docs.databricks.com/api/workspace/scopes).
+
 
 # Using Authentication (Important!)
 

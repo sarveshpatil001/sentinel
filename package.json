@@ -6,7 +6,7 @@
   "scripts": {
     "dev": "vite",
     "build": "tsc -b && vite build",
-    "test": "bun src/tests/engine-verification.ts && bun src/tests/db-verification.ts",
+    "test": "bun src/tests/engine-verification.ts && bun src/tests/db-verification.ts && bun src/tests/databricks-verification.ts",
     "test:db": "bun src/tests/db-verification.ts",
     "typecheck": "tsc -b --noEmit",
     "lint": "eslint .",
