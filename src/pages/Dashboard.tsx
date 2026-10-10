@@ -15,10 +15,12 @@ import {
   ShieldCheck,
   TerminalSquare,
   Users,
+  Zap,
 } from "lucide-react";
 import { useNavigate } from "react-router";
 import logo from "@/assets/logo.svg";
 import { ThemeToggle } from "@/components/ThemeToggle";
+import { ViewModeToggle, useViewMode } from "@/components/console/ViewModeToggle";
 import OverviewPanel from "@/components/console/OverviewPanel";
 import DataPanel from "@/components/console/DataPanel";
 import StrategiesPanel from "@/components/console/StrategiesPanel";
@@ -30,26 +32,38 @@ import AgentsPanel from "@/components/console/AgentsPanel";
 import AuditPanel from "@/components/console/AuditPanel";
 import ConstitutionPanel from "@/components/console/ConstitutionPanel";
 
-const TABS = [
-  { id: "overview", label: "Overview", icon: LayoutDashboard },
-  { id: "data", label: "Market data", icon: DatabaseZap },
-  { id: "strategies", label: "Strategies", icon: BadgeCheck },
-  { id: "validation", label: "Validation", icon: FlaskConical },
-  { id: "risk", label: "Risk & veto", icon: ShieldCheck },
-  { id: "execution", label: "Execution", icon: Activity },
-  { id: "connections", label: "Broker & API keys", icon: KeyRound },
-  { id: "agents", label: "Agents & learning", icon: Users },
-  { id: "audit", label: "Audit", icon: ScrollText },
-  { id: "constitution", label: "Constitution & reports", icon: TerminalSquare },
+const ALL_TABS = [
+  { id: "overview", label: "Overview", simpleLabel: "Dashboard", icon: LayoutDashboard, proOnly: false },
+  { id: "execution", label: "Execution & Trading", simpleLabel: "Trading", icon: Activity, proOnly: false },
+  { id: "strategies", label: "Strategies", simpleLabel: "Strategies", icon: BadgeCheck, proOnly: false },
+  { id: "connections", label: "Broker & Exchanges", simpleLabel: "Exchanges", icon: KeyRound, proOnly: false },
+  { id: "risk", label: "Risk & Veto", simpleLabel: "Risk Controls", icon: ShieldCheck, proOnly: false },
+  { id: "data", label: "Market Data", simpleLabel: "Market Data", icon: DatabaseZap, proOnly: true },
+  { id: "validation", label: "Validation Engine", simpleLabel: "Validation", icon: FlaskConical, proOnly: true },
+  { id: "agents", label: "Agent Registry", simpleLabel: "AI Agents", icon: Users, proOnly: true },
+  { id: "audit", label: "Audit Ledger", simpleLabel: "Audit Log", icon: ScrollText, proOnly: true },
+  { id: "constitution", label: "Constitution & Specs", simpleLabel: "Governance", icon: TerminalSquare, proOnly: true },
 ] as const;
 
-type TabId = (typeof TABS)[number]["id"];
+type TabId = (typeof ALL_TABS)[number]["id"];
 
 export default function Dashboard() {
   const { user, signOut } = useAuth();
   const navigate = useNavigate();
   const [tab, setTab] = useState<TabId>("overview");
+  const [viewMode, setViewMode] = useViewMode();
   const seed = useMutation(api.seed.seed);
+
+  // Filter tabs according to viewMode
+  const visibleTabs = ALL_TABS.filter((t) => viewMode === "advanced" || !t.proOnly);
+
+  // If the active tab gets hidden when switching to simple mode, smoothly switch back to overview
+  useEffect(() => {
+    const isVisible = visibleTabs.some((t) => t.id === tab);
+    if (!isVisible) {
+      setTab("overview");
+    }
+  }, [viewMode, tab, visibleTabs]);
 
   // Idempotent bootstrap: seeds deterministic state exactly once.
   useEffect(() => {
@@ -69,6 +83,8 @@ export default function Dashboard() {
     navigate("/");
   };
 
+  const isSimple = viewMode === "simple";
+
   return (
     <main className="min-h-screen bg-background text-foreground">
       {/* Header */}
@@ -78,19 +94,30 @@ export default function Dashboard() {
             <img src={logo} alt="Sentinel Prime" className="size-8 rounded-lg" />
             <div className="leading-tight">
               <div className="text-sm font-semibold tracking-tight">Sentinel Prime</div>
-              <div className="text-[11px] text-muted-foreground">Control console · paper mode</div>
+              <div className="text-[11px] text-muted-foreground">
+                {isSimple ? "Automated Trading" : "Control console · paper mode"}
+              </div>
             </div>
           </div>
-          <div className="flex items-center gap-3">
-            <div className="hidden items-center gap-1.5 rounded-full border border-primary/30 bg-primary/10 px-3 py-1.5 text-[11px] font-medium text-primary sm:inline-flex">
-              <Activity className="size-3" />
-              deterministic authority chain active
+
+          <div className="flex items-center gap-2.5">
+            {/* View Mode Toggle: Simple vs Pro */}
+            <ViewModeToggle mode={viewMode} onChange={setViewMode} />
+
+            <div className="hidden items-center gap-1.5 rounded-full border border-primary/30 bg-primary/10 px-3 py-1 text-[11px] font-medium text-primary md:inline-flex">
+              <Zap className="size-3 text-primary" />
+              <span>Paper Trading Active</span>
             </div>
+
             <div className="hidden text-right leading-tight sm:block">
               <div className="text-xs font-medium">{user?.name ?? user?.email ?? "Operator"}</div>
-              <div className="text-[10px] text-muted-foreground">authenticated session</div>
+              <div className="text-[10px] text-muted-foreground">
+                {isSimple ? "Protected Account" : "authenticated session"}
+              </div>
             </div>
+
             <ThemeToggle />
+
             <Button
               type="button"
               variant="outline"
@@ -104,54 +131,81 @@ export default function Dashboard() {
           </div>
         </div>
 
-        {/* Tabs */}
+        {/* Tab Navigation */}
         <div className="mx-auto w-full max-w-7xl px-4 sm:px-6">
-          <nav className="flex gap-1 overflow-x-auto pb-2">
-            {TABS.map((t) => {
-              const active = tab === t.id;
-              return (
-                <button
-                  key={t.id}
-                  type="button"
-                  onClick={() => setTab(t.id)}
-                  className={`inline-flex shrink-0 items-center gap-1.5 rounded-lg px-3 py-2 text-xs font-medium transition-colors ${
-                    active
-                      ? "bg-primary/10 text-primary"
-                      : "text-muted-foreground hover:bg-muted hover:text-foreground"
-                  }`}
-                >
-                  <t.icon className="size-3.5" />
-                  {t.label}
-                </button>
-              );
-            })}
-          </nav>
+          <div className="flex items-center justify-between">
+            <nav className="flex gap-1 overflow-x-auto pb-2">
+              {visibleTabs.map((t) => {
+                const active = tab === t.id;
+                const label = isSimple ? t.simpleLabel : t.label;
+                return (
+                  <button
+                    key={t.id}
+                    type="button"
+                    onClick={() => setTab(t.id)}
+                    className={`inline-flex shrink-0 items-center gap-1.5 rounded-lg px-3 py-2 text-xs font-medium transition-all ${
+                      active
+                        ? "bg-primary/10 text-primary font-semibold shadow-xs"
+                        : "text-muted-foreground hover:bg-muted hover:text-foreground"
+                    }`}
+                  >
+                    <t.icon className="size-3.5" />
+                    {label}
+                  </button>
+                );
+              })}
+            </nav>
+
+            {isSimple && (
+              <button
+                type="button"
+                onClick={() => setViewMode("advanced")}
+                className="hidden text-[11px] text-muted-foreground hover:text-primary transition-colors pb-2 lg:inline-flex items-center gap-1"
+                title="Switch to Pro view to see full quant metrics, audit logs, and technical specs"
+              >
+                <span>Pro controls hidden</span>
+                <span className="underline">Show more</span>
+              </button>
+            )}
+          </div>
         </div>
       </header>
 
       {/* Content */}
       <div className="mx-auto w-full max-w-7xl px-4 py-6 sm:px-6">
-        {tab === "overview" && <OverviewPanel />}
+        {tab === "overview" && <OverviewPanel isSimple={isSimple} />}
+        {tab === "execution" && <ExecutionPanel isSimple={isSimple} />}
+        {tab === "strategies" && <StrategiesPanel isSimple={isSimple} />}
+        {tab === "connections" && <ConnectionsPanel isSimple={isSimple} />}
+        {tab === "risk" && <RiskPanel isSimple={isSimple} />}
         {tab === "data" && <DataPanel />}
-        {tab === "strategies" && <StrategiesPanel />}
         {tab === "validation" && <ValidationPanel />}
-        {tab === "risk" && <RiskPanel />}
-        {tab === "execution" && <ExecutionPanel />}
-        {tab === "connections" && <ConnectionsPanel />}
         {tab === "agents" && <AgentsPanel />}
         {tab === "audit" && <AuditPanel />}
         {tab === "constitution" && <ConstitutionPanel />}
       </div>
 
       <footer className="border-t border-border/60 py-6">
-        <div className="mx-auto flex w-full max-w-7xl flex-wrap items-center gap-x-4 gap-y-1 px-4 text-[11px] text-muted-foreground sm:px-6">
-          <span>Sentinel Prime · synthetic seeded data · paper execution</span>
-          <span>·</span>
-          <span>UNKNOWN stays UNKNOWN until verified</span>
-          <span>·</span>
-          <span>FAILED stays FAILED until recovered and validated</span>
-          <span>·</span>
-          <span>validated strategies remain immutable</span>
+        <div className="mx-auto flex w-full max-w-7xl flex-wrap items-center justify-between gap-y-2 px-4 text-[11px] text-muted-foreground sm:px-6">
+          <div className="flex flex-wrap items-center gap-x-3 gap-y-1">
+            <span>Sentinel Prime · Risk-first autonomous trading</span>
+            <span>·</span>
+            <span>Simulation / Paper mode</span>
+            <span>·</span>
+            <span>Deterministic safety active</span>
+          </div>
+
+          <div className="flex items-center gap-2">
+            <span>Mode:</span>
+            <span className="font-semibold text-foreground uppercase">{viewMode}</span>
+            <button
+              type="button"
+              onClick={() => setViewMode(isSimple ? "advanced" : "simple")}
+              className="text-primary hover:underline ml-1"
+            >
+              (Switch to {isSimple ? "Pro" : "Simple"})
+            </button>
+          </div>
         </div>
       </footer>
     </main>

@@ -1,10 +1,10 @@
 import { useState } from "react";
 import { useMutation, useQuery } from "convex/react";
 import { api } from "@/convex/_generated/api";
-import { Loader2, ShieldAlert, ShieldCheck, ShieldQuestion } from "lucide-react";
+import { CheckCircle2, ChevronDown, ChevronUp, Info, Loader2, Send, ShieldAlert, ShieldCheck, ShieldQuestion } from "lucide-react";
 import { CheckRow, MetricTile, Panel, StateBadge, fmtTime } from "./shared";
 
-export default function RiskPanel() {
+export default function RiskPanel({ isSimple = false }: { isSimple?: boolean }) {
   const data = useQuery(api.console.risk);
   const strategies = useQuery(api.console.strategies);
   const submitProposal = useMutation(api.workflows.submitTradeProposal);
@@ -15,9 +15,10 @@ export default function RiskPanel() {
   const [referencePrice, setReferencePrice] = useState("62000");
   const [busy, setBusy] = useState(false);
   const [result, setResult] = useState<{ outcome: string; authorizationId: string | null; checks: { check: string; status: string; detail: string }[] } | null>(null);
+  const [showLimits, setShowLimits] = useState(false);
 
   if (!data || !strategies) {
-    return <div className="animate-pulse text-sm text-muted-foreground">Loading risk state…</div>;
+    return <div className="animate-pulse text-sm text-muted-foreground">Loading risk controls…</div>;
   }
 
   const policy = data.policies[0];
@@ -44,6 +45,152 @@ export default function RiskPanel() {
     }
   };
 
+  if (isSimple) {
+    return (
+      <div className="space-y-6">
+        {/* Simple Risk Status */}
+        <div className="rounded-2xl border border-border/70 bg-card p-6 shadow-xs">
+          <div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
+            <div className="flex items-center gap-3">
+              <div className="flex size-10 items-center justify-center rounded-xl bg-primary/10 text-primary">
+                <ShieldCheck className="size-5" />
+              </div>
+              <div>
+                <h2 className="text-base font-semibold">Automatic Risk Guardian</h2>
+                <p className="text-xs text-muted-foreground">
+                  Every proposed trade must pass 10+ mathematical veto tests before it can ever execute.
+                </p>
+              </div>
+            </div>
+
+            <div className="inline-flex items-center gap-1.5 rounded-full border border-emerald-500/30 bg-emerald-500/10 px-3 py-1 text-xs font-semibold text-emerald-600 dark:text-emerald-400">
+              <CheckCircle2 className="size-3.5" />
+              <span>Veto Shield Online</span>
+            </div>
+          </div>
+        </div>
+
+        {/* Propose a Trade Form */}
+        <div className="rounded-2xl border border-border/70 bg-card p-6 shadow-xs">
+          <h3 className="text-sm font-semibold mb-1">Simulate & Check a Trade</h3>
+          <p className="text-xs text-muted-foreground mb-4">
+            Test how Sentinel Prime evaluates trade sizes and risk rules before dispatching orders.
+          </p>
+
+          <div className="grid gap-3 sm:grid-cols-2 lg:grid-cols-4">
+            <label className="flex flex-col gap-1 text-xs font-medium text-muted-foreground">
+              Strategy
+              <select
+                value={strategyVersionId}
+                onChange={(e) => setStrategyVersionId(e.target.value)}
+                className="w-full rounded-lg border border-border/80 bg-background px-3 py-2 text-xs text-foreground"
+              >
+                <option value="">Choose a strategy…</option>
+                {strategies.versions.map((v) => (
+                  <option key={v.strategyVersionId} value={v.strategyVersionId}>
+                    {v.strategyVersionId} ({v.status})
+                  </option>
+                ))}
+              </select>
+            </label>
+
+            <label className="flex flex-col gap-1 text-xs font-medium text-muted-foreground">
+              Action
+              <select
+                value={side}
+                onChange={(e) => setSide(e.target.value as "BUY" | "SELL")}
+                className="w-full rounded-lg border border-border/80 bg-background px-3 py-2 text-xs text-foreground"
+              >
+                <option value="BUY">BUY (Long)</option>
+                <option value="SELL">SELL (Short)</option>
+              </select>
+            </label>
+
+            <label className="flex flex-col gap-1 text-xs font-medium text-muted-foreground">
+              Order Quantity
+              <input
+                value={quantity}
+                onChange={(e) => setQuantity(e.target.value)}
+                className="w-full rounded-lg border border-border/80 bg-background px-3 py-2 text-xs text-foreground"
+              />
+            </label>
+
+            <label className="flex flex-col gap-1 text-xs font-medium text-muted-foreground">
+              Est. Price ($)
+              <input
+                value={referencePrice}
+                onChange={(e) => setReferencePrice(e.target.value)}
+                className="w-full rounded-lg border border-border/80 bg-background px-3 py-2 text-xs text-foreground"
+              />
+            </label>
+          </div>
+
+          <div className="mt-4 flex items-center justify-end">
+            <button
+              type="button"
+              onClick={handleSubmit}
+              disabled={busy || !strategyVersionId}
+              className="inline-flex items-center gap-2 rounded-xl bg-primary px-5 py-2.5 text-xs font-semibold text-primary-foreground hover:opacity-90 transition-opacity cursor-pointer disabled:opacity-50"
+            >
+              {busy ? <Loader2 className="size-3.5 animate-spin" /> : <ShieldCheck className="size-4" />}
+              <span>Verify & Authorize Trade</span>
+            </button>
+          </div>
+
+          {/* Verification Outcome Card */}
+          {result && (
+            <div className="mt-5 rounded-xl border border-border/70 bg-background/50 p-4">
+              <div className="flex items-center justify-between mb-3">
+                <div className="flex items-center gap-2 text-xs font-semibold">
+                  <span>Risk Veto Outcome:</span>
+                  <StateBadge state={result.outcome} />
+                </div>
+                {result.authorizationId && (
+                  <span className="text-xs text-emerald-600 dark:text-emerald-400 font-medium">
+                    ✓ Trade authorized! Go to Trading tab to submit.
+                  </span>
+                )}
+              </div>
+
+              <div className="space-y-1.5 border-t border-border/60 pt-3">
+                {result.checks.map((c) => (
+                  <div key={c.check} className="flex items-center justify-between text-xs py-1">
+                    <span className="text-muted-foreground">{c.check.replace(/_/g, " ")}</span>
+                    <StateBadge state={c.status} />
+                  </div>
+                ))}
+              </div>
+            </div>
+          )}
+
+          {/* Collapsible details for safety limits */}
+          <div className="mt-5 pt-4 border-t border-border/60">
+            <button
+              type="button"
+              onClick={() => setShowLimits(!showLimits)}
+              className="inline-flex items-center gap-1.5 text-xs text-muted-foreground hover:text-foreground cursor-pointer"
+            >
+              {showLimits ? <ChevronUp className="size-3.5" /> : <ChevronDown className="size-3.5" />}
+              <span>{showLimits ? "Hide safety thresholds" : "View configured risk limits"}</span>
+            </button>
+
+            {showLimits && (
+              <div className="mt-3 grid gap-2.5 sm:grid-cols-3">
+                {Object.entries(limits).map(([k, v]) => (
+                  <div key={k} className="rounded-lg border border-border/50 bg-background/40 p-2.5 text-xs">
+                    <div className="text-muted-foreground capitalize">{k.replace(/([A-Z])/g, " $1")}</div>
+                    <div className="mt-0.5 font-semibold text-foreground">{v === null ? "Safe Default" : v}</div>
+                  </div>
+                ))}
+              </div>
+            )}
+          </div>
+        </div>
+      </div>
+    );
+  }
+
+  // ADVANCED / PRO VIEW
   return (
     <div className="space-y-5">
       {/* Kill switch / mode strip */}
@@ -121,69 +268,30 @@ export default function RiskPanel() {
             type="button"
             onClick={handleSubmit}
             disabled={busy || !strategyVersionId}
-            className="inline-flex items-center justify-center gap-2 self-end rounded-lg bg-primary px-4 py-2 text-xs font-medium text-primary-foreground transition-opacity hover:opacity-90 disabled:opacity-50"
+            className="self-end rounded-lg bg-primary px-4 py-2 text-xs font-medium text-primary-foreground transition-opacity hover:opacity-90 disabled:opacity-50"
           >
-            {busy ? <Loader2 className="size-3.5 animate-spin" /> : <ShieldCheck className="size-3.5" />}
-            Evaluate + veto
+            {busy ? <Loader2 className="size-3.5 animate-spin" /> : "Evaluate proposal"}
           </button>
         </div>
 
         {result && (
-          <div className="mt-5">
-            <div
-              className={`flex items-center gap-2.5 rounded-xl border px-4 py-3 text-sm font-semibold ${
-                result.outcome === "APPROVE"
-                  ? "border-emerald-600/30 bg-emerald-600/10 text-emerald-700 dark:text-emerald-300"
-                  : result.outcome === "BLOCK"
-                    ? "border-red-600/30 bg-red-600/10 text-red-700 dark:text-red-300"
-                    : "border-amber-600/30 bg-amber-600/10 text-amber-700 dark:text-amber-300"
-              }`}
-            >
-              {result.outcome === "APPROVE" ? (
-                <ShieldCheck className="size-4" />
-              ) : result.outcome === "BLOCK" ? (
-                <ShieldAlert className="size-4" />
-              ) : (
-                <ShieldQuestion className="size-4" />
-              )}
-              Deterministic risk veto: {result.outcome}
+          <div className="mt-4 rounded-xl border border-border/70 bg-background/60 p-4">
+            <div className="flex flex-wrap items-center gap-2">
+              <span className="text-xs font-semibold">Veto decision:</span>
+              <StateBadge state={result.outcome} />
               {result.authorizationId && (
-                <span className="ml-1 font-mono text-[11px] font-normal">
-                  · authorization {result.authorizationId} issued (scoped, expiring)
+                <span className="font-mono text-[11px] text-muted-foreground">
+                  authorization {result.authorizationId} (unexpired, scoped)
                 </span>
               )}
             </div>
-            <div className="mt-3">
+            <div className="mt-3 space-y-1">
               {result.checks.map((c) => (
                 <CheckRow key={c.check} check={c.check} status={c.status} detail={c.detail} />
               ))}
             </div>
           </div>
         )}
-      </Panel>
-
-      <Panel title="Risk decision history" description="Every decision references its policy version. Historical decisions never change.">
-        <div className="space-y-2.5">
-          {data.decisions.length === 0 && (
-            <p className="text-xs text-muted-foreground">No risk decisions recorded yet.</p>
-          )}
-          {data.decisions.map((d) => (
-            <div key={d.riskDecisionId} className="rounded-xl border border-border/60 bg-background/60 p-4">
-              <div className="flex flex-wrap items-center gap-2">
-                <span className="font-mono text-[11px]">{d.riskDecisionId}</span>
-                <StateBadge state={d.outcome} />
-                <span className="text-[11px] text-muted-foreground">
-                  policy v{d.policyVersion} · mode {d.mode} · {fmtTime(d.createdAt)} · {d.actor}
-                </span>
-              </div>
-              <div className="mt-2">
-                {d.checks.map((c) => (
-                  <CheckRow key={c.check} check={c.check} status={c.status} detail={c.detail} />
-                ))}
-              </div>
-            </div>
-          ))}
-        </div>
       </Panel>
     </div>
   );

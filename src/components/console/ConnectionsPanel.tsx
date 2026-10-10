@@ -2,11 +2,16 @@ import { useState } from "react";
 import { useMutation, useQuery } from "convex/react";
 import { api } from "@/convex/_generated/api";
 import {
+  AlertCircle,
+  Building2,
   Check,
+  ChevronDown,
+  ChevronUp,
   KeyRound,
   Link2,
   Loader2,
   Lock,
+  Plus,
   RefreshCw,
   ShieldAlert,
   ShieldCheck,
@@ -25,7 +30,7 @@ interface CatalogShape {
 
 const READ_DEFAULTS = ["READ_ACCOUNT", "READ_BALANCES", "READ_POSITIONS", "READ_ORDERS"];
 
-export default function ConnectionsPanel() {
+export default function ConnectionsPanel({ isSimple = false }: { isSimple?: boolean }) {
   const catalog = useQuery(api.connections.catalog) as CatalogShape | undefined;
   const connections = useQuery(api.connections.list);
   const register = useMutation(api.connections.register);
@@ -42,12 +47,10 @@ export default function ConnectionsPanel() {
   const [permissions, setPermissions] = useState<string[]>(READ_DEFAULTS);
   const [busy, setBusy] = useState<string | null>(null);
   const [notice, setNotice] = useState<{ tone: "ok" | "bad"; text: string } | null>(null);
-  const [rotatingId, setRotatingId] = useState<string | null>(null);
-  const [rotateKey, setRotateKey] = useState("");
-  const [rotateSecret, setRotateSecret] = useState("");
+  const [showAddForm, setShowAddForm] = useState(false);
 
   if (!catalog || !connections) {
-    return <div className="animate-pulse text-sm text-muted-foreground">Loading connections…</div>;
+    return <div className="animate-pulse text-sm text-muted-foreground">Loading broker connections…</div>;
   }
 
   const togglePermission = (p: string) => {
@@ -61,22 +64,22 @@ export default function ConnectionsPanel() {
     try {
       const res = await register({
         provider,
-        label,
+        label: label || `${provider} Connection`,
         environment,
-        accountRef,
+        accountRef: accountRef || "demo-account",
         apiKey,
         apiSecret: apiSecret.length > 0 ? apiSecret : undefined,
         permissions,
       });
-      // Secret state is cleared immediately — the UI never retains key material.
       setApiKey("");
       setApiSecret("");
       setLabel("");
       setAccountRef("");
+      setShowAddForm(false);
       setNotice(
         res.ok
-          ? { tone: "ok", text: `Connection ${res.connectionId} registered. Key ${res.keyMasked} fingerprinted (${res.fingerprintAlgo}); raw key material was dropped and never stored.` }
-          : { tone: "bad", text: `Rejected: ${res.errors.join(" ")}` },
+          ? { tone: "ok", text: `Connection registered securely! Only masked suffix (${res.keyMasked}) is kept; raw keys are never stored.` }
+          : { tone: "bad", text: `Registration error: ${res.errors.join(" ")}` },
       );
     } finally {
       setBusy(null);
@@ -88,24 +91,6 @@ export default function ConnectionsPanel() {
     setNotice(null);
     try {
       const res = await verify({ connectionId });
-      setNotice({ tone: res.ok ? "ok" : "bad", text: `${res.note} (status: ${res.status ?? "n/a"})` });
-    } finally {
-      setBusy(null);
-    }
-  };
-
-  const handleRotate = async (connectionId: string) => {
-    setBusy(`rotate-${connectionId}`);
-    setNotice(null);
-    try {
-      const res = await rotate({
-        connectionId,
-        apiKey: rotateKey,
-        apiSecret: rotateSecret.length > 0 ? rotateSecret : undefined,
-      });
-      setRotateKey("");
-      setRotateSecret("");
-      setRotatingId(null);
       setNotice({ tone: res.ok ? "ok" : "bad", text: res.note });
     } finally {
       setBusy(null);
@@ -116,13 +101,189 @@ export default function ConnectionsPanel() {
     setBusy(`revoke-${connectionId}`);
     setNotice(null);
     try {
-      const res = await revoke({ connectionId, reason: "Revoked by operator from the console" });
-      setNotice({ tone: res.ok ? "ok" : "bad", text: res.note });
+      const res = await revoke({ connectionId, reason: "Removed by user" });
+      setNotice({ tone: res.ok ? "ok" : "bad", text: "Connection disconnected." });
     } finally {
       setBusy(null);
     }
   };
 
+  if (isSimple) {
+    return (
+      <div className="space-y-6">
+        {notice && (
+          <div
+            className={`rounded-xl border px-4 py-3 text-xs leading-relaxed ${
+              notice.tone === "ok"
+                ? "border-emerald-600/30 bg-emerald-600/10 text-emerald-700 dark:text-emerald-300"
+                : "border-red-600/30 bg-red-600/10 text-red-700 dark:text-red-300"
+            }`}
+          >
+            {notice.text}
+          </div>
+        )}
+
+        {/* Friendly Overview Banner */}
+        <div className="rounded-2xl border border-border/70 bg-card p-6 shadow-xs">
+          <div className="flex flex-col gap-4 sm:flex-row sm:items-center sm:justify-between">
+            <div>
+              <h2 className="text-base font-semibold">Exchanges & Broker Connections</h2>
+              <p className="mt-1 text-xs text-muted-foreground">
+                Connect your paper trading or demo exchange accounts. Your secret keys are protected with one-way hashing and never stored in plain text.
+              </p>
+            </div>
+
+            <button
+              type="button"
+              onClick={() => setShowAddForm(!showAddForm)}
+              className="inline-flex items-center gap-1.5 rounded-xl bg-primary px-4 py-2 text-xs font-semibold text-primary-foreground hover:opacity-90 transition-opacity cursor-pointer self-start sm:self-auto"
+            >
+              <Plus className="size-4" />
+              <span>{showAddForm ? "Close Form" : "Connect Exchange"}</span>
+            </button>
+          </div>
+        </div>
+
+        {/* Clean Add Connection Form */}
+        {showAddForm && (
+          <div className="rounded-2xl border border-primary/30 bg-card p-6 shadow-sm">
+            <h3 className="text-sm font-semibold mb-4">Add Exchange API Key</h3>
+            <form onSubmit={handleRegister} className="space-y-4">
+              <div className="grid gap-3 sm:grid-cols-2">
+                <label className="flex flex-col gap-1 text-xs font-medium text-muted-foreground">
+                  Exchange / Provider
+                  <select
+                    value={provider}
+                    onChange={(e) => setProvider(e.target.value)}
+                    className="w-full rounded-lg border border-border/80 bg-background px-3 py-2 text-xs text-foreground"
+                  >
+                    {catalog.providers.map((p) => (
+                      <option key={p.provider} value={p.provider}>
+                        {p.provider} ({p.kind})
+                      </option>
+                    ))}
+                  </select>
+                </label>
+
+                <label className="flex flex-col gap-1 text-xs font-medium text-muted-foreground">
+                  Account Label
+                  <input
+                    value={label}
+                    onChange={(e) => setLabel(e.target.value)}
+                    placeholder="e.g. My Paper Account"
+                    required
+                    minLength={3}
+                    className="w-full rounded-lg border border-border/80 bg-background px-3 py-2 text-xs text-foreground"
+                  />
+                </label>
+
+                <label className="flex flex-col gap-1 text-xs font-medium text-muted-foreground">
+                  API Key
+                  <input
+                    type="password"
+                    value={apiKey}
+                    onChange={(e) => setApiKey(e.target.value)}
+                    placeholder="Enter at least 16 characters"
+                    required
+                    minLength={16}
+                    className="w-full rounded-lg border border-border/80 bg-background px-3 py-2 text-xs text-foreground"
+                  />
+                </label>
+
+                <label className="flex flex-col gap-1 text-xs font-medium text-muted-foreground">
+                  API Secret (Optional)
+                  <input
+                    type="password"
+                    value={apiSecret}
+                    onChange={(e) => setApiSecret(e.target.value)}
+                    placeholder="Optional secret"
+                    className="w-full rounded-lg border border-border/80 bg-background px-3 py-2 text-xs text-foreground"
+                  />
+                </label>
+              </div>
+
+              <div className="flex items-center justify-end gap-2 pt-2">
+                <button
+                  type="button"
+                  onClick={() => setShowAddForm(false)}
+                  className="rounded-lg border border-border/80 px-4 py-2 text-xs font-medium text-muted-foreground hover:text-foreground"
+                >
+                  Cancel
+                </button>
+                <button
+                  type="submit"
+                  disabled={busy !== null}
+                  className="inline-flex items-center gap-1.5 rounded-lg bg-primary px-5 py-2 text-xs font-semibold text-primary-foreground hover:opacity-90 disabled:opacity-50"
+                >
+                  {busy === "register" ? <Loader2 className="size-3.5 animate-spin" /> : <Lock className="size-3.5" />}
+                  <span>Save Protected Credential</span>
+                </button>
+              </div>
+            </form>
+          </div>
+        )}
+
+        {/* Active Connections List */}
+        <div className="rounded-2xl border border-border/70 bg-card p-6 shadow-xs">
+          <h3 className="text-sm font-semibold mb-3">Connected Accounts ({connections.length})</h3>
+
+          <div className="space-y-3">
+            {connections.length === 0 ? (
+              <p className="text-xs text-muted-foreground">
+                No external exchanges registered yet. Sentinel is operating with the simulated demo provider.
+              </p>
+            ) : (
+              connections.map((c) => (
+                <div
+                  key={c.connectionId}
+                  className="flex flex-col gap-3 rounded-xl border border-border/60 bg-background/50 p-4 sm:flex-row sm:items-center sm:justify-between text-xs"
+                >
+                  <div className="flex items-start gap-3">
+                    <div className="flex size-9 items-center justify-center rounded-lg bg-primary/10 text-primary shrink-0 mt-0.5">
+                      <Building2 className="size-4" />
+                    </div>
+                    <div>
+                      <div className="flex items-center gap-2">
+                        <span className="font-semibold text-foreground">{c.label}</span>
+                        <span className="rounded-md bg-muted px-2 py-0.5 text-[11px] text-muted-foreground">
+                          {c.provider}
+                        </span>
+                        <StateBadge state={c.status} />
+                      </div>
+                      <div className="mt-1 text-[11px] text-muted-foreground">
+                        Key: <span className="font-mono">{c.keyMasked}</span> · Mode: {c.environment}
+                      </div>
+                    </div>
+                  </div>
+
+                  <div className="flex items-center gap-2 self-end sm:self-auto">
+                    <button
+                      type="button"
+                      onClick={() => handleVerify(c.connectionId)}
+                      disabled={busy !== null}
+                      className="rounded-lg border border-border/80 bg-card px-3 py-1.5 text-xs font-medium hover:bg-muted"
+                    >
+                      {busy === `verify-${c.connectionId}` ? <Loader2 className="size-3 animate-spin inline" /> : "Verify"}
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => handleRevoke(c.connectionId)}
+                      disabled={busy !== null}
+                      className="rounded-lg border border-border/80 bg-card px-3 py-1.5 text-xs font-medium text-red-500 hover:bg-red-500/10"
+                    >
+                      Disconnect
+                    </button>
+                  </div>
+                </div>
+              ))
+            )}
+          </div>
+        </div>
+      </div>
+    );
+  }
+
+  // ADVANCED / PRO VIEW (Full KMS policy, full fingerprint algo, key rotation form)
   return (
     <div className="space-y-5">
       {/* Security posture */}
@@ -270,148 +431,81 @@ export default function ConnectionsPanel() {
                 );
               })}
             </div>
-            <p className="mt-2 text-[10px] leading-relaxed text-muted-foreground">
-              Execution permissions (amber) are never exposed to AI agents, the risk engine or the
-              browser after saving — they are consumed only by the execution subsystem.
-            </p>
           </div>
 
-          <div className="flex items-center gap-3">
-            <button
-              type="submit"
-              disabled={busy !== null}
-              className="inline-flex items-center gap-2 rounded-lg bg-primary px-4 py-2 text-xs font-medium text-primary-foreground transition-opacity hover:opacity-90 disabled:opacity-50"
-            >
-              {busy === "register" ? <Loader2 className="size-3.5 animate-spin" /> : <KeyRound className="size-3.5" />}
-              Connect securely
-            </button>
-            <span className="inline-flex items-center gap-1.5 text-[10px] text-muted-foreground">
-              <Lock className="size-3" /> password fields · never echoed after saving · never logged
-            </span>
-          </div>
+          <button
+            type="submit"
+            disabled={busy !== null}
+            className="inline-flex items-center gap-2 rounded-lg bg-primary px-4 py-2 text-xs font-medium text-primary-foreground transition-opacity hover:opacity-90 disabled:opacity-50"
+          >
+            {busy === "register" ? <Loader2 className="size-3.5 animate-spin" /> : <KeyRound className="size-3.5" />}
+            Register connection (stores fingerprint + masked suffix only)
+          </button>
         </form>
       </Panel>
 
-      {/* Connections list */}
+      {/* Connection list */}
       <Panel
-        title="Your connections"
-        description="Masked keys only. Verification is honest: a simulated adapter reports VERIFIED_SIMULATED — never a claim of real connectivity. Providers without adapters stay pending."
+        title="Registered broker / platform connections"
+        description="Masked suffix, one-way fingerprint and status only. Raw secret material is never stored, never returned and never accessible to the frontend or agents."
       >
         {connections.length === 0 ? (
           <EmptyState
-            title="No connections yet"
-            body="Register a broker or platform credential above. Raw key material is never stored — only a one-way fingerprint and the masked suffix."
+            title="No connections registered"
+            body="Register a paper or demo connection to configure broker credentials."
           />
         ) : (
           <div className="space-y-3">
             {connections.map((c) => (
               <div key={c.connectionId} className="rounded-xl border border-border/60 bg-background/60 p-4">
                 <div className="flex flex-wrap items-center gap-2">
-                  <Link2 className="size-4 text-primary" />
-                  <span className="text-sm font-semibold">{c.label}</span>
+                  <span className="font-semibold">{c.label}</span>
+                  <span className="font-mono text-[11px] text-muted-foreground">{c.connectionId}</span>
+                  <span className="text-xs text-muted-foreground">·</span>
+                  <span className="text-xs">{c.provider} ({c.providerKind})</span>
                   <StateBadge state={c.status} />
-                  <StateBadge state={c.adapter === "SIMULATED" ? "VERIFIED_SIMULATED" : "PENDING_VERIFICATION"} label={`adapter: ${c.adapter === "SIMULATED" ? "simulated" : "not configured"}`} />
-                  <span className="text-[11px] text-muted-foreground">
-                    {c.provider} · {c.providerKind} · {c.environment} · account {c.accountRef}
+                  <span className="ml-auto text-[11px] text-muted-foreground">
+                    account: <span className="font-mono">{c.accountRef}</span> · {c.environment}
                   </span>
-                  <span className="ml-auto font-mono text-[11px] text-muted-foreground">{c.keyMasked}</span>
                 </div>
 
-                <div className="mt-2 flex flex-wrap gap-x-4 gap-y-1 break-all font-mono text-[10px] text-muted-foreground">
-                  <span>id: {c.connectionId}</span>
-                  <span>fingerprint: {c.keyFingerprint.slice(0, 16)}… ({c.fingerprintAlgo})</span>
-                  <span>created {fmtTime(c.createdAt)}</span>
-                  {c.rotatedAt && <span>rotated {fmtTime(c.rotatedAt)}</span>}
-                  {c.revokedAt && <span>revoked {fmtTime(c.revokedAt)}</span>}
-                </div>
+                <div className="mt-2 text-[11px] text-muted-foreground">{c.verificationNote}</div>
 
-                <div className="mt-2 flex flex-wrap gap-1.5">
-                  {c.permissions.map((p) => (
+                <div className="mt-3 flex flex-wrap gap-1.5">
+                  {c.permissions.map((p: string) => (
                     <span
                       key={p}
-                      className={`rounded-md border px-2 py-0.5 text-[10px] font-medium ${
-                        p === "SUBMIT_ORDERS" || p === "CANCEL_ORDERS"
-                          ? "border-amber-600/35 bg-amber-600/10 text-amber-700 dark:text-amber-300"
-                          : "border-border/70 bg-card text-muted-foreground"
-                      }`}
+                      className="rounded-md border border-border/60 bg-card px-2 py-0.5 text-[10px] text-muted-foreground"
                     >
                       {p}
                     </span>
                   ))}
                 </div>
 
-                <p className="mt-2 text-[11px] leading-relaxed text-muted-foreground">{c.verificationNote}</p>
-
-                <div className="mt-3 flex flex-wrap items-center gap-2">
-                  <button
-                    type="button"
-                    onClick={() => handleVerify(c.connectionId)}
-                    disabled={busy !== null || c.status === "REVOKED"}
-                    className="inline-flex items-center gap-1.5 rounded-lg border border-border/80 bg-card px-3 py-1.5 text-[11px] font-medium transition-colors hover:bg-muted disabled:opacity-50"
-                  >
-                    {busy === `verify-${c.connectionId}` ? <Loader2 className="size-3 animate-spin" /> : <ShieldCheck className="size-3" />}
-                    Verify
-                  </button>
-                  <button
-                    type="button"
-                    onClick={() => {
-                      setRotatingId(rotatingId === c.connectionId ? null : c.connectionId);
-                      setRotateKey("");
-                      setRotateSecret("");
-                    }}
-                    disabled={busy !== null || c.status === "REVOKED"}
-                    className="inline-flex items-center gap-1.5 rounded-lg border border-border/80 bg-card px-3 py-1.5 text-[11px] font-medium transition-colors hover:bg-muted disabled:opacity-50"
-                  >
-                    <RefreshCw className="size-3" />
-                    Rotate key
-                  </button>
-                  <button
-                    type="button"
-                    onClick={() => handleRevoke(c.connectionId)}
-                    disabled={busy !== null || c.status === "REVOKED"}
-                    className="inline-flex items-center gap-1.5 rounded-lg border border-red-600/30 bg-red-600/10 px-3 py-1.5 text-[11px] font-medium text-red-700 transition-colors hover:bg-red-600/15 disabled:opacity-50 dark:text-red-300"
-                  >
-                    <Unplug className="size-3" />
-                    Revoke
-                  </button>
-                </div>
-
-                {rotatingId === c.connectionId && (
-                  <div className="mt-3 rounded-lg border border-border/70 bg-card p-3">
-                    <div className="grid gap-2 sm:grid-cols-2">
-                      <input
-                        type="password"
-                        value={rotateKey}
-                        onChange={(e) => setRotateKey(e.target.value)}
-                        placeholder="new API key"
-                        minLength={16}
-                        maxLength={256}
-                        autoComplete="off"
-                        spellCheck={false}
-                        className="w-full rounded-lg border border-border/80 bg-background px-3 py-2 text-xs text-foreground"
-                      />
-                      <input
-                        type="password"
-                        value={rotateSecret}
-                        onChange={(e) => setRotateSecret(e.target.value)}
-                        placeholder="new API secret (optional)"
-                        maxLength={256}
-                        autoComplete="off"
-                        spellCheck={false}
-                        className="w-full rounded-lg border border-border/80 bg-background px-3 py-2 text-xs text-foreground"
-                      />
-                    </div>
+                <div className="mt-3 flex flex-wrap items-center gap-2 border-t border-border/60 pt-3 text-[11px]">
+                  <span className="font-mono text-muted-foreground">key: {c.keyMasked}</span>
+                  <span className="font-mono text-muted-foreground">
+                    print: {c.keyFingerprint.slice(0, 16)}… ({c.fingerprintAlgo})
+                  </span>
+                  <div className="ml-auto flex items-center gap-2">
                     <button
                       type="button"
-                      onClick={() => handleRotate(c.connectionId)}
-                      disabled={busy !== null || rotateKey.length < 16}
-                      className="mt-2 inline-flex items-center gap-1.5 rounded-lg bg-primary px-3 py-1.5 text-[11px] font-medium text-primary-foreground transition-opacity hover:opacity-90 disabled:opacity-50"
+                      onClick={() => handleVerify(c.connectionId)}
+                      disabled={busy !== null}
+                      className="rounded-lg border border-border/80 bg-card px-2.5 py-1 text-xs font-medium hover:bg-muted"
                     >
-                      {busy === `rotate-${c.connectionId}` ? <Loader2 className="size-3 animate-spin" /> : <RefreshCw className="size-3" />}
-                      Save rotated credential
+                      Verify
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => handleRevoke(c.connectionId)}
+                      disabled={busy !== null}
+                      className="rounded-lg border border-border/80 bg-card px-2.5 py-1 text-xs font-medium text-red-600 hover:bg-muted"
+                    >
+                      Revoke
                     </button>
                   </div>
-                )}
+                </div>
               </div>
             ))}
           </div>

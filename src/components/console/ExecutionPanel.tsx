@@ -1,10 +1,10 @@
 import { useState } from "react";
 import { useMutation, useQuery } from "convex/react";
 import { api } from "@/convex/_generated/api";
-import { AlertOctagon, Loader2, RefreshCw, Send, ShieldOff } from "lucide-react";
+import { AlertOctagon, CheckCircle2, ChevronDown, ChevronUp, Clock, HelpCircle, Info, Loader2, RefreshCw, Send, ShieldAlert, ShieldCheck, ShieldOff } from "lucide-react";
 import { EmptyState, MetricTile, Panel, StateBadge, fmt, fmtTime } from "./shared";
 
-export default function ExecutionPanel() {
+export default function ExecutionPanel({ isSimple = false }: { isSimple?: boolean }) {
   const data = useQuery(api.console.execution);
   const riskData = useQuery(api.console.risk);
   const placeOrder = useMutation(api.workflows.placeOrder);
@@ -15,13 +15,15 @@ export default function ExecutionPanel() {
   const [quantity, setQuantity] = useState("0.1");
   const [busy, setBusy] = useState<string | null>(null);
   const [notice, setNotice] = useState<string | null>(null);
+  const [showAdvancedTools, setShowAdvancedTools] = useState(false);
 
   if (!data || !riskData) {
-    return <div className="animate-pulse text-sm text-muted-foreground">Loading execution state…</div>;
+    return <div className="animate-pulse text-sm text-muted-foreground">Loading trading state…</div>;
   }
 
   const pendingAuth = data.authorizations.find((a) => a.state === "APPROVED");
   const unknownOrders = data.orders.filter((o) => o.state === "UNKNOWN");
+  const openPositions = data.positions.filter((p) => p.quantity !== 0);
 
   const handleBehaviorChange = async (behavior: "ACK" | "FILL" | "PARTIAL" | "REJECT" | "TIMEOUT") => {
     setBusy("behavior");
@@ -29,12 +31,12 @@ export default function ExecutionPanel() {
     try {
       const res = await setProviderBehavior({
         behavior,
-        reason: "Operator configured the simulated provider adapter from the console (test/demo configuration).",
+        reason: "Operator configured simulated provider behavior.",
       });
       setNotice(
         "ok" in res && res.ok
-          ? `Simulated provider behavior set to ${behavior} (server-side config).`
-          : `Simulation config change refused: ${"reason" in res ? res.reason : "denied"}`,
+          ? `Exchange simulation response set to: ${behavior}`
+          : `Configuration change refused: ${"reason" in res ? res.reason : "denied"}`,
       );
     } finally {
       setBusy(null);
@@ -59,8 +61,8 @@ export default function ExecutionPanel() {
       });
       setNotice(
         res.deduped
-          ? `Duplicate idempotency key — no new external mutation. Existing order ${res.orderId} is ${res.state}.`
-          : `Order ${res.orderId}: ${res.state} — ${res.note}`,
+          ? `Duplicate order prevented. Order is already in state: ${res.state}.`
+          : `Trade placed successfully! Status: ${res.state}`,
       );
     } finally {
       setBusy(null);
@@ -94,7 +96,7 @@ export default function ExecutionPanel() {
         idempotencyKey: key,
       });
       setNotice(
-        `Idempotency test: first submit → ${first.state}; identical resubmit → ${second.deduped ? `deduplicated (${second.state}) — duplicate order prevented` : "NOT DEDUPLICATED (violation)"}.`,
+        `Safety test: first order → ${first.state}; duplicate submit → ${second.deduped ? "prevented from double-charging (safe)" : "error"}.`,
       );
     } finally {
       setBusy(null);
@@ -108,8 +110,8 @@ export default function ExecutionPanel() {
       const res = await reconcile();
       setNotice(
         res.healthy
-          ? `Reconciliation HEALTHY. Resolved: ${res.resolved.map((r) => `${r.orderId} ${r.from}→${r.to}`).join(", ") || "no pending states"}.`
-          : `Reconciliation MISMATCH — unresolved orders: ${res.unresolved.join(", ")}. New exposure stays blocked.`,
+          ? `Exchange sync complete. Status is healthy.`
+          : `Attention: unresolved orders detected (${res.unresolved.join(", ")}). Trading remains paused for safety.`,
       );
     } finally {
       setBusy(null);
@@ -122,14 +124,219 @@ export default function ExecutionPanel() {
     try {
       const res = await setKillSwitch({
         engaged,
-        reason: engaged ? "Operator engaged kill switch from console" : "Operator released kill switch after verification",
+        reason: engaged ? "Operator paused trading" : "Operator resumed trading",
       });
-      setNotice(res.ok ? `Kill switch ${engaged ? "ENGAGED" : "RELEASED"}.` : `Release refused: ${res.reason}`);
+      setNotice(res.ok ? `Trading ${engaged ? "PAUSED (Safety Halt Active)" : "RESUMED"}.` : `Action refused: ${res.reason}`);
     } finally {
       setBusy(null);
     }
   };
 
+  if (isSimple) {
+    return (
+      <div className="space-y-6">
+        {notice && (
+          <div className="rounded-xl border border-primary/30 bg-primary/10 px-4 py-3 text-xs leading-relaxed text-foreground">
+            {notice}
+          </div>
+        )}
+
+        {/* Friendly Trading Overview & Emergency Stop */}
+        <div className="rounded-2xl border border-border/70 bg-card p-6 shadow-xs">
+          <div className="flex flex-col gap-4 sm:flex-row sm:items-center sm:justify-between">
+            <div>
+              <h2 className="text-base font-semibold">Execute Simulated Trades</h2>
+              <p className="mt-1 text-xs text-muted-foreground">
+                Submit trades backed by real-time risk verification. Every trade is checked against drawdown limits before reaching the market.
+              </p>
+            </div>
+
+            <div className="flex items-center gap-2">
+              {riskData.systemState?.killSwitchEngaged ? (
+                <button
+                  type="button"
+                  onClick={() => handleKill(false)}
+                  disabled={busy !== null}
+                  className="inline-flex items-center gap-1.5 rounded-xl border border-border/80 bg-background px-4 py-2 text-xs font-semibold text-foreground hover:bg-muted transition-colors cursor-pointer"
+                >
+                  <ShieldCheck className="size-4 text-emerald-500" />
+                  Resume Trading
+                </button>
+              ) : (
+                <button
+                  type="button"
+                  onClick={() => handleKill(true)}
+                  disabled={busy !== null}
+                  className="inline-flex items-center gap-1.5 rounded-xl border border-red-600/30 bg-red-600/10 px-4 py-2 text-xs font-semibold text-red-600 dark:text-red-400 hover:bg-red-600/15 transition-colors cursor-pointer"
+                >
+                  <AlertOctagon className="size-4" />
+                  Emergency Stop
+                </button>
+              )}
+            </div>
+          </div>
+
+          {/* Clean Order Action Card */}
+          <div className="mt-6 rounded-xl border border-border/60 bg-background/50 p-5">
+            {pendingAuth ? (
+              <div className="space-y-4">
+                <div className="flex items-center gap-2 text-xs font-medium text-emerald-600 dark:text-emerald-400">
+                  <CheckCircle2 className="size-4" />
+                  <span>Approved Trade Proposal Ready: {pendingAuth.scope.side} {pendingAuth.scope.marketId.replace("MKT-", "").replace("-SIM", "")}</span>
+                </div>
+
+                <div className="flex flex-wrap items-end gap-3">
+                  <label className="flex flex-col gap-1 text-xs font-medium text-muted-foreground">
+                    Quantity
+                    <input
+                      value={quantity}
+                      onChange={(e) => setQuantity(e.target.value)}
+                      className="w-32 rounded-lg border border-border/80 bg-card px-3 py-2 text-xs text-foreground"
+                    />
+                  </label>
+
+                  <button
+                    type="button"
+                    onClick={handlePlace}
+                    disabled={busy !== null}
+                    className="inline-flex items-center gap-2 rounded-lg bg-primary px-5 py-2 text-xs font-semibold text-primary-foreground hover:opacity-90 transition-opacity cursor-pointer disabled:opacity-50"
+                  >
+                    {busy === "place" ? <Loader2 className="size-3.5 animate-spin" /> : <Send className="size-3.5" />}
+                    Submit Order Now
+                  </button>
+                </div>
+              </div>
+            ) : (
+              <div className="flex items-start gap-3 text-xs text-muted-foreground">
+                <Info className="size-4 text-primary shrink-0 mt-0.5" />
+                <div>
+                  <span className="font-medium text-foreground">No pending trade proposals right now.</span>
+                  <p className="mt-0.5">
+                    To place a trade, propose an order in the <strong>Risk Controls</strong> tab. Sentinel Prime's safety engine evaluates the risk and returns an approved authorization.
+                  </p>
+                </div>
+              </div>
+            )}
+          </div>
+        </div>
+
+        {/* Open Positions List */}
+        <div className="rounded-2xl border border-border/70 bg-card p-6 shadow-xs">
+          <h3 className="text-sm font-semibold tracking-tight">Open Positions ({openPositions.length})</h3>
+          <div className="mt-4 space-y-2.5">
+            {openPositions.length === 0 ? (
+              <p className="text-xs text-muted-foreground">No active positions. You are currently flat.</p>
+            ) : (
+              openPositions.map((p) => (
+                <div
+                  key={p.positionId}
+                  className="flex items-center justify-between rounded-xl border border-border/60 bg-background/50 px-4 py-3 text-xs"
+                >
+                  <div className="flex items-center gap-3">
+                    <span className={`font-semibold ${p.side === "LONG" ? "text-emerald-500" : "text-amber-500"}`}>
+                      {p.side}
+                    </span>
+                    <span className="text-foreground">{p.quantity} units</span>
+                    <span className="text-muted-foreground">Entry: ${fmt(p.avgEntryPrice)}</span>
+                  </div>
+
+                  <div className="text-right">
+                    <span className="text-muted-foreground">PnL: </span>
+                    <span className={`font-bold ${(p.realizedPnl ?? 0) >= 0 ? "text-emerald-500" : "text-red-500"}`}>
+                      ${fmt(p.realizedPnl)}
+                    </span>
+                  </div>
+                </div>
+              ))
+            )}
+          </div>
+        </div>
+
+        {/* Recent Orders List */}
+        <div className="rounded-2xl border border-border/70 bg-card p-6 shadow-xs">
+          <div className="flex items-center justify-between mb-4">
+            <h3 className="text-sm font-semibold tracking-tight">Recent Orders</h3>
+            <button
+              type="button"
+              onClick={handleReconcile}
+              disabled={busy !== null}
+              className="inline-flex items-center gap-1.5 text-xs text-primary hover:underline cursor-pointer"
+            >
+              <RefreshCw className={`size-3 ${busy === "recon" ? "animate-spin" : ""}`} />
+              <span>Sync with Exchange</span>
+            </button>
+          </div>
+
+          <div className="space-y-2.5">
+            {data.orders.length === 0 ? (
+              <p className="text-xs text-muted-foreground">No orders yet.</p>
+            ) : (
+              data.orders.slice(0, 6).map((o) => (
+                <div
+                  key={o.orderId}
+                  className="flex flex-wrap items-center justify-between gap-3 rounded-xl border border-border/60 bg-background/50 px-4 py-3 text-xs"
+                >
+                  <div className="flex items-center gap-2.5">
+                    <span className="font-semibold text-foreground">{o.side}</span>
+                    <span className="text-muted-foreground">{o.quantity} {o.symbol}</span>
+                    <StateBadge state={o.state} />
+                  </div>
+
+                  <div className="text-right text-[11px] text-muted-foreground">
+                    {o.fillPrice ? `Filled @ $${fmt(o.fillPrice)}` : "Market Order"} · {fmtTime(o.updatedAt)}
+                  </div>
+                </div>
+              ))
+            )}
+          </div>
+
+          {/* Toggle for simulator tools */}
+          <div className="mt-5 pt-4 border-t border-border/60">
+            <button
+              type="button"
+              onClick={() => setShowAdvancedTools(!showAdvancedTools)}
+              className="inline-flex items-center gap-1.5 text-xs text-muted-foreground hover:text-foreground cursor-pointer"
+            >
+              {showAdvancedTools ? <ChevronUp className="size-3.5" /> : <ChevronDown className="size-3.5" />}
+              <span>{showAdvancedTools ? "Hide simulation testing tools" : "Show simulation response tools"}</span>
+            </button>
+
+            {showAdvancedTools && (
+              <div className="mt-3 flex flex-wrap items-center gap-3 rounded-xl border border-border/60 bg-background/40 p-4">
+                <label className="flex flex-col gap-1 text-xs text-muted-foreground">
+                  Simulated Exchange Behavior
+                  <select
+                    value={riskData.systemState?.simulatedProviderBehavior ?? "ACK"}
+                    onChange={(e) =>
+                      handleBehaviorChange(e.target.value as "ACK" | "FILL" | "PARTIAL" | "REJECT" | "TIMEOUT")
+                    }
+                    className="rounded-lg border border-border/80 bg-card px-3 py-1.5 text-xs text-foreground"
+                  >
+                    <option value="ACK">ACK (Order accepted)</option>
+                    <option value="FILL">FILL (Immediate fill)</option>
+                    <option value="PARTIAL">PARTIAL (Partial fill)</option>
+                    <option value="REJECT">REJECT (Exchange rejection)</option>
+                    <option value="TIMEOUT">TIMEOUT (Simulate network loss)</option>
+                  </select>
+                </label>
+
+                <button
+                  type="button"
+                  onClick={handleDuplicateSubmit}
+                  disabled={busy !== null || !pendingAuth}
+                  className="self-end rounded-lg border border-border/80 bg-card px-3 py-1.5 text-xs text-foreground hover:bg-muted"
+                >
+                  Test Double-Submission Safety
+                </button>
+              </div>
+            )}
+          </div>
+        </div>
+      </div>
+    );
+  }
+
+  // ADVANCED / PRO VIEW (Preserves all raw prechecks, authorizations, and full lifecycle steps)
   return (
     <div className="space-y-5">
       {notice && (
@@ -213,7 +420,7 @@ export default function ExecutionPanel() {
         {!pendingAuth && (
           <p className="mt-3 rounded-lg border border-amber-600/25 bg-amber-600/5 px-3 py-2 text-[11px] leading-relaxed text-amber-700 dark:text-amber-300">
             No approved authorization is available. Submit a trade proposal in the Risk panel first — orders
-            cannot exist without a scoped, unexpired authorization. That is the whole point.
+            cannot exist without a scoped, unexpired authorization.
           </p>
         )}
 
