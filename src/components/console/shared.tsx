@@ -93,13 +93,51 @@ const TONE_CLASSES: Record<string, string> = {
   locked: "border-border/70 bg-card text-muted-foreground",
 };
 
+/** Friendly text translations for technical enums so normal people understand them */
+const FRIENDLY_LABELS: Record<string, string> = {
+  VALID: "Verified",
+  INCOMPLETE: "Partial",
+  STALE: "Delayed",
+  MISSING: "Missing",
+  INVALID: "Invalid",
+  FAILED: "Failed",
+  PASS: "Passed",
+  FAIL: "Blocked",
+  UNKNOWN: "Checking...",
+  COMPLETED: "Tested",
+  BLOCKED: "Stopped",
+  STRONG: "High Quality",
+  MODERATE: "Good Quality",
+  WEAK: "Needs Review",
+  SUITABLE: "Fit to Trade",
+  MIXED: "Mixed Results",
+  UNSUITABLE: "Not Ready",
+  APPROVE: "Approved",
+  BLOCK: "Blocked",
+  APPROVED: "Ready",
+  CONSUMED: "Used",
+  EXPIRED: "Expired",
+  FILLED: "Completed",
+  PARTIALLY_FILLED: "Half Filled",
+  REJECTED: "Declined",
+  CANCELLED: "Cancelled",
+  HEALTHY: "Normal",
+  ENGAGED: "PAUSED",
+  RELEASED: "Active",
+  PAPER: "Paper Mode",
+  ACTIVE: "Connected",
+  PENDING_VERIFICATION: "Checking",
+  VERIFIED_SIMULATED: "Demo Ready",
+};
+
 export function StateBadge({ state, label }: { state: string; label?: string }) {
   const tone = TONE_BY_STATE[state] ?? "neutral";
+  const displayLabel = label ?? FRIENDLY_LABELS[state] ?? state;
   return (
     <span
-      className={`inline-flex items-center rounded-md border px-2 py-0.5 text-[11px] font-semibold tracking-wide ${TONE_CLASSES[tone]}`}
+      className={`inline-flex items-center rounded-md border px-2 py-0.5 text-[11px] font-medium tracking-wide ${TONE_CLASSES[tone]}`}
     >
-      {label ?? state}
+      {displayLabel}
     </span>
   );
 }
@@ -170,11 +208,12 @@ export function CheckRow({
   status: string;
   detail: string;
 }) {
+  const friendlyCheck = check.replace(/_/g, " ");
   return (
     <div className="flex items-start gap-3 border-b border-border/50 py-2.5 last:border-b-0">
       <StateBadge state={status} />
       <div className="min-w-0">
-        <div className="font-mono text-[11px] font-medium text-foreground">{check}</div>
+        <div className="text-xs font-medium capitalize text-foreground">{friendlyCheck}</div>
         <div className="mt-0.5 text-xs leading-relaxed text-muted-foreground">{detail}</div>
       </div>
     </div>
@@ -198,10 +237,8 @@ export function fmtPct(value: number | null | undefined, digits = 2) {
 }
 
 export function fmtTime(ms: number | null | undefined) {
-  if (!ms) return "N/A";
-  return new Date(ms).toLocaleString(undefined, {
-    month: "short",
-    day: "numeric",
+  if (!ms || !Number.isFinite(ms)) return "N/A";
+  return new Date(ms).toLocaleTimeString(undefined, {
     hour: "2-digit",
     minute: "2-digit",
     second: "2-digit",
@@ -210,9 +247,9 @@ export function fmtTime(ms: number | null | undefined) {
 
 export function EmptyState({ title, body }: { title: string; body: string }) {
   return (
-    <div className="rounded-xl border border-dashed border-border/80 bg-background/50 px-6 py-10 text-center">
-      <div className="text-sm font-medium text-foreground">{title}</div>
-      <p className="mx-auto mt-1.5 max-w-md text-xs leading-relaxed text-muted-foreground">{body}</p>
+    <div className="rounded-xl border border-dashed border-border/70 p-6 text-center text-xs text-muted-foreground">
+      <div className="font-medium text-foreground">{title}</div>
+      <div className="mt-1">{body}</div>
     </div>
   );
 }

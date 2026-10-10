@@ -24,99 +24,93 @@ import logo from "@/assets/logo.svg";
 import { ThemeToggle } from "@/components/ThemeToggle";
 
 const pipelineStages = [
-  "Market Data",
-  "Data Validation",
-  "Market Intelligence",
-  "Regime",
-  "Strategy",
-  "Backtest",
-  "Validation",
-  "Evidence",
-  "Bot Fitness",
-  "Risk Evaluation",
-  "Deterministic Risk Veto",
-  "Execution Authorization",
-  "Execution",
-  "Reconciliation",
-  "Monitoring",
-  "Learning",
-  "New Version",
-  "Revalidation",
+  "Get Market Prices",
+  "Check Price Quality",
+  "Spot Market Trends",
+  "Strategy Rules",
+  "Test on History",
+  "Double-Check Accuracy",
+  "Performance Score",
+  "Check Safety Limits",
+  "Safety Veto Check",
+  "Approve Trade",
+  "Place Order",
+  "Confirm With Exchange",
+  "Track Open Position",
+  "Learn & Suggest Improvements",
 ];
 
 const features = [
   {
     icon: DatabaseZap,
-    title: "Provenance-first market data",
-    body: "Every candle carries event, publication, availability and receipt times. FAILED is never treated as EMPTY, MISSING is never treated as ZERO, and defective feeds are classified — never silently repaired.",
+    title: "Clean, verified price data",
+    body: "Every price candle is double-checked for accuracy. Missing or corrupted data is stopped immediately so trades only run on real numbers.",
   },
   {
     icon: BrainCircuit,
-    title: "Deterministic quant engine",
-    body: "PnL, equity, drawdown, Sharpe, Sortino, expectancy and fill simulation are computed by pure deterministic code. AI interprets results; it never calculates or replaces them.",
+    title: "Exact math, zero guessing",
+    body: "Profits, losses, win rates, and fees are calculated with 100% exact math. AI helps spot opportunities, but never guesses or alters financial math.",
   },
   {
     icon: Layers,
-    title: "Immutable strategy versions",
-    body: "Strategies are structured definitions — no arbitrary executable code. A change creates a new version with preserved genealogy. Validated history can never be mutated.",
+    title: "Locked & safe strategies",
+    body: "Strategies follow clear, locked rules. When a strategy works, its rules cannot be accidentally broken or changed in the background.",
   },
   {
     icon: Scale,
-    title: "Validation before trust",
-    body: "Chronology, look-ahead and leakage tests, explicit cost and execution models, conservative intrabar resolution, stress scenarios and distinct out-of-sample evaluation. Backtest is never treated as trust.",
+    title: "Tested before real money",
+    body: "Every strategy is thoroughly tested against past market history and sudden market drops before you ever trade with it.",
   },
   {
     icon: BadgeCheck,
-    title: "Evidence & bot fitness",
-    body: "Evidence levels are computed by a versioned rubric from deterministic results — an AI cannot upgrade WEAK to STRONG. Fitness is segmented by market, regime, volatility, liquidity and spread.",
+    title: "Honest performance scores",
+    body: "Strategies receive clear, easy-to-understand grades based on real test results, so you always know which setups perform best.",
   },
   {
     icon: ShieldCheck,
-    title: "Deterministic risk veto",
-    body: "Risk AI may recommend. The deterministic risk veto decides. Unknown risk state means no trade. There is no admin force-trade path and no bypass.",
+    title: "Automatic safety shield",
+    body: "Strict limits prevent big drawdowns. If a trade looks uncertain or violates your rules, the safety shield blocks it instantly.",
   },
   {
     icon: Fingerprint,
-    title: "Scoped execution authorization",
-    body: "Orders require an unexpired authorization matching account, strategy version, market, side, quantity and mode. Idempotency keys make every external mutation duplicate-safe.",
+    title: "Protected order placement",
+    body: "Orders require explicit safety approval before being sent. Built-in protection prevents double-ordering or accidental duplicates.",
   },
   {
     icon: Radar,
-    title: "Reconciliation & UNKNOWN",
-    body: "A provider timeout is UNKNOWN — never assumed failure, never blindly retried. Reconciliation against provider state resolves it before any new exposure is allowed.",
+    title: "Double-check exchange status",
+    body: "If an exchange is slow or a connection drops, the system pauses and verifies what happened before trying anything else.",
   },
   {
     icon: ScrollText,
-    title: "Tamper-evident audit",
-    body: "Every decision, veto, authorization, order state change and learning event lands in an append-only hash-chained log with full correlation identifiers.",
+    title: "Permanent activity log",
+    body: "Every trade idea, safety block, and completed order is permanently saved in a tamper-proof log so you can review everything.",
   },
 ];
 
 const aiMay = [
-  "Generate market intelligence and hypotheses",
-  "Propose structured strategy versions",
-  "Interpret deterministic results and evidence",
-  "Recommend risk actions and monitoring responses",
-  "Classify failures and propose experiments",
+  "Spot interesting market patterns and trends",
+  "Suggest helpful strategy rules and settings",
+  "Explain trading results in simple terms",
+  "Alert you when market conditions change",
+  "Suggest ways to improve trade settings",
 ];
 
 const aiMayNot = [
-  "Submit, cancel or modify orders",
-  "Bypass or override the deterministic risk veto",
-  "Calculate or alter financial results",
-  "Mark failed data as valid",
-  "Modify validated strategies or audit history",
-  "Access execution credentials",
+  "Place or change orders without safety approval",
+  "Bypass or ignore your risk limits",
+  "Alter or fake your profit and loss numbers",
+  "Use bad, broken, or missing price data",
+  "Change your saved strategy rules behind your back",
+  "See or export your exchange passwords",
 ];
 
 const modes = [
-  { name: "RESEARCH", tone: "quiet" },
-  { name: "BACKTEST", tone: "quiet" },
-  { name: "OUT_OF_SAMPLE", tone: "quiet" },
-  { name: "PAPER", tone: "active" },
-  { name: "DEMO", tone: "quiet" },
-  { name: "CONTROLLED_LIVE", tone: "locked" },
-  { name: "DISABLED", tone: "quiet" },
+  { name: "RESEARCH", label: "Research", tone: "quiet" },
+  { name: "BACKTEST", label: "History Test", tone: "quiet" },
+  { name: "PAPER", label: "Paper Trading (Active)", tone: "active" },
+  { name: "DEMO", label: "Demo Mode", tone: "quiet" },
+  { name: "CONTROLLED_LIVE", label: "Live Trading (Locked)", tone: "locked" },
 ];
 
 const fadeUp = {
@@ -160,14 +154,14 @@ export default function Landing() {
             <img src={logo} alt="Sentinel Prime" className="size-8 rounded-lg" />
             <div className="leading-tight">
               <div className="text-sm font-semibold tracking-tight">Sentinel Prime</div>
-              <div className="hidden text-[11px] text-muted-foreground sm:block">Trading Intelligence System</div>
+              <div className="hidden text-[11px] text-muted-foreground sm:block">Automated Trading</div>
             </div>
           </Link>
           <nav className="hidden items-center gap-7 text-sm text-muted-foreground md:flex">
-            <a href="#authority" className="transition-colors hover:text-foreground">Authority chain</a>
-            <a href="#capabilities" className="transition-colors hover:text-foreground">Capabilities</a>
-            <a href="#boundary" className="transition-colors hover:text-foreground">AI boundary</a>
-            <a href="#modes" className="transition-colors hover:text-foreground">Modes</a>
+            <a href="#how-it-works" className="transition-colors hover:text-foreground">How it works</a>
+            <a href="#features" className="transition-colors hover:text-foreground">Features</a>
+            <a href="#ai-rules" className="transition-colors hover:text-foreground">Safety rules</a>
+            <a href="#modes" className="transition-colors hover:text-foreground">Trading modes</a>
           </nav>
           <div className="flex items-center gap-2">
             <ThemeToggle />
@@ -181,7 +175,7 @@ export default function Landing() {
               to="/auth?returnTo=%2Fdashboard"
               className="group inline-flex items-center gap-1.5 rounded-lg bg-primary px-3.5 py-2 text-sm font-medium text-primary-foreground shadow-sm transition-all hover:opacity-90"
             >
-              Open console
+              Open app
               <ArrowRight className="size-3.5 transition-transform group-hover:translate-x-0.5" />
             </Link>
           </div>
@@ -192,36 +186,34 @@ export default function Landing() {
       <main className="flex-1">
         <section className="mx-auto w-full max-w-6xl px-6 pt-20 pb-16">
           <motion.div {...fadeUp} className="max-w-3xl">
-            <SectionLabel>Autonomous crypto + forex trading intelligence</SectionLabel>
+            <SectionLabel>Automated crypto & currency trading</SectionLabel>
             <h1 className="text-balance text-4xl font-semibold leading-[1.05] tracking-tight sm:text-6xl">
-              AI proposes.
-              <span className="text-primary"> Deterministic systems decide.</span>
+              AI finds trade ideas.
+              <span className="text-primary"> Strict safety rules protect your money.</span>
             </h1>
             <p className="mt-6 max-w-2xl text-pretty text-lg leading-relaxed text-muted-foreground">
-              Sentinel Prime is a multi-agent trading intelligence and execution system where
-              data validity, quantitative results, risk, authorization and execution remain
-              under deterministic control. When evidence is thin or state is unknown, the
-              answer is no trade.
+              Sentinel Prime makes automated trading safe and easy. Smart AI discovers market trends,
+              while built-in safety shields automatically stop risky trades before they can hurt your balance.
             </p>
             <div className="mt-8 flex flex-wrap items-center gap-3">
               <Link
                 to="/auth?returnTo=%2Fdashboard"
                 className="group inline-flex items-center gap-2 rounded-xl bg-primary px-5 py-3 text-sm font-medium text-primary-foreground shadow-sm transition-all hover:opacity-90"
               >
-                Enter the control console
+                Start free paper trading
                 <ArrowRight className="size-4 transition-transform group-hover:translate-x-0.5" />
               </Link>
               <a
-                href="#authority"
+                href="#how-it-works"
                 className="inline-flex items-center gap-2 rounded-xl border border-border/80 bg-card px-5 py-3 text-sm font-medium text-foreground shadow-sm transition-colors hover:bg-muted"
               >
-                Trace the safety chain
+                See how safety works
               </a>
             </div>
             <div className="mt-8 flex flex-wrap items-center gap-x-6 gap-y-2 text-xs text-muted-foreground">
-              <span className="inline-flex items-center gap-1.5"><Lock className="size-3.5 text-primary" /> Fail closed by design</span>
-              <span className="inline-flex items-center gap-1.5"><ShieldCheck className="size-3.5 text-primary" /> Risk veto is final authority</span>
-              <span className="inline-flex items-center gap-1.5"><CircleSlash2 className="size-3.5 text-primary" /> Live trading stays gated</span>
+              <span className="inline-flex items-center gap-1.5"><Lock className="size-3.5 text-primary" /> Safe by default</span>
+              <span className="inline-flex items-center gap-1.5"><ShieldCheck className="size-3.5 text-primary" /> Automatic loss limits</span>
+              <span className="inline-flex items-center gap-1.5"><CircleSlash2 className="size-3.5 text-primary" /> Risk-free simulation</span>
             </div>
           </motion.div>
 
@@ -238,31 +230,31 @@ export default function Landing() {
                 <span className="size-2.5 rounded-full bg-border" />
               </div>
               <div className="ml-2 text-xs font-medium text-muted-foreground">
-                console · authority chain · paper mode
+                Live Safety Overview · Paper Mode
               </div>
               <div className="ml-auto inline-flex items-center gap-1.5 rounded-full bg-accent px-2.5 py-1 text-[11px] font-medium text-accent-foreground">
-                <Activity className="size-3" />
-                deterministic
+                <Activity className="size-3 text-primary" />
+                Safety Shield Active
               </div>
             </div>
             <div className="grid gap-4 p-5 md:grid-cols-3">
               {[
                 {
-                  label: "Data quality",
-                  status: "VALID",
-                  detail: "availability_time ≤ decision_time · gaps preserved",
+                  label: "Price Data",
+                  status: "VERIFIED",
+                  detail: "All market prices are clean and verified in real time.",
                   icon: Waves,
                 },
                 {
-                  label: "Risk veto",
-                  status: "APPROVE / BLOCK",
-                  detail: "unknown critical state ⇒ no trade",
+                  label: "Risk Shield",
+                  status: "PROTECTED",
+                  detail: "Trades that exceed risk limits are automatically blocked.",
                   icon: ShieldCheck,
                 },
                 {
-                  label: "Order state",
-                  status: "UNKNOWN → RECONCILE",
-                  detail: "timeouts never auto-retry · idempotent submissions",
+                  label: "Order Safety",
+                  status: "SAFE",
+                  detail: "Built-in protection prevents duplicate or accidental orders.",
                   icon: Radar,
                 },
               ].map((card) => (
@@ -286,18 +278,17 @@ export default function Landing() {
           </motion.div>
         </section>
 
-        {/* Authority chain */}
-        <section id="authority" className="border-y border-border/60 bg-card/50 py-20">
+        {/* How it works */}
+        <section id="how-it-works" className="border-y border-border/60 bg-card/50 py-20">
           <div className="mx-auto w-full max-w-6xl px-6">
             <motion.div {...fadeUp}>
-              <SectionLabel>Master authority chain</SectionLabel>
+              <SectionLabel>How safety works</SectionLabel>
               <h2 className="max-w-2xl text-3xl font-semibold tracking-tight sm:text-4xl">
-                No component may skip required authority.
+                Every trade passes simple, strict safety checks.
               </h2>
               <p className="mt-4 max-w-2xl text-muted-foreground">
-                Every action travels the same chain. The orchestrator cannot bypass domain
-                safety, the frontend cannot authorize financial action, and learning can never
-                mutate a live strategy.
+                Before any trade reaches an exchange, it travels through clear safety steps.
+                No automated bot can skip checks or exceed risk limits.
               </p>
             </motion.div>
 
@@ -310,7 +301,7 @@ export default function Landing() {
                 <div key={stage} className="flex items-center gap-2">
                   <div
                     className={`rounded-lg border px-3 py-1.5 text-xs font-medium transition-colors ${
-                      stage === "Deterministic Risk Veto" || stage === "Execution Authorization"
+                      stage === "Check Safety Limits" || stage === "Approve Trade"
                         ? "border-primary/40 bg-primary/10 text-primary"
                         : "border-border/70 bg-card text-foreground/85"
                     }`}
@@ -333,12 +324,11 @@ export default function Landing() {
               <div className="flex items-start gap-3">
                 <Scale className="mt-0.5 size-5 shrink-0 text-primary" />
                 <div>
-                  <h3 className="text-sm font-semibold">The operating preference</h3>
+                  <h3 className="text-sm font-semibold">Our core principle</h3>
                   <p className="mt-1 text-sm leading-relaxed text-muted-foreground">
-                    <span className="font-medium text-foreground">NO TRADE</span> is preferable
-                    to an <span className="font-medium text-foreground">UNTRUSTED TRADE</span>.
-                    Unknown remains unknown until verified. Failed remains failed until
-                    recovered and validated. Missing remains missing.
+                    <span className="font-medium text-foreground">Not trading</span> is always better than placing
+                    an <span className="font-medium text-foreground">unsafe trade</span>.
+                    If market data looks corrupted or connection is uncertain, Sentinel safely pauses and waits.
                   </p>
                 </div>
               </div>
@@ -346,17 +336,16 @@ export default function Landing() {
           </div>
         </section>
 
-        {/* Capabilities */}
-        <section id="capabilities" className="py-20">
+        {/* Features */}
+        <section id="features" className="py-20">
           <div className="mx-auto w-full max-w-6xl px-6">
             <motion.div {...fadeUp}>
-              <SectionLabel>Capabilities</SectionLabel>
+              <SectionLabel>Features</SectionLabel>
               <h2 className="max-w-2xl text-3xl font-semibold tracking-tight sm:text-4xl">
-                A complete intelligence loop — not just a backtester.
+                A complete trading system built around your protection.
               </h2>
               <p className="mt-4 max-w-2xl text-muted-foreground">
-                Understand → Create → Test → Trust → Trade → Monitor → Learn → Improve →
-                Understand again, with deterministic controls at every hand-off.
+                Discover ideas, test on market history, protect your balance, and improve over time — with clear controls at every step.
               </p>
             </motion.div>
 
@@ -380,16 +369,15 @@ export default function Landing() {
         </section>
 
         {/* AI boundary */}
-        <section id="boundary" className="border-y border-border/60 bg-card/50 py-20">
+        <section id="ai-rules" className="border-y border-border/60 bg-card/50 py-20">
           <div className="mx-auto w-full max-w-6xl px-6">
             <motion.div {...fadeUp}>
-              <SectionLabel>AI authority boundary</SectionLabel>
+              <SectionLabel>What AI can and cannot do</SectionLabel>
               <h2 className="max-w-2xl text-3xl font-semibold tracking-tight sm:text-4xl">
-                Confidence is not truth. An agent is not an authority.
+                Smart assistance with strict limits.
               </h2>
               <p className="mt-4 max-w-2xl text-muted-foreground">
-                Twenty-two specialized agents and deterministic components, deny-by-default
-                permissions, scoped data access, and no path from any model to an exchange.
+                AI helps you discover trends and analyze data. It never has permission to place random trades or ignore safety rules.
               </p>
             </motion.div>
 
@@ -400,7 +388,7 @@ export default function Landing() {
               >
                 <div className="flex items-center gap-2 text-sm font-semibold">
                   <Bot className="size-4 text-primary" />
-                  AI may
+                  AI is allowed to
                 </div>
                 <ul className="mt-4 space-y-3">
                   {aiMay.map((item) => (
@@ -419,7 +407,7 @@ export default function Landing() {
               >
                 <div className="flex items-center gap-2 text-sm font-semibold">
                   <CircleSlash2 className="size-4 text-destructive" />
-                  AI may not
+                  AI is NEVER allowed to
                 </div>
                 <ul className="mt-4 space-y-3">
                   {aiMayNot.map((item) => (
@@ -438,14 +426,13 @@ export default function Landing() {
         <section id="modes" className="py-20">
           <div className="mx-auto w-full max-w-6xl px-6">
             <motion.div {...fadeUp}>
-              <SectionLabel>Product modes</SectionLabel>
+              <SectionLabel>Trading modes</SectionLabel>
               <h2 className="max-w-2xl text-3xl font-semibold tracking-tight sm:text-4xl">
-                Modes never silently become more dangerous.
+                Safe simulation by default.
               </h2>
               <p className="mt-4 max-w-2xl text-muted-foreground">
-                This deployment runs in PAPER: real strategy, validation and risk logic with
-                simulated execution. Controlled live remains disabled until a readiness review
-                verifies every gate — and activation is a separate, explicit approval.
+                Sentinel Prime runs in paper simulation mode so you can try out strategies risk-free.
+                Live real-money trading remains safely disabled until you are ready and explicitly approve it.
               </p>
             </motion.div>
 
@@ -463,7 +450,7 @@ export default function Landing() {
                 >
                   {m.tone === "active" && <span className="size-1.5 animate-pulse rounded-full bg-primary" />}
                   {m.tone === "locked" && <Lock className="size-3" />}
-                  {m.name}
+                  {m.label}
                 </div>
               ))}
             </motion.div>
@@ -474,9 +461,9 @@ export default function Landing() {
               className="mt-8 grid gap-4 sm:grid-cols-3"
             >
               {[
-                { icon: Gauge, title: "Evidence before trust", body: "A backtest result is not a valid strategy. Trust requires validation, evidence and fitness — each computed, each versioned." },
-                { icon: ShieldCheck, title: "Fail closed everywhere", body: "Security fails closed. Risk fails closed. Execution fails closed. Reconciliation fails closed. Unknown states block, never approve." },
-                { icon: Activity, title: "Complete traceability", body: "Correlation IDs tie every workflow, agent run, risk decision, authorization and order into the audit chain." },
+                { icon: Gauge, title: "Test before you trust", body: "Check real performance and historical drawdown before deciding to run any strategy." },
+                { icon: ShieldCheck, title: "Safe limits first", body: "If market conditions get strange or a connection is lost, trading pauses safely." },
+                { icon: Activity, title: "Clear trade tracking", body: "See exactly why each trade was approved, filled, or blocked at any time." },
               ].map((c) => (
                 <div key={c.title} className="rounded-2xl border border-border/70 bg-card p-6">
                   <c.icon className="size-5 text-primary" />
@@ -495,35 +482,19 @@ export default function Landing() {
               {...fadeUp}
               className="relative overflow-hidden rounded-3xl border border-border/70 bg-card px-8 py-14 text-center shadow-[0_1px_2px_rgba(15,23,42,0.04),0_28px_60px_-32px_rgba(15,23,42,0.30)]"
             >
-              <div
-                aria-hidden
-                className="pointer-events-none absolute inset-0"
-                style={{
-                  background:
-                    "radial-gradient(640px 300px at 50% -20%, color-mix(in srgb, var(--primary) 18%, transparent), transparent 70%)",
-                }}
-              />
-              <h2 className="relative text-3xl font-semibold tracking-tight sm:text-4xl">
-                Operate the system that stays safe when everything else fails.
+              <h2 className="text-balance text-3xl font-semibold tracking-tight sm:text-4xl">
+                Ready to explore automated trading safely?
               </h2>
-              <p className="relative mx-auto mt-4 max-w-xl text-muted-foreground">
-                Open the console to watch data quality gates, deterministic validation,
-                evidence rubrics, the risk veto, authorization scopes and reconciliation
-                work as one chain — on live paper state.
+              <p className="mx-auto mt-4 max-w-xl text-muted-foreground">
+                Try out algorithms and simulate orders in paper mode with no real money at risk.
               </p>
-              <div className="relative mt-8 flex flex-wrap items-center justify-center gap-3">
+              <div className="mt-8 flex justify-center">
                 <Link
                   to="/auth?returnTo=%2Fdashboard"
-                  className="group inline-flex items-center gap-2 rounded-xl bg-primary px-6 py-3 text-sm font-medium text-primary-foreground shadow-sm transition-all hover:opacity-90"
+                  className="group inline-flex items-center gap-2 rounded-xl bg-primary px-6 py-3.5 text-sm font-medium text-primary-foreground shadow-sm transition-all hover:opacity-90"
                 >
-                  Launch Sentinel Prime console
+                  Open trading app
                   <ArrowRight className="size-4 transition-transform group-hover:translate-x-0.5" />
-                </Link>
-                <Link
-                  to="/auth"
-                  className="inline-flex items-center gap-2 rounded-xl border border-border/80 bg-background px-6 py-3 text-sm font-medium transition-colors hover:bg-muted"
-                >
-                  Create an account
                 </Link>
               </div>
             </motion.div>
@@ -531,19 +502,14 @@ export default function Landing() {
         </section>
       </main>
 
-      <footer className="border-t border-border/60 py-10">
-        <div className="mx-auto flex w-full max-w-6xl flex-col gap-4 px-6 sm:flex-row sm:items-center sm:justify-between">
-          <div className="flex items-center gap-2.5">
-            <img src={logo} alt="Sentinel Prime" className="size-6 rounded-md" />
-            <span className="text-sm font-medium tracking-tight">Sentinel Prime</span>
-            <span className="text-xs text-muted-foreground">
-              · deterministic trading intelligence
-            </span>
+      {/* Footer */}
+      <footer className="border-t border-border/60 py-8">
+        <div className="mx-auto flex w-full max-w-6xl flex-wrap items-center justify-between gap-4 px-6 text-xs text-muted-foreground">
+          <div className="flex items-center gap-2">
+            <img src={logo} alt="Sentinel Prime" className="size-5 rounded" />
+            <span>Sentinel Prime · Safe automated trading</span>
           </div>
-          <p className="max-w-md text-xs leading-relaxed text-muted-foreground">
-            Synthetic seeded market data · paper execution only · evidence levels are not
-            guarantees · nothing on this page is financial advice
-          </p>
+          <div>Paper mode simulation · No financial advice</div>
         </div>
       </footer>
     </motion.div>

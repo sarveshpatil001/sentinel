@@ -34,15 +34,15 @@ import ConstitutionPanel from "@/components/console/ConstitutionPanel";
 
 const ALL_TABS = [
   { id: "overview", label: "Overview", simpleLabel: "Dashboard", icon: LayoutDashboard, proOnly: false },
-  { id: "execution", label: "Execution & Trading", simpleLabel: "Trading", icon: Activity, proOnly: false },
+  { id: "execution", label: "Trading & Orders", simpleLabel: "Trading", icon: Activity, proOnly: false },
   { id: "strategies", label: "Strategies", simpleLabel: "Strategies", icon: BadgeCheck, proOnly: false },
-  { id: "connections", label: "Broker & Exchanges", simpleLabel: "Exchanges", icon: KeyRound, proOnly: false },
-  { id: "risk", label: "Risk & Veto", simpleLabel: "Risk Controls", icon: ShieldCheck, proOnly: false },
-  { id: "data", label: "Market Data", simpleLabel: "Market Data", icon: DatabaseZap, proOnly: true },
-  { id: "validation", label: "Validation Engine", simpleLabel: "Validation", icon: FlaskConical, proOnly: true },
-  { id: "agents", label: "Agent Registry", simpleLabel: "AI Agents", icon: Users, proOnly: true },
-  { id: "audit", label: "Audit Ledger", simpleLabel: "Audit Log", icon: ScrollText, proOnly: true },
-  { id: "constitution", label: "Constitution & Specs", simpleLabel: "Governance", icon: TerminalSquare, proOnly: true },
+  { id: "connections", label: "Exchanges", simpleLabel: "Exchanges", icon: KeyRound, proOnly: false },
+  { id: "risk", label: "Safety Controls", simpleLabel: "Safety Controls", icon: ShieldCheck, proOnly: false },
+  { id: "data", label: "Price Feeds", simpleLabel: "Price Feeds", icon: DatabaseZap, proOnly: true },
+  { id: "validation", label: "Test History", simpleLabel: "Test History", icon: FlaskConical, proOnly: true },
+  { id: "agents", label: "AI Helpers", simpleLabel: "AI Helpers", icon: Users, proOnly: true },
+  { id: "audit", label: "Activity Log", simpleLabel: "Activity Log", icon: ScrollText, proOnly: true },
+  { id: "constitution", label: "System Rules", simpleLabel: "System Rules", icon: TerminalSquare, proOnly: true },
 ] as const;
 
 type TabId = (typeof ALL_TABS)[number]["id"];
@@ -95,7 +95,7 @@ export default function Dashboard() {
             <div className="leading-tight">
               <div className="text-sm font-semibold tracking-tight">Sentinel Prime</div>
               <div className="text-[11px] text-muted-foreground">
-                {isSimple ? "Automated Trading" : "Control console · paper mode"}
+                {isSimple ? "Automated Trading" : "Advanced Console"}
               </div>
             </div>
           </div>
@@ -106,13 +106,13 @@ export default function Dashboard() {
 
             <div className="hidden items-center gap-1.5 rounded-full border border-primary/30 bg-primary/10 px-3 py-1 text-[11px] font-medium text-primary md:inline-flex">
               <Zap className="size-3 text-primary" />
-              <span>Paper Trading Active</span>
+              <span>Simulation Mode (Safe)</span>
             </div>
 
             <div className="hidden text-right leading-tight sm:block">
-              <div className="text-xs font-medium">{user?.name ?? user?.email ?? "Operator"}</div>
+              <div className="text-xs font-medium">{user?.name ?? user?.email ?? "Trader"}</div>
               <div className="text-[10px] text-muted-foreground">
-                {isSimple ? "Protected Account" : "authenticated session"}
+                {isSimple ? "Logged In" : "Authenticated session"}
               </div>
             </div>
 
@@ -163,8 +163,8 @@ export default function Dashboard() {
                 className="hidden text-[11px] text-muted-foreground hover:text-primary transition-colors pb-2 lg:inline-flex items-center gap-1"
                 title="Switch to Pro view to see full quant metrics, audit logs, and technical specs"
               >
-                <span>Pro controls hidden</span>
-                <span className="underline">Show more</span>
+                <span>Advanced tabs hidden</span>
+                <span className="underline">Show Pro mode</span>
               </button>
             )}
           </div>
@@ -188,16 +188,16 @@ export default function Dashboard() {
       <footer className="border-t border-border/60 py-6">
         <div className="mx-auto flex w-full max-w-7xl flex-wrap items-center justify-between gap-y-2 px-4 text-[11px] text-muted-foreground sm:px-6">
           <div className="flex flex-wrap items-center gap-x-3 gap-y-1">
-            <span>Sentinel Prime · Risk-first autonomous trading</span>
+            <span>Sentinel Prime · Easy & safe automated trading</span>
             <span>·</span>
-            <span>Simulation / Paper mode</span>
+            <span>Demo simulation mode</span>
             <span>·</span>
-            <span>Deterministic safety active</span>
+            <span>No real money at risk</span>
           </div>
 
           <div className="flex items-center gap-2">
-            <span>Mode:</span>
-            <span className="font-semibold text-foreground uppercase">{viewMode}</span>
+            <span>View:</span>
+            <span className="font-semibold text-foreground capitalize">{viewMode}</span>
             <button
               type="button"
               onClick={() => setViewMode(isSimple ? "advanced" : "simple")}

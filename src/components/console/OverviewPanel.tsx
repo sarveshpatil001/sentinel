@@ -24,7 +24,7 @@ export default function OverviewPanel({ isSimple = false }: { isSimple?: boolean
   const [showTechnicalDetails, setShowTechnicalDetails] = useState(false);
 
   if (!data) {
-    return <div className="animate-pulse text-sm text-muted-foreground">Loading system overview…</div>;
+    return <div className="animate-pulse text-sm text-muted-foreground">Loading dashboard…</div>;
   }
 
   const s = data.systemState;
@@ -43,21 +43,21 @@ export default function OverviewPanel({ isSimple = false }: { isSimple?: boolean
               <div>
                 <div className="flex items-center gap-2">
                   <h1 className="text-base font-semibold text-foreground">
-                    Sentinel System Status: {isHealthy ? "Protected & Ready" : "Attention Required"}
+                    Status: {isHealthy ? "All Systems Ready" : "Trading Paused"}
                   </h1>
                   <span className="inline-flex items-center rounded-full bg-emerald-500/15 px-2.5 py-0.5 text-xs font-medium text-emerald-600 dark:text-emerald-400">
-                    Live Safe Mode
+                    Safe Mode
                   </span>
                 </div>
                 <p className="mt-1 text-xs leading-relaxed text-muted-foreground">
-                  Autonomous safety guardrails are fully active. Real capital is safe from unintended trades or unverified signals.
+                  Automatic safety rules are on. Your account is protected from bad trades or unexpected market swings.
                 </p>
               </div>
             </div>
 
             <div className="flex items-center gap-2 self-start rounded-xl border border-border/70 bg-card/80 px-3.5 py-2 sm:self-auto">
               <div className="size-2 rounded-full bg-emerald-500 animate-pulse" />
-              <span className="text-xs font-medium text-foreground">Paper Trading Simulation</span>
+              <span className="text-xs font-medium text-foreground">Paper Trading (Safe)</span>
             </div>
           </div>
         </div>
@@ -66,16 +66,16 @@ export default function OverviewPanel({ isSimple = false }: { isSimple?: boolean
         <div className="grid gap-4 sm:grid-cols-2 lg:grid-cols-4">
           <div className="rounded-2xl border border-border/70 bg-card p-5 shadow-xs transition-all hover:border-primary/30">
             <div className="flex items-center justify-between text-muted-foreground">
-              <span className="text-xs font-medium uppercase tracking-wider">Markets Monitored</span>
+              <span className="text-xs font-medium uppercase tracking-wider">Markets Tracked</span>
               <Coins className="size-4 text-primary" />
             </div>
-            <div className="mt-3 text-2xl font-bold tracking-tight text-foreground">{data.marketCount}</div>
-            <div className="mt-1 text-xs text-muted-foreground">Top Crypto & Forex pairs</div>
+            <div className="mt-3 text-2xl font-bold tracking-tight text-foreground">{data.marketCount} pairs</div>
+            <div className="mt-1 text-xs text-muted-foreground">Major Crypto & Currencies</div>
           </div>
 
           <div className="rounded-2xl border border-border/70 bg-card p-5 shadow-xs transition-all hover:border-primary/30">
             <div className="flex items-center justify-between text-muted-foreground">
-              <span className="text-xs font-medium uppercase tracking-wider">Trading Activity</span>
+              <span className="text-xs font-medium uppercase tracking-wider">Test Orders</span>
               <TrendingUp className="size-4 text-emerald-500" />
             </div>
             <div className="mt-3 text-2xl font-bold tracking-tight text-foreground">{data.orderCounts.filled} filled</div>
@@ -86,24 +86,24 @@ export default function OverviewPanel({ isSimple = false }: { isSimple?: boolean
 
           <div className="rounded-2xl border border-border/70 bg-card p-5 shadow-xs transition-all hover:border-primary/30">
             <div className="flex items-center justify-between text-muted-foreground">
-              <span className="text-xs font-medium uppercase tracking-wider">Feed Quality</span>
+              <span className="text-xs font-medium uppercase tracking-wider">Price Feed Health</span>
               <ShieldCheck className="size-4 text-primary" />
             </div>
             <div className="mt-3 text-2xl font-bold tracking-tight text-emerald-600 dark:text-emerald-400">
-              100% Verified
+              100% Good
             </div>
-            <div className="mt-1 text-xs text-muted-foreground">Zero bad ticks or missing bars</div>
+            <div className="mt-1 text-xs text-muted-foreground">Accurate prices verified</div>
           </div>
 
           <div className="rounded-2xl border border-border/70 bg-card p-5 shadow-xs transition-all hover:border-primary/30">
             <div className="flex items-center justify-between text-muted-foreground">
-              <span className="text-xs font-medium uppercase tracking-wider">Safety Engines</span>
+              <span className="text-xs font-medium uppercase tracking-wider">Safety Checks</span>
               <Cpu className="size-4 text-primary" />
             </div>
             <div className="mt-3 text-2xl font-bold tracking-tight text-foreground">
-              {data.agentCounts.deterministic} active
+              {data.agentCounts.deterministic} running
             </div>
-            <div className="mt-1 text-xs text-muted-foreground">Automatic risk veto & checks</div>
+            <div className="mt-1 text-xs text-muted-foreground">Automatic loss protection active</div>
           </div>
         </div>
 
@@ -113,7 +113,7 @@ export default function OverviewPanel({ isSimple = false }: { isSimple?: boolean
             <div>
               <h2 className="text-sm font-semibold tracking-tight">Active Trading Strategies</h2>
               <p className="text-xs text-muted-foreground mt-0.5">
-                Mathematical algorithmic models validated against rigorous market simulations.
+                Ready-to-use strategies tested on real past market data.
               </p>
             </div>
           </div>
@@ -132,7 +132,7 @@ export default function OverviewPanel({ isSimple = false }: { isSimple?: boolean
                     <StateBadge state={v.state === "COMPLETED" ? "PASS" : v.state} />
                   </div>
                   <div className="mt-1 text-xs text-muted-foreground">
-                    {v.tradeCount ?? 0} simulated trades executed
+                    {v.tradeCount ?? 0} test trades
                   </div>
                 </div>
 
@@ -154,17 +154,17 @@ export default function OverviewPanel({ isSimple = false }: { isSimple?: boolean
           <div className="flex items-center justify-between mb-2">
             <div className="flex items-center gap-2">
               <CheckCircle2 className="size-4 text-emerald-500" />
-              <h2 className="text-sm font-semibold tracking-tight">Protected Ledger & Audit Trail</h2>
+              <h2 className="text-sm font-semibold tracking-tight">Account Protection Log</h2>
             </div>
             <span className="inline-flex items-center gap-1.5 rounded-full border border-emerald-600/25 bg-emerald-600/10 px-2.5 py-0.5 text-xs font-semibold text-emerald-700 dark:text-emerald-300">
               <Link2 className="size-3" />
-              {data.auditChain.verifiedCount} events cryptographically verified
+              {data.auditChain.verifiedCount} events logged & verified
             </span>
           </div>
 
           <p className="text-xs leading-relaxed text-muted-foreground">
-            Every trade decision, risk veto, and system change is permanently recorded and verified.
-            No automated agent can bypass the risk rules or alter past performance data.
+            Every trade decision, safety block, and price check is permanently recorded.
+            Automated bots cannot change past history or ignore your stop-loss rules.
           </p>
 
           <div className="mt-4 pt-4 border-t border-border/60">
@@ -174,7 +174,7 @@ export default function OverviewPanel({ isSimple = false }: { isSimple?: boolean
               className="inline-flex items-center gap-1.5 text-xs font-medium text-primary hover:underline cursor-pointer"
             >
               {showTechnicalDetails ? <ChevronUp className="size-3.5" /> : <ChevronDown className="size-3.5" />}
-              <span>{showTechnicalDetails ? "Hide technical audit logs" : "View recent audit activity"}</span>
+              <span>{showTechnicalDetails ? "Hide recent events" : "Show recent activity log"}</span>
             </button>
 
             {showTechnicalDetails && (
@@ -206,13 +206,11 @@ export default function OverviewPanel({ isSimple = false }: { isSimple?: boolean
           <div>
             <div className="flex items-center gap-2 text-sm font-semibold">
               System mode: <StateBadge state={s?.mode ?? "PAPER"} />
-              <StateBadge state={s?.killSwitchEngaged ? "ENGAGED" : "RELEASED"} label={s?.killSwitchEngaged ? "KILL SWITCH ENGAGED" : "kill switch released"} />
+              <StateBadge state={s?.killSwitchEngaged ? "ENGAGED" : "RELEASED"} label={s?.killSwitchEngaged ? "EMERGENCY STOP ON" : "Safety Normal"} />
             </div>
             <p className="mt-1 text-xs leading-relaxed text-muted-foreground">
               Environment <span className="font-medium text-foreground">{s?.environment ?? "PAPER"}</span>.
-              Controlled live is disabled and there is no automatic live activation or resume —
-              readiness review and explicit approval are separate required steps.
-              {s?.liveAutoResume === false && " Automatic resume: disabled."}
+              Real money trading stays safely disabled until explicit review and approval.
             </p>
           </div>
         </div>
@@ -220,9 +218,9 @@ export default function OverviewPanel({ isSimple = false }: { isSimple?: boolean
 
       {/* Key tiles */}
       <div className="grid gap-3 sm:grid-cols-2 lg:grid-cols-4">
-        <MetricTile label="Markets tracked" value={data.marketCount} sub="crypto + forex (synthetic feeds)" />
+        <MetricTile label="Markets tracked" value={data.marketCount} sub="crypto + currencies" />
         <MetricTile
-          label="Data quality"
+          label="Price quality"
           value={
             <span className="flex flex-wrap gap-1.5">
               {data.qualitySummary.map((q) => (
@@ -234,20 +232,20 @@ export default function OverviewPanel({ isSimple = false }: { isSimple?: boolean
         <MetricTile
           label="Orders"
           value={data.orderCounts.total}
-          sub={`${data.orderCounts.filled} filled · ${data.orderCounts.unknown} unknown`}
+          sub={`${data.orderCounts.filled} filled · ${data.orderCounts.unknown} pending`}
           tone={data.orderCounts.unknown > 0 ? "warn" : "neutral"}
         />
         <MetricTile
-          label="Agent registry"
-          value={`${data.agentCounts.total} components`}
-          sub={`${data.agentCounts.deterministic} deterministic · ${data.agentCounts.unavailable} AI-unavailable`}
+          label="Safety checks"
+          value={`${data.agentCounts.total} checks`}
+          sub={`${data.agentCounts.deterministic} active`}
         />
       </div>
 
       {/* Latest validations */}
       <Panel
-        title="Latest deterministic validations"
-        description="Backtest result ≠ valid strategy ≠ trustworthy strategy ≠ currently fit ≠ authorized trade."
+        title="Recent strategy test results"
+        description="Tested against market history with realistic fees and slippage."
       >
         <div className="space-y-2">
           {data.latestValidations.map((v) => (
@@ -260,8 +258,8 @@ export default function OverviewPanel({ isSimple = false }: { isSimple?: boolean
               <StateBadge state={v.leakageState} />
               <div className="ml-auto flex items-center gap-4 text-xs text-muted-foreground">
                 <span>trades: <span className="font-medium text-foreground">{v.tradeCount ?? "N/A"}</span></span>
-                <span>net return: <span className="font-medium text-foreground">{fmtPct(v.netReturn)}</span></span>
-                <span>max DD: <span className="font-medium text-foreground">{fmtPct(v.maxDrawdown)}</span></span>
+                <span>return: <span className="font-medium text-foreground">{fmtPct(v.netReturn)}</span></span>
+                <span>max drop: <span className="font-medium text-foreground">{fmtPct(v.maxDrawdown)}</span></span>
               </div>
             </div>
           ))}
@@ -271,21 +269,21 @@ export default function OverviewPanel({ isSimple = false }: { isSimple?: boolean
       {/* Audit + controls */}
       <div className="grid gap-5 lg:grid-cols-2">
         <Panel
-          title="Audit chain integrity"
-          description="Append-only hash-chained log. Tamper-evident, never rewritten."
+          title="Activity log integrity"
+          description="Permanent tamper-proof history of every action taken."
           action={
             data.auditChain.valid ? (
               <span className="inline-flex items-center gap-1.5 rounded-md border border-emerald-600/25 bg-emerald-600/10 px-2 py-1 text-[11px] font-semibold text-emerald-700 dark:text-emerald-300">
                 <Link2 className="size-3" />{" "}
                 {data.auditChain.scope === "FULL_CHAIN"
-                  ? `full chain verified from genesis (${data.auditChain.verifiedCount} records verified)`
+                  ? `Full history verified (${data.auditChain.verifiedCount} events)`
                   : data.auditChain.scope === "WINDOW"
-                    ? `window verified (${data.auditChain.verifiedCount} records verified) — earlier history NOT verified`
-                    : "no records — nothing verified"}
+                    ? `Recent history verified (${data.auditChain.verifiedCount} events)`
+                    : "No events recorded yet"}
               </span>
             ) : (
               <span className="inline-flex items-center gap-1.5 rounded-md border border-red-600/25 bg-red-600/10 px-2 py-1 text-[11px] font-semibold text-red-700 dark:text-red-300">
-                <AlertTriangle className="size-3" /> chain broken
+                <AlertTriangle className="size-3" /> Warning: check required
               </span>
             )
           }
@@ -295,7 +293,7 @@ export default function OverviewPanel({ isSimple = false }: { isSimple?: boolean
               <div key={e.sequence} className="flex items-start gap-2.5 text-xs">
                 <span className="mt-0.5 font-mono text-[10px] text-muted-foreground">#{e.sequence}</span>
                 <div>
-                  <div className="font-medium text-foreground">{e.action}</div>
+                  <div className="font-medium text-foreground">{e.action.replace(/_/g, " ")}</div>
                   <div className="text-muted-foreground">{e.detail}</div>
                   <div className="mt-0.5 text-[10px] text-muted-foreground/70">
                     {fmtTime(e.at)} · {e.actor}
@@ -306,7 +304,7 @@ export default function OverviewPanel({ isSimple = false }: { isSimple?: boolean
           </div>
         </Panel>
 
-        <Panel title="Controlled-live readiness gates" description="Section 30 gate checklist. Readiness ≠ activation.">
+        <Panel title="Live trading readiness checklist" description="Requirements needed before real-money trading is ever allowed.">
           <div className="grid max-h-[340px] grid-cols-1 gap-1.5 overflow-auto pr-1 sm:grid-cols-2">
             {(s?.controlledLiveGates ?? []).map((g) => (
               <div
