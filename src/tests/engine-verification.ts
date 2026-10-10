@@ -8,7 +8,7 @@
  * the build green (Rule 38/39).
  */
 import { evaluateRisk, vetoAllows, RiskContext, RiskPolicy, TradeProposal } from "../convex/lib/risk";
-import { normalizeProviderResponse, validateAuthorizationScope, runPrechecks, AuthorizationRecord, OrderIntent } from "../convex/lib/execution";
+import { normalizeProviderResponse, validateAuthorizationScope, runPrechecks, AuthorizationRecord, OrderIntent, PrecheckContext } from "../convex/lib/execution";
 import { validateCandles } from "../convex/lib/dataQuality";
 import { simulate, StrategyDefinition, ValidationConfig } from "../convex/lib/backtest";
 import { computeAuditHash, verifyAuditChain, AuditRecord } from "../convex/lib/audit";
@@ -555,6 +555,220 @@ const indexHtml = readFileSync(new URL("../../index.html", import.meta.url), "ut
 check("TEST-THEME-004 index.html applies dark by default before mount (no theme flash)", indexHtml.includes('localStorage.getItem("sp-theme")') && indexHtml.includes('classList.toggle("dark"') && indexHtml.includes('|| "dark"'));
 const manifest = readFileSync(new URL("../../public/manifest.webmanifest", import.meta.url), "utf8");
 check("TEST-THEME-005 PWA manifest chrome matches the dark palette", manifest.includes('"background_color": "#171717"') && manifest.includes('"theme_color": "#171717"'));
+
+// ---------------------------------------------------------------------------
+// F5–F8 PROPERTY HARDENING — garbage inputs must never APPROVE / pass
+// prechecks (property-style suite over the three safety-critical functions).
+//
+// EVERY input of evaluateRisk, validateAuthorizationScope and runPrechecks is
+// fed undefined, NaN, ±Infinity, a negative number, an empty string and
+// unknown strings. Asserted property (fail closed): the outcome is NEVER
+// APPROVE / ok:true — and the call never throws on garbage.
+//
+// Two pairs are CONTRACT-VALID inputs whose behavior must NOT change and are
+// asserted separately (TEST-FUZZ-001b) instead of being required to fail:
+//   - ctx.accountStateComplete omitted (undefined) = complete (interface doc)
+//   - ctx.realizedPnlToday = -1: a losing day is real data — validated as
+//     finite, never sign-rejected
+// ---------------------------------------------------------------------------
+const FUZZ: { label: string; value: unknown }[] = [
+  { label: "undefined", value: undefined },
+  { label: "NaN", value: NaN },
+  { label: "Infinity", value: Infinity },
+  { label: "-Infinity", value: -Infinity },
+  { label: "negative", value: -1 },
+  { label: "empty string", value: "" },
+  { label: "unknown string", value: "GARBAGE_ENUM" },
+  { label: "unknown string 2", value: "not a valid value" },
+];
+
+function withValue<T extends object>(base: T, path: string, value: unknown): T {
+  const copy = { ...base } as unknown as Record<string, unknown>;
+  const keys = path.split(".");
+  let cur = copy;
+  for (const k of keys.slice(0, -1)) {
+    cur[k] = { ...(cur[k] as object) };
+    cur = cur[k] as Record<string, unknown>;
+  }
+  cur[keys[keys.length - 1]] = value;
+  return copy as unknown as T;
+}
+
+// ---- evaluateRisk ----------------------------------------------------------
+const riskViolations: string[] = [];
+let riskCases = 0;
+const fuzzRisk = (
+  label: string,
+  build: (v: unknown) => { p: TradeProposal; c: RiskContext; r: RiskPolicy },
+  skip: (f: { label: string }) => boolean = () => false,
+) => {
+  for (const f of FUZZ) {
+    if (skip(f)) continue;
+    riskCases++;
+    try {
+      const { p, c, r } = build(f.value);
+      const d = evaluateRisk(p, c, r);
+      if (d.outcome === "APPROVE" || vetoAllows(d.outcome))
+        riskViolations.push(`${label}=${f.label} -> ${d.outcome}`);
+    } catch (e) {
+      riskViolations.push(`${label}=${f.label} THREW ${String(e)}`);
+    }
+  }
+};
+for (const path of ["proposalId", "side", "quantity", "referencePrice", "orderType", "mode"])
+  fuzzRisk(`proposal.${path}`, (v) => ({ p: withValue(proposal, path, v), c: baseCtx, r: policy }));
+for (const path of [
+  "mode", "killSwitchEngaged", "strategyEligible", "strategyVersionId", "evidenceLevel",
+  "fitnessVerdict", "marketId", "marketStatus", "providerState", "dataAgeMs",
+  "dataQualityState", "spreadBps", "openPositions", "realizedPnlToday", "equity",
+  "peakEquity", "consecutiveLosses", "existingOrderIdempotencyKeys",
+  "proposalIdempotencyKey", "unresolvedUnknownOrders", "accountStateComplete",
+])
+  fuzzRisk(
+    `ctx.${path}`,
+    (v) => ({ p: proposal, c: withValue(baseCtx, path, v), r: policy }),
+    (f) =>
+      (path === "accountStateComplete" && f.label === "undefined") ||
+      (path === "realizedPnlToday" && f.label === "negative"),
+  );
+for (const path of ["policyId", "version", "status"])
+  fuzzRisk(`policy.${path}`, (v) => ({ p: proposal, c: baseCtx, r: withValue(policy, path, v) }));
+for (const path of [
+  "maxNotionalPerTrade", "maxOpenPositions", "maxDailyLoss", "maxDrawdown",
+  "maxConsecutiveLosses", "maxSpreadBps", "maxDataAgeMs",
+])
+  fuzzRisk(`policy.limits.${path}`, (v) => ({
+    p: proposal,
+    c: baseCtx,
+    r: { ...policy, limits: withValue(policy.limits, path, v) },
+  }));
+
+check(
+  "TEST-FUZZ-001 evaluateRisk property: undefined/NaN/±Infinity/negative/empty/unknown on ANY input never APPROVEs",
+  riskViolations.length === 0,
+  `${riskCases} cases; violations: ${riskViolations.slice(0, 6).join(" | ")}`,
+);
+check(
+  "TEST-FUZZ-001b contract-valid pairs keep their documented behavior (valid inputs unchanged)",
+  evaluateRisk(proposal, baseCtx, policy).outcome === "APPROVE" &&
+    evaluateRisk(proposal, { ...baseCtx, realizedPnlToday: -1 }, policy).outcome === "APPROVE",
+);
+
+// ---- validateAuthorizationScope -------------------------------------------
+const scopeViolations: string[] = [];
+let scopeCases = 0;
+const fuzzScope = (
+  label: string,
+  build: (v: unknown) => [AuthorizationRecord, OrderIntent, number],
+) => {
+  for (const f of FUZZ) {
+    scopeCases++;
+    try {
+      const res = validateAuthorizationScope(...build(f.value));
+      if (res.ok) scopeViolations.push(`${label}=${f.label} -> ok:true`);
+    } catch (e) {
+      scopeViolations.push(`${label}=${f.label} THREW ${String(e)}`);
+    }
+  }
+};
+for (const path of ["authorizationId", "state", "issuedAt"])
+  fuzzScope(`auth.${path}`, (v) => [withValue(auth, path, v), intent, Date.now()]);
+for (const path of [
+  "account", "strategyVersionId", "marketId", "side", "quantity", "orderType",
+  "timeInForce", "riskPolicyRef", "mode", "expiresAt",
+])
+  fuzzScope(`auth.scope.${path}`, (v) => [withValue(auth, `scope.${path}`, v), intent, Date.now()]);
+for (const path of [
+  "orderId", "idempotencyKey", "authorizationId", "strategyVersionId", "marketId",
+  "symbol", "side", "quantity", "orderType", "timeInForce", "mode",
+])
+  fuzzScope(`intent.${path}`, (v) => [auth, withValue(intent, path, v), Date.now()]);
+fuzzScope("now", (v) => [auth, intent, v as number]);
+
+check(
+  "TEST-FUZZ-002 validateAuthorizationScope property: garbage on ANY input never yields ok:true",
+  scopeViolations.length === 0,
+  `${scopeCases} cases; violations: ${scopeViolations.slice(0, 6).join(" | ")}`,
+);
+
+// ---- runPrechecks ----------------------------------------------------------
+const preCtx: PrecheckContext = {
+  systemEnabled: true,
+  killSwitchEngaged: false,
+  mode: "PAPER",
+  providerState: "AVAILABLE",
+  marketStatus: "OPEN",
+  dataAgeMs: 1000,
+  maxDataAgeMs: 7200000,
+  now: Date.now(),
+  existingIdempotencyKeys: [],
+  unresolvedUnknownOrders: 0,
+};
+const preViolations: string[] = [];
+let preCases = 0;
+const fuzzPre = (label: string, build: (v: unknown) => [OrderIntent, PrecheckContext]) => {
+  for (const f of FUZZ) {
+    preCases++;
+    try {
+      const res = runPrechecks(...build(f.value));
+      if (res.ok) preViolations.push(`${label}=${f.label} -> ok:true`);
+    } catch (e) {
+      preViolations.push(`${label}=${f.label} THREW ${String(e)}`);
+    }
+  }
+};
+for (const path of [
+  "orderId", "idempotencyKey", "authorizationId", "strategyVersionId", "marketId",
+  "symbol", "side", "quantity", "orderType", "timeInForce", "mode",
+])
+  fuzzPre(`intent.${path}`, (v) => [withValue(intent, path, v), preCtx]);
+for (const path of [
+  "systemEnabled", "killSwitchEngaged", "mode", "providerState", "marketStatus",
+  "dataAgeMs", "maxDataAgeMs", "now", "existingIdempotencyKeys", "unresolvedUnknownOrders",
+])
+  fuzzPre(`ctx.${path}`, (v) => [intent, withValue(preCtx, path, v)]);
+
+check(
+  "TEST-FUZZ-003 runPrechecks property: garbage on ANY input never yields ok:true",
+  preViolations.length === 0,
+  `${preCases} cases; violations: ${preViolations.slice(0, 6).join(" | ")}`,
+);
+
+// ---- explicit regressions for the closed denylist/coercion holes -----------
+check(
+  "TEST-FUZZ-004 unknown mode string -> BLOCK (mode allowlist, no PASS default)",
+  evaluateRisk({ ...proposal, mode: "SANDBOX" }, baseCtx, policy).outcome === "BLOCK",
+);
+check(
+  "TEST-FUZZ-004b unknown data-quality / provider-state strings never APPROVE",
+  evaluateRisk(proposal, { ...baseCtx, dataQualityState: "SORT_OF_VALID" }, policy).outcome !==
+    "APPROVE" &&
+    evaluateRisk(proposal, { ...baseCtx, providerState: "MAYBE" as never }, policy).outcome !==
+      "APPROVE",
+);
+check(
+  "TEST-FUZZ-004c negative policy limit -> policy_validity BLOCK (never silently inverted)",
+  evaluateRisk(proposal, baseCtx, {
+    ...policy,
+    limits: { ...policy.limits, maxDailyLoss: -5 },
+  }).checks.some((c) => c.check === "policy_validity" && c.status === "BLOCK"),
+);
+check(
+  "TEST-FUZZ-004d unknown authorization state string fails scope validation closed",
+  !validateAuthorizationScope({ ...auth, state: "WEIRD_STATE" as never }, intent, Date.now()).ok,
+);
+check(
+  "TEST-FUZZ-004e NaN/undefined/negative data age never passes prechecks (no numeric coercion to PASS)",
+  !runPrechecks(intent, { ...preCtx, dataAgeMs: NaN }).ok &&
+    !runPrechecks(intent, { ...preCtx, dataAgeMs: undefined as never }).ok &&
+    !runPrechecks(intent, { ...preCtx, dataAgeMs: -1 }).ok,
+);
+check(
+  "TEST-FUZZ-004f non-boolean kill-switch / enable flags never pass prechecks",
+  !runPrechecks(intent, { ...preCtx, killSwitchEngaged: "" as never }).ok &&
+    !runPrechecks(intent, { ...preCtx, systemEnabled: -1 as never }).ok &&
+    !runPrechecks(intent, { ...preCtx, existingIdempotencyKeys: undefined as never }).ok,
+);
 
 console.log(`\n${pass} passed, ${fail} failed`);
 if (fail > 0) process.exit(1);

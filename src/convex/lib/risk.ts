@@ -88,9 +88,50 @@ const finite = (x: unknown): x is number =>
   typeof x === "number" && Number.isFinite(x);
 
 /**
- * Required-input validation. Invalid or non-finite values must NEVER produce
- * an approval (Section 10): a malformed proposal or policy is a deterministic
- * BLOCK, and numeric limit evaluation is skipped rather than fed NaN.
+ * Strict identifier/symbol token: no whitespace, control, quote or underscore
+ * characters (identifiers in this system never contain `_` — verified).
+ * Every real identifier conforms — garbage strings do not.
+ */
+const TOKEN_RE = /^[A-Za-z0-9][A-Za-z0-9.:@\/-]*$/;
+const token = (x: unknown): x is string =>
+  typeof x === "string" && x.length > 0 && x.length <= 200 && TOKEN_RE.test(x);
+
+/** Controlled vocabularies — ALLOWLISTS. Unknown values fail closed. */
+const MODES: readonly string[] = [
+  "RESEARCH",
+  "BACKTEST",
+  "OUT_OF_SAMPLE",
+  "PAPER",
+  "DEMO",
+  "CONTROLLED_LIVE",
+  "DISABLED",
+];
+const SIDES: readonly string[] = ["BUY", "SELL"];
+const ORDER_TYPES: readonly string[] = ["MARKET", "LIMIT"];
+const DATA_QUALITY_STATES: readonly string[] = [
+  "VALID",
+  "INCOMPLETE",
+  "STALE",
+  "MISSING",
+  "INVALID",
+  "FAILED",
+];
+const PROVIDER_STATES: readonly string[] = ["AVAILABLE", "DEGRADED", "UNAVAILABLE"];
+const EVIDENCE_LEVELS: readonly string[] = ["STRONG", "MODERATE", "WEAK", "INSUFFICIENT"];
+const FITNESS_VERDICTS: readonly string[] = [
+  "SUITABLE",
+  "MIXED",
+  "UNSUITABLE",
+  "INSUFFICIENT_DATA",
+];
+
+/**
+ * Required-input validation. Invalid, non-finite or UNKNOWN-valued inputs
+ * must NEVER produce an approval (Section 10): a malformed proposal, context
+ * or policy is a deterministic BLOCK, and numeric limit evaluation is skipped
+ * rather than fed NaN. Every numeric input is validated with Number.isFinite;
+ * every string/enum input is validated against a token shape or an allowlist
+ * (unknown values fail closed — never a permissive default).
  */
 function validateInputs(
   proposal: TradeProposal,
@@ -98,10 +139,51 @@ function validateInputs(
   policy: RiskPolicy,
 ): { problems: string[]; malformedPolicy: boolean } {
   const problems: string[] = [];
+
+  // Identifiers and controlled vocabularies (allowlists; unknown -> BLOCK).
+  if (!token(proposal.proposalId))
+    problems.push("proposal.proposalId must be a non-empty identifier token");
+  if (!SIDES.includes(proposal.side))
+    problems.push(`proposal.side ${String(proposal.side)} is not a known side`);
+  if (!ORDER_TYPES.includes(proposal.orderType))
+    problems.push(`proposal.orderType ${String(proposal.orderType)} is not a known order type`);
+  if (!MODES.includes(proposal.mode))
+    problems.push(`proposal.mode ${String(proposal.mode)} is not a known mode`);
+  if (!MODES.includes(ctx.mode)) problems.push(`ctx.mode ${String(ctx.mode)} is not a known mode`);
+  if (typeof ctx.killSwitchEngaged !== "boolean")
+    problems.push("ctx.killSwitchEngaged must be a boolean");
+  if (typeof ctx.strategyEligible !== "boolean")
+    problems.push("ctx.strategyEligible must be a boolean");
+  if (!token(ctx.strategyVersionId))
+    problems.push("ctx.strategyVersionId must be a non-empty identifier token");
+  if (!token(ctx.marketId)) problems.push("ctx.marketId must be a non-empty identifier token");
+  if (!token(ctx.proposalIdempotencyKey))
+    problems.push("ctx.proposalIdempotencyKey must be a non-empty identifier token");
+  if (!EVIDENCE_LEVELS.includes(ctx.evidenceLevel))
+    problems.push(`ctx.evidenceLevel ${String(ctx.evidenceLevel)} is not a known level`);
+  if (!FITNESS_VERDICTS.includes(ctx.fitnessVerdict))
+    problems.push(`ctx.fitnessVerdict ${String(ctx.fitnessVerdict)} is not a known verdict`);
+  if (!DATA_QUALITY_STATES.includes(ctx.dataQualityState))
+    problems.push(`ctx.dataQualityState ${String(ctx.dataQualityState)} is not a known data-quality state`);
+  if (!PROVIDER_STATES.includes(ctx.providerState))
+    problems.push(`ctx.providerState ${String(ctx.providerState)} is not a known provider state`);
+  if (
+    !Array.isArray(ctx.existingOrderIdempotencyKeys) ||
+    !ctx.existingOrderIdempotencyKeys.every((k) => typeof k === "string")
+  )
+    problems.push("ctx.existingOrderIdempotencyKeys must be an array of strings");
+  if (ctx.accountStateComplete !== undefined && typeof ctx.accountStateComplete !== "boolean")
+    problems.push("ctx.accountStateComplete must be a boolean when present");
+
+  // Numerics — every numeric input passes Number.isFinite (never coerced).
   if (!finite(proposal.quantity) || proposal.quantity <= 0)
     problems.push("proposal.quantity must be a finite number > 0");
   if (!finite(proposal.referencePrice) || proposal.referencePrice <= 0)
     problems.push("proposal.referencePrice must be a finite number > 0");
+  if (ctx.dataAgeMs !== null && (!finite(ctx.dataAgeMs) || ctx.dataAgeMs < 0))
+    problems.push("ctx.dataAgeMs must be null or a finite number >= 0");
+  if (ctx.spreadBps !== null && (!finite(ctx.spreadBps) || ctx.spreadBps < 0))
+    problems.push("ctx.spreadBps must be null or a finite number >= 0");
   if (!finite(ctx.equity) || ctx.equity < 0) problems.push("ctx.equity invalid");
   if (!finite(ctx.peakEquity) || ctx.peakEquity <= 0)
     problems.push("ctx.peakEquity invalid");
@@ -113,7 +195,16 @@ function validateInputs(
   if (!finite(ctx.unresolvedUnknownOrders) || ctx.unresolvedUnknownOrders < 0)
     problems.push("ctx.unresolvedUnknownOrders invalid");
 
+  // Policy shape — malformed policy is reported as policy_validity.
   let malformedPolicy = false;
+  if (!token(policy.policyId)) {
+    malformedPolicy = true;
+    problems.push("policy.policyId must be a non-empty identifier token");
+  }
+  if (!finite(policy.version) || policy.version <= 0) {
+    malformedPolicy = true;
+    problems.push("policy.version must be a finite number > 0");
+  }
   const limits: (keyof RiskPolicyLimits)[] = [
     "maxNotionalPerTrade",
     "maxOpenPositions",
@@ -125,9 +216,9 @@ function validateInputs(
   ];
   for (const key of limits) {
     const v = policy.limits[key];
-    if (v !== null && !finite(v)) {
+    if (v !== null && (!finite(v) || v < 0)) {
       malformedPolicy = true;
-      problems.push(`policy.limits.${key} is neither null nor a finite number`);
+      problems.push(`policy.limits.${key} is neither null nor a finite number >= 0`);
     }
   }
   return { problems, malformedPolicy };
@@ -167,12 +258,18 @@ export function evaluateRisk(
   push("policy_status", "PASS", `Risk policy ${policy.policyId}@v${policy.version} is APPROVED.`);
 
   // --- System gates -------------------------------------------------------
-  if (ctx.killSwitchEngaged) {
+  if (ctx.killSwitchEngaged === true) {
     push("kill_switch", "BLOCK", "Kill switch is ENGAGED — no new execution permitted.");
-  } else {
+  } else if (ctx.killSwitchEngaged === false) {
     push("kill_switch", "PASS", "Kill switch released.");
+  } else {
+    // Unreachable after input validation; kept fail-closed by construction.
+    push("kill_switch", "BLOCK", "Kill switch state is not a known state — fail closed, no execution.");
   }
 
+  // Mode is an ALLOWLIST: PAPER/DEMO (matching the system mode) pass, every
+  // known non-executable mode is named explicitly, and any UNKNOWN mode is
+  // BLOCKED — there is no permissive default.
   if (proposal.mode === "DISABLED") {
     push("mode", "BLOCK", "System mode DISABLED — no new execution.");
   } else if (proposal.mode === "RESEARCH" || proposal.mode === "BACKTEST" || proposal.mode === "OUT_OF_SAMPLE") {
@@ -181,8 +278,12 @@ export function evaluateRisk(
     // Live activation is a separate, explicitly authorized operation. It is
     // NOT reachable in this build — never a side effect of any other action.
     push("mode", "BLOCK", "CONTROLLED_LIVE execution is NOT authorized in this build (live activation prohibited — requires a separate, approved live-readiness process). ");
-  } else {
+  } else if (proposal.mode !== ctx.mode) {
+    push("mode", "BLOCK", `Proposal mode ${proposal.mode} does not match system mode ${ctx.mode} — fail closed.`);
+  } else if (proposal.mode === "PAPER" || proposal.mode === "DEMO") {
     push("mode", "PASS", `Mode ${proposal.mode} permits simulated/authorized execution.`);
+  } else {
+    push("mode", "BLOCK", `Mode ${proposal.mode} is not a known mode — fail closed, no execution.`);
   }
 
   // --- Reconciliation state ----------------------------------------------
@@ -213,24 +314,28 @@ export function evaluateRisk(
   }
 
   // --- Strategy eligibility ----------------------------------------------
-  if (ctx.strategyEligible) {
+  if (ctx.strategyEligible === true) {
     push("strategy_eligibility", "PASS", `Strategy version ${ctx.strategyVersionId} is validation-eligible.`);
   } else {
     push("strategy_eligibility", "BLOCK", `Strategy version ${ctx.strategyVersionId} is NOT eligible (validation/evidence gate unmet).`);
   }
 
   // --- Data quality / freshness (critical -> UNKNOWN, not zero) -----------
-  if (ctx.dataQualityState === "FAILED" || ctx.dataQualityState === "INVALID") {
+  // Data quality is an ALLOWLIST over the six known states; an UNKNOWN state
+  // is never treated as VALID (no permissive default).
+  if (ctx.dataQualityState === "VALID") {
+    push("data_quality", "PASS", "Market data quality VALID.");
+  } else if (ctx.dataQualityState === "FAILED" || ctx.dataQualityState === "INVALID") {
     push("data_quality", "BLOCK", `Critical market data quality is ${ctx.dataQualityState} — trade blocked.`);
   } else if (ctx.dataQualityState === "MISSING") {
     push("data_quality", "UNKNOWN", "Critical market data is MISSING — unknown risk state, no trade.");
   } else if (ctx.dataQualityState === "STALE" || ctx.dataQualityState === "INCOMPLETE") {
     push("data_quality", "UNKNOWN", `Market data is ${ctx.dataQualityState} — risk state not fully knowable, no trade.`);
   } else {
-    push("data_quality", "PASS", "Market data quality VALID.");
+    push("data_quality", "UNKNOWN", `Market data quality state ${String(ctx.dataQualityState)} is not a known state — risk state not knowable, no trade.`);
   }
 
-  if (ctx.dataAgeMs === null) {
+  if (ctx.dataAgeMs === null || !finite(ctx.dataAgeMs)) {
     push("data_freshness", "UNKNOWN", "Data age unknown — freshness cannot be verified.");
   } else if (policy.limits.maxDataAgeMs !== null && ctx.dataAgeMs > policy.limits.maxDataAgeMs) {
     push("data_freshness", "BLOCK", `Data age ${Math.round(ctx.dataAgeMs / 60000)}min exceeds policy limit.`);
@@ -239,12 +344,16 @@ export function evaluateRisk(
   }
 
   // --- Provider / market status -----------------------------------------
-  if (ctx.providerState === "UNAVAILABLE") {
+  // Provider state is an ALLOWLIST: only AVAILABLE passes; anything else is
+  // UNKNOWN (never a permissive default).
+  if (ctx.providerState === "AVAILABLE") {
+    push("provider_status", "PASS", "Provider AVAILABLE.");
+  } else if (ctx.providerState === "UNAVAILABLE") {
     push("provider_status", "UNKNOWN", "Provider UNAVAILABLE — external state not knowable; unsafe actions blocked.");
   } else if (ctx.providerState === "DEGRADED") {
     push("provider_status", "UNKNOWN", "Provider DEGRADED — execution safety not confirmed; no trade.");
   } else {
-    push("provider_status", "PASS", "Provider AVAILABLE.");
+    push("provider_status", "UNKNOWN", `Provider state ${String(ctx.providerState)} is not a known state — external state not knowable; no trade.`);
   }
 
   if (ctx.marketStatus !== "OPEN") {
@@ -254,7 +363,7 @@ export function evaluateRisk(
   }
 
   // --- Spread / liquidity -------------------------------------------------
-  if (ctx.spreadBps === null) {
+  if (ctx.spreadBps === null || !finite(ctx.spreadBps)) {
     push("spread", "UNKNOWN", "Spread unknown — liquidity risk not assessable.");
   } else if (policy.limits.maxSpreadBps !== null && ctx.spreadBps > policy.limits.maxSpreadBps) {
     push("spread", "BLOCK", `Spread ${ctx.spreadBps}bps exceeds policy limit ${policy.limits.maxSpreadBps}bps.`);
