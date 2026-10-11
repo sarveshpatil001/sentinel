@@ -2,22 +2,16 @@ import { useState } from "react";
 import { useMutation, useQuery } from "convex/react";
 import { api } from "@/convex/_generated/api";
 import {
-  AlertCircle,
   Building2,
   Check,
-  ChevronDown,
-  ChevronUp,
   KeyRound,
-  Link2,
   Loader2,
   Lock,
   Plus,
-  RefreshCw,
   ShieldAlert,
   ShieldCheck,
-  Unplug,
 } from "lucide-react";
-import { EmptyState, Panel, StateBadge, fmtTime } from "./shared";
+import { EmptyState, Panel, StateBadge } from "./shared";
 
 interface CatalogShape {
   providers: { provider: string; kind: string; adapter: string; note: string }[];
@@ -35,7 +29,6 @@ export default function ConnectionsPanel({ isSimple = false }: { isSimple?: bool
   const connections = useQuery(api.connections.list);
   const register = useMutation(api.connections.register);
   const verify = useMutation(api.connections.verify);
-  const rotate = useMutation(api.connections.rotate);
   const revoke = useMutation(api.connections.revoke);
 
   const [provider, setProvider] = useState("SIM-CRYPTO-PROVIDER");

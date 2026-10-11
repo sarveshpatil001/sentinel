@@ -1,7 +1,7 @@
 import { useState } from "react";
 import { useMutation, useQuery } from "convex/react";
 import { api } from "@/convex/_generated/api";
-import { AlertOctagon, CheckCircle2, ChevronDown, ChevronUp, Clock, HelpCircle, Info, Loader2, RefreshCw, Send, ShieldAlert, ShieldCheck, ShieldOff } from "lucide-react";
+import { AlertOctagon, CheckCircle2, ChevronDown, ChevronUp, Info, Loader2, RefreshCw, Send, ShieldCheck, ShieldOff } from "lucide-react";
 import { EmptyState, MetricTile, Panel, StateBadge, fmt, fmtTime } from "./shared";
 
 export default function ExecutionPanel({ isSimple = false }: { isSimple?: boolean }) {

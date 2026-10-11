@@ -1,8 +1,8 @@
 import { useState } from "react";
 import { useMutation, useQuery } from "convex/react";
 import { api } from "@/convex/_generated/api";
-import { CheckCircle2, ChevronDown, ChevronUp, Info, Loader2, Send, ShieldAlert, ShieldCheck, ShieldQuestion } from "lucide-react";
-import { CheckRow, MetricTile, Panel, StateBadge, fmtTime } from "./shared";
+import { CheckCircle2, ChevronDown, ChevronUp, Loader2, ShieldCheck } from "lucide-react";
+import { CheckRow, MetricTile, Panel, StateBadge } from "./shared";
 
 export default function RiskPanel({ isSimple = false }: { isSimple?: boolean }) {
   const data = useQuery(api.console.risk);

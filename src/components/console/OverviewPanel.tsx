@@ -3,14 +3,11 @@ import { useQuery } from "convex/react";
 import { api } from "@/convex/_generated/api";
 import {
   AlertTriangle,
-  ArrowUpRight,
   CheckCircle2,
   ChevronDown,
   ChevronUp,
   Coins,
   Cpu,
-  Info,
-  Layers,
   Link2,
   ShieldAlert,
   ShieldCheck,

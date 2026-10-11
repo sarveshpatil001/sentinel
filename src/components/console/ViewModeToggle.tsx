@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useState } from "react";
 import { Sparkles, SlidersHorizontal } from "lucide-react";
 import { VIEW_MODE_STORAGE_KEY, ViewMode, resolveViewMode } from "@/lib/viewMode";
 

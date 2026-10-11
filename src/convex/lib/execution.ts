@@ -90,7 +90,7 @@ const finite = (x: unknown): x is number =>
  * characters (identifiers in this system never contain `_` — verified).
  * Every real identifier conforms — garbage strings do not.
  */
-const TOKEN_RE = /^[A-Za-z0-9][A-Za-z0-9.:@\/-]*$/;
+const TOKEN_RE = /^[A-Za-z0-9][A-Za-z0-9.:@/-]*$/;
 const token = (x: unknown): x is string =>
   typeof x === "string" && x.length > 0 && x.length <= 200 && TOKEN_RE.test(x);
 

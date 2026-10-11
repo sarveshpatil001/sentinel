@@ -58,14 +58,7 @@ export default function Dashboard() {
 
   // Filter tabs according to viewMode
   const visibleTabs = ALL_TABS.filter((t) => viewMode === "advanced" || !t.proOnly);
-
-  // If the active tab gets hidden when switching to simple mode, smoothly switch back to overview
-  useEffect(() => {
-    const isVisible = visibleTabs.some((t) => t.id === tab);
-    if (!isVisible) {
-      setTab("overview");
-    }
-  }, [viewMode, tab, visibleTabs]);
+  const activeTab = visibleTabs.some((t) => t.id === tab) ? tab : "overview";
 
   // Idempotent bootstrap: seeds deterministic state exactly once.
   useEffect(() => {
@@ -138,7 +131,7 @@ export default function Dashboard() {
           <div className="flex items-center justify-between">
             <nav className="flex gap-1 overflow-x-auto pb-2">
               {visibleTabs.map((t) => {
-                const active = tab === t.id;
+                const active = activeTab === t.id;
                 const label = isSimple ? t.simpleLabel : t.label;
                 return (
                   <button
@@ -175,17 +168,17 @@ export default function Dashboard() {
 
       {/* Content */}
       <div className="mx-auto w-full max-w-7xl px-4 py-6 sm:px-6">
-        {tab === "overview" && <OverviewPanel isSimple={isSimple} />}
-        {tab === "execution" && <ExecutionPanel isSimple={isSimple} />}
-        {tab === "strategies" && <StrategiesPanel isSimple={isSimple} />}
-        {tab === "connections" && <ConnectionsPanel isSimple={isSimple} />}
-        {tab === "risk" && <RiskPanel isSimple={isSimple} />}
-        {tab === "data" && <DataPanel />}
-        {tab === "validation" && <ValidationPanel />}
-        {tab === "agents" && <AgentsPanel />}
-        {tab === "audit" && <AuditPanel />}
-        {tab === "constitution" && <ConstitutionPanel />}
-        {tab === "databricks" && <DatabricksPanel />}
+        {activeTab === "overview" && <OverviewPanel isSimple={isSimple} />}
+        {activeTab === "execution" && <ExecutionPanel isSimple={isSimple} />}
+        {activeTab === "strategies" && <StrategiesPanel isSimple={isSimple} />}
+        {activeTab === "connections" && <ConnectionsPanel isSimple={isSimple} />}
+        {activeTab === "risk" && <RiskPanel isSimple={isSimple} />}
+        {activeTab === "data" && <DataPanel />}
+        {activeTab === "validation" && <ValidationPanel />}
+        {activeTab === "agents" && <AgentsPanel />}
+        {activeTab === "audit" && <AuditPanel />}
+        {activeTab === "constitution" && <ConstitutionPanel />}
+        {activeTab === "databricks" && <DatabricksPanel />}
       </div>
 
       <footer className="border-t border-border/60 py-6">

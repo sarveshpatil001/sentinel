@@ -2,13 +2,9 @@ import { useState } from "react";
 import { useMutation, useQuery } from "convex/react";
 import { api } from "@/convex/_generated/api";
 import {
-  BadgeCheck,
   ChevronDown,
   ChevronUp,
-  Cpu,
   GitBranch,
-  Layers,
-  LineChart,
   Loader2,
   Lock,
   PlusCircle,
