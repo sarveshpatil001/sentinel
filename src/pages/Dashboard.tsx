@@ -1,4 +1,4 @@
-import { Link, useLocation, useNavigate } from "react-router";
+import { Link, matchPath, useLocation, useNavigate } from "react-router";
 import { useMutation } from "convex/react";
 import { api } from "@/convex/_generated/api";
 import { useAuth } from "@/hooks/use-auth";
@@ -30,7 +30,7 @@ export default function Dashboard() {
   const { user, signOut } = useAuth();
   const seed = useMutation(api.seed.seed);
   const action = useConsoleAction();
-  const screen = screens.find((item) => item.path === location.pathname) ?? screens[0];
+  const screen = screens.find((item) => matchPath(item.path, location.pathname)) ?? screens[0];
 
   return (
     <main>

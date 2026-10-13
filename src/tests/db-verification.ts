@@ -38,6 +38,8 @@ const modules: Record<string, () => Promise<unknown>> = {
   "../convex/_generated/server.ts": () => import("../convex/_generated/server"),
   "../convex/workflows.ts": () => import("../convex/workflows"),
   "../convex/console.ts": () => import("../convex/console"),
+  "../convex/connections.ts": () => import("../convex/connections"),
+  "../convex/databricks.ts": () => import("../convex/databricks"),
   "../convex/users.ts": () => import("../convex/users"),
   "../convex/seed.ts": () => import("../convex/seed"),
 };
@@ -1533,6 +1535,130 @@ async function seedUsers(t: T) {
     !JSON.stringify(result).includes("ORD-R549"),
     JSON.stringify(result),
   );
+}
+
+// Post-reset coverage uses real handlers, never the UI's mocked API responses.
+// All writes below stay in convex-test's isolated in-memory database.
+{
+  const t = fresh();
+  for (const [name, ref] of Object.entries({
+    overview: api.console.overview, data: api.console.data,
+    strategies: api.console.strategies, validation: api.console.validation,
+    risk: api.console.risk, execution: api.console.execution,
+    agents: api.console.agents, audit: api.console.audit,
+    connections: api.connections.list,
+  })) {
+    const error = await t.query(ref, {}).catch((e: unknown) => e);
+    check(`DB-RESET-AUTH query ${name} denies signed-out access`,
+      error instanceof Error && error.message.includes("UNAUTHENTICATED"));
+  }
+  const credential = {
+    provider: "SIM-CRYPTO-PROVIDER", label: "Test connection", environment: "PAPER",
+    accountRef: "test-paper-account", apiKey: "test-only-key-0123456789",
+    permissions: ["READ_ACCOUNT"],
+  };
+  const attempts: [string, () => Promise<unknown>][] = [
+    ["register", () => t.mutation(api.connections.register, credential)],
+    ["verify", () => t.mutation(api.connections.verify, { connectionId: "none" })],
+    ["revoke", () => t.mutation(api.connections.revoke, { connectionId: "none", reason: "test" })],
+    ["proposal", () => t.mutation(api.workflows.submitTradeProposal, { strategyVersionId: "none", marketId: "none", side: "BUY", quantity: 1, referencePrice: 1, idempotencyKey: "test" })],
+    ["order", () => t.mutation(api.workflows.placeOrder, placeArgs("none", "test"))],
+    ["reconcile", () => t.mutation(api.workflows.reconcile, {})],
+    ["validation", () => t.mutation(api.workflows.runValidation, { strategyVersionId: "none" })],
+    ["candidate", () => t.mutation(api.workflows.proposeCandidateVersion, { learningEventId: "none", params: {} })],
+    ["kill switch", () => t.mutation(api.workflows.setKillSwitch, { engaged: true, reason: "test" })],
+    ["provider behavior", () => t.mutation(api.workflows.setSimulatedProviderBehavior, { behavior: "ACK", reason: "test" })],
+    ["Databricks action", () => t.action(api.databricks.checkWorkspace, {})],
+  ];
+  for (const [name, attempt] of attempts) {
+    const error = await attempt().catch((e: unknown) => e);
+    check(`DB-RESET-AUTH action ${name} denies signed-out access`,
+      error instanceof Error && error.message.includes("UNAUTHENTICATED"));
+  }
+  const catalog = await t.query(api.connections.catalog, {});
+  check("DB-RESET-CATALOG public catalog exposes only declared non-secret metadata",
+    catalog.environments.join(",") === "PAPER,DEMO" && catalog.disabledEnvironments.includes("CONTROLLED_LIVE"));
+}
+
+{
+  const t = fresh();
+  const { userA, userB } = await seedUsers(t);
+  const asA = t.withIdentity({ subject: userA });
+  const asB = t.withIdentity({ subject: userB });
+  const credential = {
+    provider: "SIM-CRYPTO-PROVIDER", label: "Test connection", environment: "PAPER",
+    accountRef: "test-paper-account", apiKey: "test-only-key-0123456789",
+    apiSecret: "test-only-secret-9876543210", permissions: ["READ_ACCOUNT"],
+  };
+  const deniedLive = await asA.mutation(api.connections.register, { ...credential, environment: "CONTROLLED_LIVE" });
+  check("DB-RESET-CONN live credential ingestion is rejected without storing a connection",
+    !deniedLive.ok && (await asA.query(api.connections.list, {})).length === 0);
+  const registered = await asA.mutation(api.connections.register, credential);
+  const own = await asA.query(api.connections.list, {});
+  const foreign = await asB.query(api.connections.list, {});
+  check("DB-RESET-CONN register/list return real pending owner-scoped metadata",
+    registered.ok && own.length === 1 && own[0].status === "PENDING_VERIFICATION" && foreign.length === 0);
+  const stored = await t.run(async (ctx) => ({
+    connections: await ctx.db.query("brokerConnections").collect(),
+    audit: await ctx.db.query("auditEvents").collect(),
+  }));
+  const serialized = JSON.stringify({ registered, own, stored });
+  check("DB-RESET-CONN raw test key and secret never enter stored rows, audit, or responses",
+    !serialized.includes(credential.apiKey) && !serialized.includes(credential.apiSecret));
+  const connectionId = registered.connectionId;
+  if (!connectionId) throw new Error("Registration failed; broker lifecycle cannot be tested.");
+  const foreignVerify = await asB.mutation(api.connections.verify, { connectionId });
+  const foreignRevoke = await asB.mutation(api.connections.revoke, { connectionId, reason: "test" });
+  check("DB-RESET-CONN foreign verify/revoke are denied without altering the owner's record",
+    !foreignVerify.ok && !foreignRevoke.ok && (await asA.query(api.connections.list, {}))[0].status === "PENDING_VERIFICATION");
+  const verified = await asA.mutation(api.connections.verify, { connectionId });
+  check("DB-RESET-CONN simulated verification is explicitly NOT real connectivity",
+    verified.ok && verified.status === "VERIFIED_SIMULATED" && verified.note.includes("NOT evidence of real provider connectivity"));
+  const revoked = await asA.mutation(api.connections.revoke, { connectionId, reason: "test cleanup" });
+  const verifyRevoked = await asA.mutation(api.connections.verify, { connectionId });
+  check("DB-RESET-CONN revoke persists and verification cannot reactivate a revoked connection",
+    revoked.ok && !verifyRevoked.ok && (await asA.query(api.connections.list, {}))[0].status === "REVOKED");
+  const unconfigured = await asB.mutation(api.connections.register, { ...credential, provider: "BINANCE" });
+  if (!unconfigured.connectionId) throw new Error("Unconfigured-adapter registration failed.");
+  const realProvider = await asB.mutation(api.connections.verify, { connectionId: unconfigured.connectionId });
+  check("DB-RESET-CONN unimplemented provider remains pending, never faked connected",
+    realProvider.status === "PENDING_VERIFICATION" && realProvider.note.includes("NOT VERIFIED"));
+}
+
+{
+  const t = fresh();
+  const { userA, userB } = await seedWorkspace(t, "ACK");
+  const asA = t.withIdentity({ subject: userA });
+  const asB = t.withIdentity({ subject: userB });
+  await seedAuthorization(t, { authorizationId: "AUTH-RESET", ownerUserId: userA });
+  const order = await asA.mutation(api.workflows.placeOrder, placeArgs("AUTH-RESET", "IK-RESET"));
+  const learning = await asA.mutation(api.workflows.recordLearningEvent, {
+    orderId: order.orderId ?? undefined, failureClass: "REGIME_SHIFT",
+    analysis: "Isolated test analysis", hypothesis: "Isolated candidate hypothesis",
+  });
+  const original = (await asA.query(api.console.strategies)).versions.find((v) => v.strategyVersionId === "SV-T");
+  const denied = await asB.mutation(api.workflows.proposeCandidateVersion, { learningEventId: learning.learningEventId, params: { fast: 3 } });
+  const candidate = await asA.mutation(api.workflows.proposeCandidateVersion, {
+    learningEventId: learning.learningEventId, params: { fast: 3, slow: 7, timeExitBars: 10 },
+  });
+  const after = await asA.query(api.console.strategies);
+  const parent = after.versions.find((v) => v.strategyVersionId === "SV-T");
+  const child = after.versions.find((v) => candidate.ok && v.strategyVersionId === candidate.strategyVersionId);
+  check("DB-RESET-CANDIDATE only owner creates a new PROPOSAL; parent definition and provenance remain unchanged",
+    !denied.ok && candidate.ok && child?.status === "PROPOSAL" && child?.immutable === true &&
+    JSON.stringify(parent?.definition) === JSON.stringify(original?.definition) &&
+    JSON.stringify(parent?.provenance) === JSON.stringify(original?.provenance));
+  const data = await asA.query(api.console.data);
+  const candles = await t.run(async (ctx) => ctx.db.query("candles").collect());
+  check("DB-RESET-DATA API market series equals stored candle timestamps and prices, not UI constants",
+    data.series.length === 1 && data.series[0].points.length === candles.length &&
+    data.series[0].points[0].t === candles[0].eventTime && data.series[0].points[0].close === candles[0].close);
+  const agentsA = await asA.query(api.console.agents);
+  const agentsB = await asB.query(api.console.agents);
+  check("DB-RESET-AGENTS registry stays empty without invented AI and learning records remain owner-scoped",
+    agentsA.agents.length === 0 && agentsA.learningEvents.length === 1 && agentsB.learningEvents.length === 0);
+  check("DB-RESET-USER current-user endpoint returns the authenticated user, null for signed-out callers",
+    String((await asA.query(api.users.currentUser))?._id) === userA && (await t.query(api.users.currentUser)) === null);
 }
 
 console.log(`\n${pass} passed, ${fail} failed`);

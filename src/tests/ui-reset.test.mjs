@@ -4,7 +4,7 @@ import { resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { createElement } from "react";
 import { renderToStaticMarkup } from "react-dom/server";
-import { MemoryRouter } from "react-router";
+import { MemoryRouter, Route, Routes } from "react-router";
 
 const root = fileURLToPath(new URL("../../", import.meta.url));
 const read = (path) => readFileSync(resolve(root, path), "utf8");
@@ -107,6 +107,18 @@ test("every neutral screen renders its native controls and existing data interfa
     for (const route of ["/dashboard", "/trading", "/charts", "/analysis", "/history", "/settings"]) expect(html).toContain(`href="${route}"`);
   }
   expect(mutationCalls).toBe(0);
+});
+
+test("router-accepted trailing slash and mixed-case URLs show the requested screen", () => {
+  for (const [path, route, title] of [
+    ["/charts/", "/charts", "Charts"], ["/CHARTS", "/charts", "Charts"],
+    ["/trading/", "/trading", "Trading"], ["/Settings/", "/settings", "Settings"],
+  ]) {
+    const html = renderToStaticMarkup(createElement(MemoryRouter, { initialEntries: [path] },
+      createElement(Routes, {}, createElement(Route, { path: route, element: createElement(RequireAuth, { children: createElement(Dashboard) }) }))));
+    expect(html).toContain(`<h1>${title}</h1>`);
+    expect(html).toMatch(new RegExp(`<a[^>]*aria-current="page"[^>]*href="${route}"`));
+  }
 });
 
 test("populated records retain blocked/unknown states, provenance, and unavailable integrations", () => {
