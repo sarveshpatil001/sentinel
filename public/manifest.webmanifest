@@ -1,17 +1,7 @@
 {
-  "name": "freebuff.com application",
-  "short_name": "freebuff.com",
-  "description": "freebuff.com application",
+  "name": "Sentinel Prime",
+  "short_name": "Sentinel Prime",
+  "description": "Temporary interface during UI reset",
   "start_url": "/",
-  "display": "standalone",
-  "background_color": "#171717",
-  "theme_color": "#171717",
-  "icons": [
-    {
-      "src": "/logo.svg",
-      "sizes": "any",
-      "type": "image/svg+xml",
-      "purpose": "any"
-    }
-  ]
+  "display": "browser"
 }

@@ -1,3 +1,11 @@
+## UI reset status
+
+The previous Sentinel Prime product design has been removed. Replacement UI design has **not** started. Application pages now use neutral native forms, links, and record readouts.
+
+Protected temporary screens: `/dashboard`, `/trading`, `/charts`, `/analysis`, `/history`, `/settings`. `/auth` retains email OTP and anonymous sign-in; `/` is a neutral entry page. All original frontend API entry points remain available, and backend security/risk/execution logic is unchanged. Initialization is an explicit admin-gated operation in Settings, not a page-mount mutation.
+
+See [the UI reset audit](docs/ui-reset-audit.md) for the inventory, deletion scope, retained framework infrastructure, and verification limitations. Generic UI-kit modules and platform diagnostics remain infrastructure; they are not the active product design. Styling guidance below describes the starter framework and must not be used to start replacement design before approval.
+
 ## Overview
 
 This project uses the following tech stack:

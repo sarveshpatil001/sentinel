@@ -28,7 +28,6 @@ import {
   SnapshotBinding,
 } from "../convex/lib/pipeline";
 import { readFileSync } from "node:fs";
-import { THEME_STORAGE_KEY, resolveTheme } from "../lib/theme";
 
 let pass = 0;
 let fail = 0;
@@ -547,14 +546,8 @@ check(
     !wfSrc.includes("args.simulate"),
 );
 
-// TEST-THEME-* dark theme mode wiring (current UI changes)
-check("TEST-THEME-001 dark is the default for missing/unknown stored values", resolveTheme(null) === "dark" && resolveTheme(undefined) === "dark" && resolveTheme("blue") === "dark");
-check("TEST-THEME-002 explicit 'light' is honored (dark is default, not forced)", resolveTheme("light") === "light");
-check("TEST-THEME-003 shared storage key is used by toggle and bootstrap", THEME_STORAGE_KEY === "sp-theme");
-const indexHtml = readFileSync(new URL("../../index.html", import.meta.url), "utf8");
-check("TEST-THEME-004 index.html applies dark by default before mount (no theme flash)", indexHtml.includes('localStorage.getItem("sp-theme")') && indexHtml.includes('classList.toggle("dark"') && indexHtml.includes('|| "dark"'));
-const manifest = readFileSync(new URL("../../public/manifest.webmanifest", import.meta.url), "utf8");
-check("TEST-THEME-005 PWA manifest chrome matches the dark palette", manifest.includes('"background_color": "#171717"') && manifest.includes('"theme_color": "#171717"'));
+// Obsolete theme-only assertions moved to reset-specific verification.
+// All business, security, and fuzz checks remain unchanged.
 
 // ---------------------------------------------------------------------------
 // F5–F8 PROPERTY HARDENING — garbage inputs must never APPROVE / pass
