@@ -97,7 +97,7 @@ export default function HistoryScreen() {
 
   return (
     <>
-      <PageHeading title="Analysis Archive" sub="Historical multi-agent logs and assessments" />
+      <PageHeading title="Analysis Archive" sub="Historical multi-agent logs and assessments (demo workspace records)" />
 
       <div className="mt-3 space-y-3 px-5">
         <div className="relative">

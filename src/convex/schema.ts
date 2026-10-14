@@ -527,6 +527,9 @@ const schema = defineSchema(
       detail: v.string(),
       prevHash: v.string(),
       hash: v.string(),
+      // Hash format tag: "SHA256-V1" on every new record; absent on legacy
+      // (FNV-1a) records written before the audit-chain upgrade.
+      hashVersion: v.optional(v.string()),
     }).index("by_sequence", ["sequence"]),
 
     // -----------------------------------------------------------------------

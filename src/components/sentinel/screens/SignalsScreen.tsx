@@ -101,7 +101,7 @@ export default function SignalsScreen() {
 
         <div className="flex min-h-[38px] items-center rounded-[8px] border border-sp-line bg-[#0A0F1A] px-4 py-2">
           <p className="text-[10.5px] text-sp-muted">
-            Informational analysis only • Automated execution disabled
+            Seeded demo workspace synthesis • Informational only • Automated execution disabled
           </p>
         </div>
         {stance && (

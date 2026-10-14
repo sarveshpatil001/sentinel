@@ -79,7 +79,31 @@ export interface TradeProposal {
 export interface RiskDecisionResult {
   outcome: "APPROVE" | "BLOCK" | "UNKNOWN";
   checks: RiskCheck[];
+  /**
+   * CANONICAL policy identity: `<policyId>@v<version>` — identifier-token
+   * conformant (TOKEN_RE) and version-pinned. This is the machine reference
+   * bound into `executionAuthorizations.scope.riskPolicyRef` and validated by
+   * `validateAuthorizationScope` (execution.ts). A malformed policy identity
+   * is never interpolated into a plausible-looking reference.
+   */
   policyRef: string;
+  /**
+   * Human-readable display label (identity + lifecycle status), for audit and
+   * UI text ONLY. Never stored in an identifier field.
+   */
+  policyLabel: string;
+}
+
+/**
+ * Canonical, version-pinned policy identity (the one policy-reference
+ * contract shared by producer, database record and consumer). Returns the
+ * INVALID sentinel for anything that is not a valid identity+version pair so
+ * a garbage policy can never masquerade as a real reference.
+ */
+export function policyIdentity(policyId: unknown, version: unknown): string {
+  return token(policyId) && finite(version) && (version as number) > 0
+    ? `${policyId}@v${version}`
+    : "INVALID-POLICY@v0";
 }
 
 const UNKNOWN_BLOCKS = true; // fail-closed invariant
@@ -234,6 +258,11 @@ export function evaluateRisk(
     checks.push({ check, status, detail });
 
   // --- Required inputs + policy shape (fail closed on garbage) -----------
+  // One policy-reference contract for producer, record and consumer:
+  // `policyRef` is the canonical token identity; `policyLabel` is display-only.
+  const policyRef = policyIdentity(policy.policyId, policy.version);
+  const policyLabel = `${policyRef} (${policy.status})`;
+
   const { problems, malformedPolicy } = validateInputs(proposal, ctx, policy);
   if (problems.length > 0) {
     push(
@@ -241,7 +270,7 @@ export function evaluateRisk(
       "BLOCK",
       `Invalid risk inputs — evaluation refused (fail closed): ${problems.join("; ")}.`,
     );
-    return { outcome: "BLOCK", checks, policyRef: `${policy.policyId}@v${policy.version} (${policy.status})` };
+    return { outcome: "BLOCK", checks, policyRef, policyLabel };
   }
   push("input_validity", "PASS", "All required risk inputs are finite and valid.");
 
@@ -251,9 +280,9 @@ export function evaluateRisk(
     push(
       "policy_status",
       "BLOCK",
-      `Risk policy ${policy.policyId}@v${policy.version} is ${policy.status} — only an APPROVED policy version may authorize execution.`,
+      `Risk policy ${policyRef} is ${policy.status} — only an APPROVED policy version may authorize execution.`,
     );
-    return { outcome: "BLOCK", checks, policyRef: `${policy.policyId}@v${policy.version} (${policy.status})` };
+    return { outcome: "BLOCK", checks, policyRef, policyLabel };
   }
   push("policy_status", "PASS", `Risk policy ${policy.policyId}@v${policy.version} is APPROVED.`);
 
@@ -438,7 +467,8 @@ export function evaluateRisk(
   return {
     outcome,
     checks,
-    policyRef: `${policy.policyId}@v${policy.version} (${policy.status})`,
+    policyRef,
+    policyLabel,
   };
 }
 

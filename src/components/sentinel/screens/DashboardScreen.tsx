@@ -49,7 +49,7 @@ export default function DashboardScreen() {
             1.08425
           </p>
           <p className="relative z-10 mt-[26px] text-[10px] text-sp-muted tabular-nums">
-            Updated 4m ago • Simulated tick feed
+            Sample quote • Simulated tick feed (not a live price)
           </p>
         </GlassCard>
 
@@ -65,7 +65,7 @@ export default function DashboardScreen() {
             Rate cut expectations moderated across European rate desks.
           </p>
           <p className="mt-[10px] text-[10px] text-sp-muted tabular-nums">
-            Published today 14:15 UTC • Verified catalyst
+            Sample workspace data • Not a live news feed
           </p>
         </GlassCard>
 
@@ -103,7 +103,7 @@ export default function DashboardScreen() {
         </button>
         {running && (
           <p role="status" className="mt-2 text-center text-[10.5px] text-sp-muted">
-            Running multi-agent synthesis…
+            Opening the analysis workspace…
           </p>
         )}
       </div>

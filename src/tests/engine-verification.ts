@@ -11,7 +11,7 @@ import { evaluateRisk, vetoAllows, RiskContext, RiskPolicy, TradeProposal } from
 import { normalizeProviderResponse, validateAuthorizationScope, runPrechecks, AuthorizationRecord, OrderIntent, PrecheckContext } from "../convex/lib/execution";
 import { validateCandles } from "../convex/lib/dataQuality";
 import { simulate, StrategyDefinition, ValidationConfig } from "../convex/lib/backtest";
-import { computeAuditHash, verifyAuditChain, AuditRecord } from "../convex/lib/audit";
+import { computeAuditHash, verifyAuditChain, sha256Hex, CURRENT_HASH_VERSION, AuditRecord } from "../convex/lib/audit";
 import {
   fingerprintSecret,
   maskKey,
@@ -265,6 +265,140 @@ check(
   verifyAuditChain([]).verifiedCount === 0 &&
     verifyAuditChain([rec, rec2, rec3]).verifiedCount === 3 &&
     verifyAuditChain([rec2, windowTampered], rec2.prevHash).verifiedCount === 1,
+);
+
+// TEST-AUDIT-2xx — versioned SHA-256 chain (upgrade from FNV-1a).
+// The legacy 64-bit FNV-1a digest is non-cryptographic: 64-bit output is
+// collision-prone and the legacy `|`-join is ambiguous. Every NEW record is
+// now written as `sha256:<64 hex>` over a length-prefixed canonical form;
+// legacy records remain verifiable in their own format.
+const mkV1 = (over: Partial<AuditRecord>): AuditRecord => {
+  const r: AuditRecord = {
+    sequence: 1,
+    at: 1,
+    actor: "a",
+    actorType: "USER",
+    action: "X",
+    resourceType: "r",
+    resourceId: "1",
+    outcome: "SUCCESS",
+    correlationId: "c",
+    detail: "d",
+    prevHash: "GENESIS",
+    hash: "",
+    hashVersion: CURRENT_HASH_VERSION,
+    ...over,
+  };
+  r.hash = computeAuditHash(r);
+  return r;
+};
+
+check(
+  "TEST-AUDIT-201 SHA-256 matches published FIPS 180-4 test vectors",
+  sha256Hex("") === "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855" &&
+    sha256Hex("abc") === "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad" &&
+    sha256Hex("abcdbcdecdefdefgefghfghighijhijkijkljklmklmnlmnomnopnopq") ===
+      "248d6a61d20638b8e5c026930c3e6039a33ce45964ff2167f6ecedd419db06c1",
+);
+const v1Rec = mkV1({});
+check(
+  "TEST-AUDIT-202 new records use the versioned sha256:<64-hex> format",
+  /^sha256:[0-9a-f]{64}$/.test(v1Rec.hash) &&
+    ((): string => {
+      const legacy: AuditRecord = { ...v1Rec, hashVersion: undefined, hash: "" };
+      legacy.hash = computeAuditHash(legacy);
+      return legacy.hash;
+    })().match(/^[0-9a-f]{16}$/) !== null,
+);
+// Ambiguity: the legacy `|`-join lets different field splits serialize to the
+// same string (documented weakness). Length-prefixing removes it.
+const splitA = { ...v1Rec, actor: "x|USER", actorType: "USER", action: "A", hash: "", hashVersion: undefined };
+const splitB = { ...v1Rec, actor: "x", actorType: "USER|USER", action: "A", hash: "", hashVersion: undefined };
+const splitAv1 = { ...splitA, hashVersion: CURRENT_HASH_VERSION };
+const splitBv1 = { ...splitB, hashVersion: CURRENT_HASH_VERSION };
+check(
+  "TEST-AUDIT-203 field-split ambiguity is removed by length-prefixed canonical serialization",
+  computeAuditHash(splitA) === computeAuditHash(splitB) &&
+    computeAuditHash(splitAv1) !== computeAuditHash(splitBv1),
+);
+// Backward compatibility: pre-upgrade (legacy) records still verify, and a
+// mixed legacy -> v1 chain verifies end to end.
+const legacyRec: AuditRecord = {
+  sequence: 1, at: 1, actor: "a", actorType: "USER", action: "X", resourceType: "r",
+  resourceId: "1", outcome: "SUCCESS", correlationId: "c", detail: "legacy", prevHash: "GENESIS", hash: "",
+};
+legacyRec.hash = computeAuditHash(legacyRec);
+const mixedNext = mkV1({ sequence: 2, at: 2, detail: "v1 after legacy", prevHash: legacyRec.hash });
+check(
+  "TEST-AUDIT-204 legacy records still verify and a mixed legacy->v1 chain is intact",
+  verifyAuditChain([legacyRec]).valid && verifyAuditChain([legacyRec, mixedNext]).valid &&
+    verifyAuditChain([legacyRec, mixedNext]).scope === "FULL_CHAIN",
+);
+const v1Tampered = { ...v1Rec, detail: "forged" };
+check(
+  "TEST-AUDIT-205 modification of a v1 record is detected",
+  !verifyAuditChain([v1Tampered]).valid,
+);
+const v1a = mkV1({ sequence: 1, at: 1 });
+const v1b = mkV1({ sequence: 2, at: 2, prevHash: v1a.hash });
+const v1c = mkV1({ sequence: 3, at: 3, prevHash: v1b.hash });
+check(
+  "TEST-AUDIT-206 deletion of a middle record is detected (sequence gap)",
+  !verifyAuditChain([v1a, v1c]).valid,
+);
+// DOCUMENTED LIMITATION (not a pass claim): tail truncation of an unanchored
+// chain is undetectable — the prefix still verifies. This is exactly why the
+// chain is labeled tamper-EVIDENT and why external anchoring of head hashes
+// (SPEC-GAP-005) is a production requirement.
+const truncated = verifyAuditChain([v1a, v1b]);
+check(
+  "TEST-AUDIT-207 tail truncation is NOT detectable without external anchoring (documented limitation, chain remains tamper-evident only)",
+  truncated.valid && truncated.note.includes("NOT tamper-proof"),
+);
+const badVersion: AuditRecord = { ...v1a, hashVersion: "MD5-V0", hash: "0".repeat(32) };
+check(
+  "TEST-AUDIT-208 an unknown hash format fails closed (never verified by a weaker fallback)",
+  !verifyAuditChain([badVersion]).valid && (verifyAuditChain([badVersion]).reason ?? "").includes("hashVersion"),
+);
+const dupV1 = mkV1({ sequence: 2, at: 3, detail: "replayed", prevHash: v1a.hash });
+check(
+  "TEST-AUDIT-209 a duplicated sequence number in a v1 chain fails (concurrent-append replay)",
+  !verifyAuditChain([v1a, v1b, dupV1]).valid,
+);
+check(
+  "TEST-AUDIT-210 reordered v1 records fail (out-of-order sequences)",
+  !verifyAuditChain([v1b, v1a], v1b.prevHash).valid,
+);
+// Checkpoints: an in-range declaration must match the actual head hash.
+// Independently protected (exported) heads are a production requirement and
+// are NOT claimed here (SPEC-GAP-005).
+const cpGood = mkV1({
+  sequence: 3, at: 3, action: "CHAIN_CHECKPOINT", resourceType: "auditEvents", resourceId: "2",
+  detail: `CHECKPOINT head=${v1b.hash} seq=2`, prevHash: v1b.hash,
+});
+const goodVerdict = verifyAuditChain([v1a, v1b, cpGood]);
+check(
+  "TEST-AUDIT-210b a checkpoint whose declared head matches the actual record verifies and is counted",
+  goodVerdict.valid && goodVerdict.checkpointsVerified === 1,
+);
+const cpForged = mkV1({
+  sequence: 3, at: 3, action: "CHAIN_CHECKPOINT", resourceType: "auditEvents", resourceId: "2",
+  detail: "CHECKPOINT head=deadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef seq=2",
+  prevHash: v1b.hash,
+});
+check(
+  "TEST-AUDIT-210c a checkpoint declaring a forged head fails (history rewritten after checkpoint)",
+  !verifyAuditChain([v1a, v1b, cpForged]).valid &&
+    (verifyAuditChain([v1a, v1b, cpForged]).reason ?? "").includes("checkpoint"),
+);
+const cpOutside = mkV1({
+  sequence: 3, at: 3, action: "CHAIN_CHECKPOINT", resourceType: "auditEvents", resourceId: "2",
+  detail: `CHECKPOINT head=${v1b.hash} seq=2`, prevHash: v1b.hash,
+});
+const outsideVerdict = verifyAuditChain([cpOutside], cpOutside.prevHash);
+check(
+  "TEST-AUDIT-210d a checkpoint referencing a record outside the verified range is NOT counted (nothing checked against)",
+  outsideVerdict.valid && outsideVerdict.checkpointsVerified === 0,
 );
 
 // TEST-SEC-CRED-* credential handling contract (Section 16 secret rules)
@@ -761,6 +895,55 @@ check(
   !runPrechecks(intent, { ...preCtx, killSwitchEngaged: "" as never }).ok &&
     !runPrechecks(intent, { ...preCtx, systemEnabled: -1 as never }).ok &&
     !runPrechecks(intent, { ...preCtx, existingIdempotencyKeys: undefined as never }).ok,
+);
+
+// ---------------------------------------------------------------------------
+// TEST-POLREF-* — POLICY-REFERENCE CONTRACT (producer -> consumer).
+// Regression for the P0 defect: the risk producer formerly emitted a
+// human-readable label ("<policyId>@v<n> (<status>)") into `policyRef`, while
+// the execution validator requires an identifier token — so EVERY approved
+// proposal produced an authorization that could never be consumed
+// (validateAuthorizationScope rejected its own issuer's reference).
+// ---------------------------------------------------------------------------
+const polrefDecision = evaluateRisk(proposal, baseCtx, policy);
+check(
+  "TEST-POLREF-001 produced policyRef is the canonical version-pinned identity (policyId@vN)",
+  polrefDecision.policyRef === "P@v1",
+  polrefDecision.policyRef,
+);
+check(
+  "TEST-POLREF-002 display label carries lifecycle status and is separate from the identity",
+  polrefDecision.policyLabel === "P@v1 (APPROVED)",
+  polrefDecision.policyLabel,
+);
+check(
+  "TEST-POLREF-003 authorization scope carrying the PRODUCED policyRef validates (producer->consumer contract)",
+  validateAuthorizationScope(
+    { ...auth, scope: { ...auth.scope, riskPolicyRef: polrefDecision.policyRef } },
+    intent,
+    Date.now(),
+  ).ok,
+);
+check(
+  "TEST-POLREF-004 legacy display label in the identifier field is still rejected (validator unchanged)",
+  !validateAuthorizationScope(
+    { ...auth, scope: { ...auth.scope, riskPolicyRef: "P@v1 (APPROVED)" } },
+    intent,
+    Date.now(),
+  ).ok,
+);
+const polrefBlocked = evaluateRisk(proposal, baseCtx, { ...policy, status: "PROVISIONAL" });
+check(
+  "TEST-POLREF-005 blocked-path decisions return the canonical identity plus status label",
+  polrefBlocked.outcome === "BLOCK" &&
+    polrefBlocked.policyRef === "P@v1" &&
+    polrefBlocked.policyLabel === "P@v1 (PROVISIONAL)",
+);
+const polrefGarbage = evaluateRisk(proposal, baseCtx, { ...policy, policyId: "NOT A TOKEN" });
+check(
+  "TEST-POLREF-006 malformed policy identity never fabricates a plausible reference (fail closed)",
+  polrefGarbage.outcome === "BLOCK" && polrefGarbage.policyRef === "INVALID-POLICY@v0",
+  `${polrefGarbage.outcome} ${polrefGarbage.policyRef}`,
 );
 
 console.log(`\n${pass} passed, ${fail} failed`);

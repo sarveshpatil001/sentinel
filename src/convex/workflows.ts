@@ -269,7 +269,7 @@ export const submitTradeProposal = mutation({
         resourceId: riskDecisionId,
         outcome: decision.outcome,
         correlationId: proposal.proposalId,
-        detail: `Deterministic risk evaluation under ${decision.policyRef}: ${decision.outcome}. Veto is final authority.`,
+        detail: `Deterministic risk evaluation under ${decision.policyLabel}: ${decision.outcome}. Veto is final authority.`,
       },
       now,
     );
@@ -305,6 +305,9 @@ export const submitTradeProposal = mutation({
         quantity: args.quantity,
         orderType: "MARKET",
         timeInForce: "GTC",
+        // Canonical, version-pinned policy identity (`<policyId>@v<n>`) — the
+        // single contract expected by validateAuthorizationScope. The
+        // human-readable label is NEVER stored in this identifier field.
         riskPolicyRef: decision.policyRef,
         mode: riskCtx.mode as never,
         expiresAt: now + 15 * 60_000,

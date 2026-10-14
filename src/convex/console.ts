@@ -81,6 +81,7 @@ export const overview = query({
           detail: r.detail,
           prevHash: r.prevHash,
           hash: r.hash,
+          hashVersion: r.hashVersion,
         }),
       );
     const visibleAudit = sortedAudit.filter(
@@ -288,6 +289,7 @@ export const audit = query({
           detail: r.detail,
           prevHash: r.prevHash,
           hash: r.hash,
+          hashVersion: r.hashVersion,
         }),
       );
     // Integrity over the FETCHED WINDOW (newest 250 events) — NOT the whole

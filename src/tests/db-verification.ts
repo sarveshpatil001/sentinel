@@ -13,8 +13,12 @@
  * the build green (Rule 38/39).
  *
  * BOUNDARIES (deliberate):
- *  - No risk policy is ever APPROVED by this suite. Policy fixtures either
- *    mirror the seeded PROVISIONAL configuration or declare NO limits at all.
+ *  - Policy fixtures mirror the seeded PROVISIONAL configuration or declare NO
+ *    limits at all. The single exception is DB-POLREF-* (P0 regression): it
+ *    performs a REAL admin ratification of the seeded policy through the
+ *    admin-gated `approveRiskPolicy` mutation, inside its own isolated
+ *    in-memory database, to exercise the approved-proposal-to-order path.
+ *    No numerical limit is changed, and nothing leaves that test database.
  *  - Execution authorization fixtures are inserted directly as capability
  *    tokens (owner-bound records) so that consumption/ownership behavior can
  *    be tested without ratifying any policy.
@@ -1659,6 +1663,229 @@ async function seedUsers(t: T) {
     agentsA.agents.length === 0 && agentsA.learningEvents.length === 1 && agentsB.learningEvents.length === 0);
   check("DB-RESET-USER current-user endpoint returns the authenticated user, null for signed-out callers",
     String((await asA.query(api.users.currentUser))?._id) === userA && (await t.query(api.users.currentUser)) === null);
+}
+
+// ---------------------------------------------------------------------------
+// DB-POLREF-* — P0 REGRESSION: approved proposal -> order through REAL handlers.
+// This exercises the actual producer-to-consumer workflow (evaluateRisk ->
+// authorization scope -> validateAuthorizationScope -> order lifecycle), not
+// manually inserted authorization fixtures. Before the policy-reference
+// contract repair, step (e) failed closed every time: the risk engine wrote a
+// human-readable label ("RISK-POLICY-CORE@v1 (APPROVED)") into the identifier
+// field `scope.riskPolicyRef`, which the execution validator rejects.
+// ---------------------------------------------------------------------------
+{
+  const t = fresh();
+  const { userA, userB } = await seedWorkspace(t, "FILL");
+  await t.run(async (ctx) => {
+    // Out-of-band admin provisioning (SPEC-GAP-008): the initial admin is
+    // provisioned outside the application, exactly as documented.
+    await ctx.db.patch(userA as never, { role: "admin" });
+    await ctx.db.insert("riskPolicies", { ...SEEDED_POLICY, createdAt: Date.now() });
+    // Strategy-eligibility evidence for SV-T (precondition of the risk gate).
+    await ctx.db.insert("validationRuns", {
+      validationId: "VAL-POLREF",
+      strategyVersionId: "SV-T",
+      dataSnapshotId: "SNAP-POLREF",
+      validationConfigVersion: "test",
+      engineVersion: "test",
+      featureVersion: "test",
+      costModelVersion: "test",
+      executionModelVersion: "test",
+      state: "COMPLETED",
+      integrity: [],
+      leakageState: "NO_LEAKAGE_DETECTED",
+      metrics: { tradeCount: 1, netReturn: 0 },
+      stress: {},
+      oos: {},
+      createdAt: Date.now(),
+      completedAt: Date.now(),
+    });
+    await ctx.db.insert("evidenceRecords", {
+      evidenceId: "EV-POLREF",
+      validationId: "VAL-POLREF",
+      strategyVersionId: "SV-T",
+      level: "MODERATE",
+      rubricVersion: "test",
+      factors: {},
+      rationale: ["Test fixture evidence for the eligibility gate."],
+      createdAt: Date.now(),
+    });
+  });
+  const asA = t.withIdentity({ subject: userA });
+  const asB = t.withIdentity({ subject: userB });
+
+  const mismatch = await asA.mutation(api.workflows.approveRiskPolicy, {
+    policyId: "RISK-POLICY-CORE",
+    version: 99,
+    attestation: "version-mismatch probe",
+  });
+  check(
+    "DB-POLREF-001 mismatched policy version cannot be ratified (exact version binding)",
+    mismatch.ok === false,
+  );
+
+  const ratified = await asA.mutation(api.workflows.approveRiskPolicy, {
+    policyId: "RISK-POLICY-CORE",
+    version: 1,
+    attestation: "Test-only ratification inside an isolated in-memory database (P0 integration path).",
+  });
+  check("DB-POLREF-002 admin ratification of the declared policy succeeds (limits unchanged)", ratified.ok === true);
+
+  const prop = await asA.mutation(api.workflows.submitTradeProposal, {
+    strategyVersionId: "SV-T",
+    marketId: "MKT-T",
+    side: "BUY",
+    quantity: 0.1,
+    referencePrice: 62000,
+    idempotencyKey: "PK-POLREF-1",
+  });
+  check(
+    "DB-POLREF-003 eligible proposal under the APPROVED policy is APPROVED and yields an authorization",
+    prop.outcome === "APPROVE" && prop.authorizationId !== null,
+    JSON.stringify(prop.checks.filter((c) => c.status !== "PASS")),
+  );
+
+  const authRow = await t.run(async (ctx) =>
+    ctx.db
+      .query("executionAuthorizations")
+      .withIndex("by_authorizationId", (q) => q.eq("authorizationId", prop.authorizationId ?? ""))
+      .first(),
+  );
+  check(
+    "DB-POLREF-004 authorization scope binds the canonical version-pinned policy identity",
+    authRow?.scope.riskPolicyRef === "RISK-POLICY-CORE@v1",
+    authRow?.scope.riskPolicyRef,
+  );
+
+  const order = await asA.mutation(api.workflows.placeOrder, {
+    authorizationId: prop.authorizationId ?? "",
+    strategyVersionId: "SV-T",
+    marketId: "MKT-T",
+    side: "BUY",
+    quantity: 0.1,
+    orderType: "MARKET",
+    timeInForce: "GTC",
+    idempotencyKey: "IK-POLREF-1",
+  });
+  const orderRow = await t.run(async (ctx) =>
+    ctx.db
+      .query("orders")
+      .withIndex("by_idempotencyKey", (q) => q.eq("idempotencyKey", "IK-POLREF-1"))
+      .first(),
+  );
+  check(
+    "DB-POLREF-005 approved proposal reaches a PAPER order through the real producer/consumer path",
+    order.orderId !== null &&
+      orderRow?.mode === "PAPER" &&
+      orderRow?.state === "FILLED" &&
+      orderRow?.history.some((h) => h.state === "AUTHORIZED") === true,
+    `${order.state} ${order.note}`,
+  );
+
+  const consumedRow = await t.run(async (ctx) =>
+    ctx.db
+      .query("executionAuthorizations")
+      .withIndex("by_authorizationId", (q) => q.eq("authorizationId", prop.authorizationId ?? ""))
+      .first(),
+  );
+  check(
+    "DB-POLREF-006 authorization is atomically CONSUMED and bound to the surviving order",
+    consumedRow?.state === "CONSUMED" && consumedRow?.consumedByOrderId === order.orderId,
+  );
+
+  const reuse = await asA.mutation(api.workflows.placeOrder, {
+    authorizationId: prop.authorizationId ?? "",
+    strategyVersionId: "SV-T",
+    marketId: "MKT-T",
+    side: "BUY",
+    quantity: 0.1,
+    orderType: "MARKET",
+    timeInForce: "GTC",
+    idempotencyKey: "IK-POLREF-2",
+  });
+  const reuseRow = await t.run(async (ctx) =>
+    ctx.db
+      .query("orders")
+      .withIndex("by_idempotencyKey", (q) => q.eq("idempotencyKey", "IK-POLREF-2"))
+      .first(),
+  );
+  check(
+    "DB-POLREF-007 consumed authorization cannot be reused (single use preserved)",
+    reuse.state === "REJECTED" &&
+      reuseRow?.state === "REJECTED" &&
+      !reuseRow?.providerOrderId &&
+      reuse.note.includes("authorization_state"),
+    `state=${reuse.state} row=${String(reuseRow?.state)} note=${reuse.note}`,
+  );
+
+  const foreign = await asB.mutation(api.workflows.placeOrder, {
+    authorizationId: prop.authorizationId ?? "",
+    strategyVersionId: "SV-T",
+    marketId: "MKT-T",
+    side: "BUY",
+    quantity: 0.1,
+    orderType: "MARKET",
+    timeInForce: "GTC",
+    idempotencyKey: "IK-POLREF-3",
+  });
+  check(
+    "DB-POLREF-008 foreign owner cannot consume the authorization (not-found ≡ not-owned)",
+    foreign.state === "REJECTED" && foreign.orderId === null,
+  );
+
+  const prop2 = await asA.mutation(api.workflows.submitTradeProposal, {
+    strategyVersionId: "SV-T",
+    marketId: "MKT-T",
+    side: "BUY",
+    quantity: 0.1,
+    referencePrice: 62000,
+    idempotencyKey: "PK-POLREF-2",
+  });
+  check("DB-POLREF-009 second clean proposal also yields an authorization", prop2.authorizationId !== null);
+  await t.run(async (ctx) => {
+    const row = await ctx.db
+      .query("executionAuthorizations")
+      .withIndex("by_authorizationId", (q) => q.eq("authorizationId", prop2.authorizationId ?? ""))
+      .first();
+    if (row) {
+      // Tamper: legacy human-readable label in the identifier field.
+      await ctx.db.patch(row._id, {
+        scope: { ...row.scope, riskPolicyRef: "RISK-POLICY-CORE@v1 (APPROVED)" },
+      });
+    }
+  });
+  const malformed = await asA.mutation(api.workflows.placeOrder, {
+    authorizationId: prop2.authorizationId ?? "",
+    strategyVersionId: "SV-T",
+    marketId: "MKT-T",
+    side: "BUY",
+    quantity: 0.1,
+    orderType: "MARKET",
+    timeInForce: "GTC",
+    idempotencyKey: "IK-POLREF-4",
+  });
+  const malformedRow = await t.run(async (ctx) =>
+    ctx.db
+      .query("executionAuthorizations")
+      .withIndex("by_authorizationId", (q) => q.eq("authorizationId", prop2.authorizationId ?? ""))
+      .first(),
+  );
+  const malformedOrderRow = await t.run(async (ctx) =>
+    ctx.db
+      .query("orders")
+      .withIndex("by_idempotencyKey", (q) => q.eq("idempotencyKey", "IK-POLREF-4"))
+      .first(),
+  );
+  check(
+    "DB-POLREF-010 malformed (display-label) policy reference fails closed and consumes nothing",
+    malformed.state === "REJECTED" &&
+      malformedOrderRow?.state === "REJECTED" &&
+      !malformedOrderRow?.providerOrderId &&
+      malformedRow?.state === "APPROVED" &&
+      malformed.note.includes("input_validity"),
+    `state=${malformed.state} row=${String(malformedOrderRow?.state)} authState=${String(malformedRow?.state)} note=${malformed.note}`,
+  );
 }
 
 console.log(`\n${pass} passed, ${fail} failed`);
