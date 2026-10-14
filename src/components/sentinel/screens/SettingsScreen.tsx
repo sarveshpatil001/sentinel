@@ -1,5 +1,7 @@
 import { useState } from "react";
+import { useMutation, useQuery } from "convex/react";
 import { useNavigate } from "react-router";
+import { api } from "@/convex/_generated/api";
 import { useAuth } from "@/hooks/use-auth";
 import { useConsoleAction } from "@/hooks/use-console-action";
 import { GlassCard, MicroLabel } from "../cards";
@@ -37,13 +39,81 @@ function ToggleRow({
   );
 }
 
+function SelectRow({
+  label,
+  value,
+  options,
+  onChange,
+}: {
+  label: string;
+  value: string;
+  options: { value: string; label: string }[];
+  onChange: (value: string) => void;
+}) {
+  return (
+    <div className="flex items-center justify-between py-[10px]">
+      <span className="text-[13px] font-semibold text-sp-text">{label}</span>
+      <select
+        aria-label={label}
+        value={value}
+        onChange={(event) => onChange(event.target.value)}
+        className="rounded-[6px] border border-sp-line bg-transparent px-2 py-1 text-[13px] tabular-nums text-sp-muted-2"
+      >
+        {options.length === 0 && <option value="">—</option>}
+        {options.map((option) => (
+          <option key={option.value} value={option.value}>
+            {option.label}
+          </option>
+        ))}
+      </select>
+    </div>
+  );
+}
+
+const TIMEFRAMES = ["1m", "5m", "15m", "30m", "1h", "4h", "1d"];
+const HORIZON_LABELS: Record<string, string> = {
+  SHORT: "Short (≤ 1 day)",
+  MEDIUM: "Medium (≤ 1 week)",
+  LONG: "Long (> 1 week)",
+};
+
 export default function SettingsScreen() {
   const navigate = useNavigate();
   const { signOut } = useAuth();
   const action = useConsoleAction();
-  const [chime, setChime] = useState(true);
-  const [bulletins, setBulletins] = useState(true);
+  // Persisted, server-validated preferences. Missing or invalid stored
+  // settings come back as `saved: null` with safe defaults — never a crash.
+  const prefsResult = useQuery(api.preferences.get, {});
+  const instruments = useQuery(api.marketData.instruments, {});
+  const savePreferences = useMutation(api.preferences.save);
+
+  const loaded = prefsResult?.saved ?? prefsResult?.defaults ?? null;
+  // Loaded settings are the source of truth until the user edits — derived
+  // state, so missing/invalid rows fall back to safe defaults without an
+  // effect round-trip.
+  const base = {
+    marketId: loaded?.marketId ?? "",
+    timeframe: loaded?.timeframe ?? "1h",
+    horizon: loaded?.horizon ?? "SHORT",
+    chime: loaded?.notifications.analysisComplete ?? true,
+    bulletins: loaded?.notifications.highImpactNews ?? false,
+  };
+  const [draft, setDraft] = useState<typeof base | null>(null);
   const [saved, setSaved] = useState(false);
+  const current = draft ?? base;
+
+  const marketOptions = Array.isArray(instruments)
+    ? instruments.map((m: { marketId: string; symbol: string }) => ({
+        value: m.marketId,
+        label: m.symbol,
+      }))
+    : [];
+  const notificationDefaults = loaded?.notifications ?? {
+    analysisComplete: true,
+    riskBlocked: true,
+    providerFailure: true,
+    highImpactNews: false,
+  };
 
   return (
     <>
@@ -53,16 +123,33 @@ export default function SettingsScreen() {
         <GlassCard radius={16} className="min-h-[136px] px-4 pb-2 pt-[14px]">
           <MicroLabel>WORKSTATION DEFAULTS</MicroLabel>
           <div className="mt-[6px] divide-y divide-sp-line">
-            {[
-              { label: "Default Currency Pair", value: "EUR/USD ›" },
-              { label: "Timeframe Anchor", value: "15m ›" },
-              { label: "Analysis Forecast Horizon", value: "2 Hours ›" },
-            ].map((row) => (
-              <div key={row.label} className="flex items-center justify-between py-[10px]">
-                <span className="text-[13px] font-semibold text-sp-text">{row.label}</span>
-                <span className="text-[13px] text-sp-muted-2 tabular-nums">{row.value}</span>
-              </div>
-            ))}
+            <SelectRow
+              label="Default Currency Pair"
+              value={current.marketId}
+              options={marketOptions}
+              onChange={(value) => {
+                setDraft({ ...current, marketId: value });
+                setSaved(false);
+              }}
+            />
+            <SelectRow
+              label="Timeframe Anchor"
+              value={current.timeframe}
+              options={TIMEFRAMES.map((tf) => ({ value: tf, label: tf }))}
+              onChange={(value) => {
+                setDraft({ ...current, timeframe: value });
+                setSaved(false);
+              }}
+            />
+            <SelectRow
+              label="Analysis Forecast Horizon"
+              value={current.horizon}
+              options={Object.entries(HORIZON_LABELS).map(([value, label]) => ({ value, label }))}
+              onChange={(value) => {
+                setDraft({ ...current, horizon: value });
+                setSaved(false);
+              }}
+            />
           </div>
         </GlassCard>
 
@@ -92,18 +179,25 @@ export default function SettingsScreen() {
         <GlassCard radius={14} className="min-h-[116px] px-4 pb-4 pt-[14px]">
           <MicroLabel>NOTIFICATIONS & SOUNDS</MicroLabel>
           <div className="mt-[6px] divide-y divide-sp-line">
-            <ToggleRow label="Signal Generation Chime" on={chime} onToggle={() => setChime((value) => !value)} />
+            <ToggleRow
+              label="Signal Generation Chime"
+              on={current.chime}
+              onToggle={() => setDraft({ ...current, chime: !current.chime })}
+            />
             <ToggleRow
               label="High-Impact Macro Bulletins"
-              on={bulletins}
-              onToggle={() => setBulletins((value) => !value)}
+              on={current.bulletins}
+              onToggle={() => setDraft({ ...current, bulletins: !current.bulletins })}
             />
           </div>
+          <p className="mt-[8px] text-[10px] text-sp-muted">
+            Preferences are stored on your account. Notification delivery channels are not part of this build.
+          </p>
         </GlassCard>
 
         {saved && (
           <p role="status" className="text-[10.5px] text-sp-muted">
-            Preferences saved for this session (demo workspace).
+            Preferences saved to your account.
           </p>
         )}
       </div>
@@ -112,8 +206,25 @@ export default function SettingsScreen() {
         <div className="flex gap-2.5">
           <button
             type="button"
-            onClick={() => setSaved(true)}
-            className="flex h-12 w-[200px] items-center justify-center rounded-[12px] border border-sp-cyan bg-sp-glass text-[13px] font-extrabold text-sp-cyan transition-colors hover:bg-sp-cyan/10"
+            disabled={action.busy || current.marketId === ""}
+            onClick={() =>
+              action.run(async () => {
+                await savePreferences({
+                  marketId: current.marketId,
+                  timeframe: current.timeframe,
+                  horizon: current.horizon,
+                  notifications: {
+                    analysisComplete: current.chime,
+                    riskBlocked: notificationDefaults.riskBlocked,
+                    providerFailure: notificationDefaults.providerFailure,
+                    highImpactNews: current.bulletins,
+                  },
+                });
+                setSaved(true);
+                return "Preferences saved";
+              })
+            }
+            className="flex h-12 w-[200px] items-center justify-center rounded-[12px] border border-sp-cyan bg-sp-glass text-[13px] font-extrabold text-sp-cyan transition-colors hover:bg-sp-cyan/10 disabled:opacity-60"
           >
             Save Preferences
           </button>

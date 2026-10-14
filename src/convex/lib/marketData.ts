@@ -20,7 +20,7 @@
  * CONNECTIVITY STATUS (verified live from this project's build environment on
  * 2026-10-14, response shapes recorded in the verification battery):
  *   - api.kraken.com /0/public/OHLC        — VERIFIED (crypto OHLC)
- *   - api.exchange.coinbase.com /products/*/candles — VERIFIED (crypto OHLC)
+ *   - api.exchange.coinbase.com product candles  — VERIFIED (crypto OHLC)
  *   - api.frankfurter.dev /v1/*            — VERIFIED (ECB FX close-only rates)
  *   - feeds.finance.yahoo.com RSS          — VERIFIED (news; see lib/news.ts)
  * Connectivity from the deployed Convex runtime is re-verified on every fetch:
@@ -293,6 +293,9 @@ export function parseKrakenOhlc(
   body: string,
   opts: { symbol: string; timeframe: string },
 ): { ok: true; candles: ProviderCandle[]; providerTimestamp: number | null; issues: ValidationIssue[] } | { ok: false; failureClass: ProviderFailureClass; detail: string } {
+  if (timeframeMs(opts.timeframe) === null) {
+    return { ok: false, failureClass: "UNSUPPORTED_REQUEST", detail: "unsupported timeframe for candle parsing" };
+  }
   const parsed = parseJsonBody(body);
   if ("error" in parsed) return { ok: false, failureClass: "MALFORMED_RESPONSE", detail: parsed.error };
   const root = parsed.value as { error?: unknown; result?: unknown };

@@ -3,7 +3,7 @@ import { api } from "@/convex/_generated/api";
 import { Panel, RecordDetails } from "./shared";
 
 export default function DataPanel() {
-  const data = useQuery(api.console.data);
+  const data = useQuery(api.console.data, {});
   if (data === undefined) return <p role="status">Loading market data…</p>;
   return (
     <Panel title="Market data" description="Chart design is pending. Existing deterministic simulation series, quality checks, and snapshots remain available.">

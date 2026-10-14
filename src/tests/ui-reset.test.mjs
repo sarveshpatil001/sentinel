@@ -37,6 +37,11 @@ const apiFixture = {
   workflows: Object.fromEntries(["placeOrder", "reconcile", "setKillSwitch", "setSimulatedProviderBehavior", "proposeCandidateVersion", "submitTradeProposal", "runValidation"].map((name) => [name, `workflows.${name}`])),
   connections: Object.fromEntries(["catalog", "list", "register", "verify", "revoke"].map((name) => [name, `connections.${name}`])),
   databricks: { checkWorkspace: "databricks.checkWorkspace" },
+  analysis: { run: "analysis.run", history: "analysis.history", get: "analysis.get" },
+  news: { latest: "news.latest", topImpact: "news.topImpact" },
+  marketData: { candles: "marketData.candles", health: "marketData.health", instruments: "marketData.instruments" },
+  preferences: { get: "preferences.get", save: "preferences.save" },
+  providers: { refreshMarketData: "providers.refreshMarketData", refreshNews: "providers.refreshNews", runAnalysisWithFreshData: "providers.runAnalysisWithFreshData" },
 };
 mock.module("@/convex/_generated/api", () => ({ api: apiFixture }));
 mock.module("@/hooks/use-auth", () => ({ useAuth: () => ({ isLoading: loadingAuth, isAuthenticated: authenticated, user: { email: "test@example.invalid" }, signIn: async () => {}, signOut: async () => {} }) }));
@@ -45,6 +50,15 @@ mock.module("convex/react", () => ({
     if (loadingData) return undefined;
     if (ref === "connections.list") return [];
     if (ref === "connections.catalog") return { providers: [{ provider: "SIM-CRYPTO-PROVIDER", adapter: "SIMULATED" }], permissions: ["READ_ACCOUNT"], environments: ["PAPER", "DEMO"], disabledEnvironments: ["CONTROLLED_LIVE"] };
+    if (ref === "preferences.get") return {
+      saved: null,
+      defaults: { marketId: "MKT-T", symbol: "BTC/USD", timeframe: "1h", horizon: "SHORT",
+        notifications: { analysisComplete: true, riskBlocked: true, providerFailure: true, highImpactNews: false } },
+      reason: "NO_SAVED_PREFERENCES",
+    };
+    if (ref === "marketData.instruments") return [{ marketId: "MKT-T", symbol: "BTC/USD", assetClass: "CRYPTO",
+      providerState: "AVAILABLE", supportedTimeframes: ["1m", "5m", "15m", "30m", "1h", "4h", "1d"],
+      hasCandleProvider: true, hasRateFeedOnly: false }];
     return fixture;
   },
   useMutation: () => async () => { mutationCalls++; return { ok: true }; },

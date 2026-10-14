@@ -27,7 +27,7 @@
  */
 import { convexTest } from "convex-test";
 import schema from "../convex/schema";
-import { api } from "../convex/_generated/api";
+import { api, internal } from "../convex/_generated/api";
 import { loadRiskContext } from "../convex/workflows";
 import { evaluateRisk, vetoAllows, type RiskPolicy, type TradeProposal } from "../convex/lib/risk";
 
@@ -46,6 +46,11 @@ const modules: Record<string, () => Promise<unknown>> = {
   "../convex/databricks.ts": () => import("../convex/databricks"),
   "../convex/users.ts": () => import("../convex/users"),
   "../convex/seed.ts": () => import("../convex/seed"),
+  "../convex/analysis.ts": () => import("../convex/analysis"),
+  "../convex/marketData.ts": () => import("../convex/marketData"),
+  "../convex/news.ts": () => import("../convex/news"),
+  "../convex/preferences.ts": () => import("../convex/preferences"),
+  "../convex/providers.ts": () => import("../convex/providers"),
 };
 
 function fresh() {
@@ -1652,7 +1657,7 @@ async function seedUsers(t: T) {
     !denied.ok && candidate.ok && child?.status === "PROPOSAL" && child?.immutable === true &&
     JSON.stringify(parent?.definition) === JSON.stringify(original?.definition) &&
     JSON.stringify(parent?.provenance) === JSON.stringify(original?.provenance));
-  const data = await asA.query(api.console.data);
+  const data = await asA.query(api.console.data, {});
   const candles = await t.run(async (ctx) => ctx.db.query("candles").collect());
   check("DB-RESET-DATA API market series equals stored candle timestamps and prices, not UI constants",
     data.series.length === 1 && data.series[0].points.length === candles.length &&
@@ -1887,6 +1892,576 @@ async function seedUsers(t: T) {
     `state=${malformed.state} row=${String(malformedOrderRow?.state)} authState=${String(malformedRow?.state)} note=${malformed.note}`,
   );
 }
+
+// ===========================================================================
+// BACKEND REPAIR BATTERY — market data, news, analysis pipeline (Section 04).
+// Real handlers against the in-memory database: pipeline honesty (LIVE vs
+// SIMULATED labels), risk-engine non-bypass, ownership + pagination,
+// instrument/timeframe chart queries, preferences validation, credential
+// secrecy, and execution remaining disabled.
+// ===========================================================================
+
+async function seedAnalysisWorkspace(
+  t: T,
+  pattern: "SPIKE" | "FLAT",
+): Promise<{ userA: string; userB: string }> {
+  const now = Date.now();
+  return await t.run(async (ctx) => {
+    const userA = await ctx.db.insert("users", { name: "Repair User A" });
+    const userB = await ctx.db.insert("users", { name: "Repair User B" });
+    await ctx.db.insert("systemState", {
+      key: "global",
+      mode: "PAPER",
+      killSwitchEngaged: false,
+      liveAutoResume: false,
+      environment: "TEST",
+      simulatedProviderBehavior: "ACK",
+      peakEquity: 100000,
+      controlledLiveGates: [],
+      updatedAt: now,
+    });
+    await ctx.db.insert("markets", {
+      marketId: "MKT-T",
+      symbol: "BTC/USD",
+      assetClass: "CRYPTO",
+      venue: "SIM-VENUE",
+      provider: "SIMULATED",
+      baseAsset: "BTC",
+      quoteAsset: "USD",
+      timezone: "UTC",
+      status: "OPEN",
+      providerState: "AVAILABLE",
+    });
+    // 30 synthetic 1h bars ending one hour ago (availability_time <= now).
+    for (let i = 0; i < 30; i++) {
+      const eventTime = now - 30 * HOUR + i * HOUR;
+      const close = pattern === "SPIKE" && i === 29 ? 110 : 100;
+      await ctx.db.insert("candles", {
+        marketId: "MKT-T",
+        symbol: "BTC/USD",
+        assetClass: "CRYPTO",
+        venue: "SIM-VENUE",
+        timeframe: "1h",
+        eventTime,
+        open: 100,
+        high: Math.max(100, close) + 1,
+        low: Math.min(100, close) - 1,
+        close,
+        volume: 10,
+        source: "SIMULATED",
+        providerTimestamp: eventTime,
+        receivedTime: eventTime,
+        availabilityTime: eventTime + HOUR,
+        qualityStatus: "VALID",
+      });
+    }
+    await ctx.db.insert("strategies", {
+      strategyId: "STRAT-T",
+      name: "Repair Fixture Candidate",
+      description: "Deterministic fixture candidate for the analysis pipeline battery.",
+      marketId: "MKT-T",
+      timeframe: "1h",
+      createdAt: now,
+    });
+    await ctx.db.insert("strategyVersions", {
+      strategyVersionId: "SV-T",
+      strategyId: "STRAT-T",
+      version: 1,
+      status: "VERSION",
+      immutable: true,
+      definition: {
+        marketId: "MKT-T",
+        symbol: "BTC/USD",
+        timeframe: "1h",
+        entry: { indicator: "ema_cross", fast: 2, slow: 3 },
+        exit: { stopLossPct: 0.02, takeProfitPct: 0.02, timeExitBars: 100 },
+        filters: { rsiMin: null, rsiMax: null },
+        sizing: { kind: "fixed_fraction", fraction: 1 },
+      },
+      provenance: {
+        authorType: "HUMAN",
+        authorRef: "test-fixture",
+        rationale: "Fixture candidate for deterministic pipeline tests.",
+        createdAt: now,
+      },
+    });
+    return { userA: String(userA), userB: String(userB) };
+  });
+}
+
+async function backendRepairBattery() {
+  // ---- analysis pipeline: success path on SIMULATED data -----------------
+  {
+    const t = fresh();
+    const { userA, userB } = await seedAnalysisWorkspace(t, "SPIKE");
+    const asA = t.withIdentity({ subject: userA });
+    const asB = t.withIdentity({ subject: userB });
+
+    let unauth = false;
+    try {
+      await t.mutation(api.analysis.run, { marketId: "MKT-T", timeframe: "1h", horizon: "SHORT" });
+    } catch (e) {
+      unauth = String(e).includes("UNAUTHENTICATED");
+    }
+    check("DB-ANALYSIS-001 unauthenticated analysis run is refused", unauth);
+
+    let badTf = false;
+    try {
+      await asA.mutation(api.analysis.run, { marketId: "MKT-T", timeframe: "7m", horizon: "SHORT" });
+    } catch (e) {
+      badTf = String(e).includes("INVALID_REQUEST");
+    }
+    let badHorizon = false;
+    try {
+      await asA.mutation(api.analysis.run, { marketId: "MKT-T", timeframe: "1h", horizon: "YOLO" });
+    } catch (e) {
+      badHorizon = String(e).includes("INVALID_REQUEST");
+    }
+    check("DB-ANALYSIS-002 unsupported timeframe and horizon are rejected server-side", badTf && badHorizon);
+
+    const run1 = await asA.mutation(api.analysis.run, {
+      marketId: "MKT-T",
+      timeframe: "1h",
+      horizon: "SHORT",
+    });
+    check(
+      "DB-ANALYSIS-003 pipeline persists SIMULATED-labeled run: evaluated LONG candidate, risk BLOCK on PROVISIONAL policy, honest NO TRADE verdict",
+      run1.data.label === "SIMULATED" &&
+        run1.status === "BLOCKED" &&
+        run1.verdict === "NO TRADE" &&
+        run1.strategyResults.length === 1 &&
+        run1.strategyResults[0].signal === "LONG" &&
+        run1.strategyResults[0].evaluated === true &&
+        run1.risk.evaluated === true &&
+        run1.risk.outcome === "BLOCK" &&
+        run1.risk.evaluations.length === 1 &&
+        run1.risk.evaluations[0].checks.some(
+          (c) => c.check === "policy_status" && c.status === "BLOCK",
+        ) &&
+        run1.news.status === "UNAVAILABLE",
+      JSON.stringify({ verdict: run1.verdict, risk: run1.risk.outcome, label: run1.data.label }),
+    );
+
+    check(
+      "DB-ANALYSIS-004 run record is traceable: snapshot binding, quality checks and verdict evidence recorded",
+      run1.snapshot.snapshotId === `SNAP-${run1.analysisId}` &&
+        run1.snapshot.rangeEnd > run1.snapshot.rangeStart &&
+        run1.data.qualityChecks.length > 0 &&
+        run1.verdictEvidence.length > 0 &&
+        run1.errors.some((e) => e.includes("SYNTHETIC SEED DATA")),
+    );
+
+    check("DB-ANALYSIS-005 analysis creates NO orders/authorizations/positions (execution disabled)",
+      await (async () => {
+        const counts = await t.run(async (ctx) => ({
+          orders: (await ctx.db.query("orders").collect()).length,
+          auths: (await ctx.db.query("executionAuthorizations").collect()).length,
+          positions: (await ctx.db.query("positions").collect()).length,
+        }));
+        return counts.orders === 0 && counts.auths === 0 && counts.positions === 0;
+      })(),
+    );
+
+    check("DB-ANALYSIS-006 audit event recorded (correlation id, execution-disabled note, no secrets)",
+      await (async () => {
+        const events = await t.run(async (ctx) => ctx.db.query("auditEvents").collect());
+        const ev = events.find((e) => e.action === "ANALYSIS_RUN");
+        return (
+          ev !== undefined &&
+          ev.correlationId === run1.analysisId &&
+          ev.detail.includes("execution disabled") &&
+          ev.detail.includes("verdict NO TRADE") &&
+          !JSON.stringify(events).includes("sk_live")
+        );
+      })(),
+    );
+
+    // ---- ownership + pagination ---------------------------------------
+    const foreign = await asB.query(api.analysis.get, { analysisId: run1.analysisId });
+    const own = await asA.query(api.analysis.get, { analysisId: run1.analysisId });
+    const histB = await asB.query(api.analysis.history, { paginationOpts: { numItems: 10, cursor: null } });
+    const histA = await asA.query(api.analysis.history, { paginationOpts: { numItems: 10, cursor: null } });
+    check("DB-ANALYSIS-007 records are owner-scoped: not-found == not-owned, history never crosses owners",
+      foreign === null && own !== null && histA.page.length === 1 && histB.page.length === 0);
+
+    let badPage = false;
+    try {
+      await asA.query(api.analysis.history, { paginationOpts: { numItems: 0, cursor: null } });
+    } catch (e) {
+      badPage = String(e).includes("INVALID_REQUEST");
+    }
+    let bigPage = false;
+    try {
+      await asA.query(api.analysis.history, { paginationOpts: { numItems: 500, cursor: null } });
+    } catch (e) {
+      bigPage = String(e).includes("INVALID_REQUEST");
+    }
+    check("DB-ANALYSIS-008 pagination limits are validated (1..100)", badPage && bigPage);
+
+    // 4 more runs -> 5 total; page size 2 must walk 2/2/1.
+    for (let i = 0; i < 4; i++) {
+      await asA.mutation(api.analysis.run, { marketId: "MKT-T", timeframe: "1h", horizon: "SHORT" });
+    }
+    const p1 = await asA.query(api.analysis.history, { paginationOpts: { numItems: 2, cursor: null } });
+    const p2 = await asA.query(api.analysis.history, { paginationOpts: { numItems: 2, cursor: p1.continueCursor } });
+    const p3 = await asA.query(api.analysis.history, { paginationOpts: { numItems: 2, cursor: p2.continueCursor } });
+    const ids = new Set(
+      [...p1.page, ...p2.page, ...p3.page].map((r) => r.analysisId),
+    );
+    check("DB-ANALYSIS-009 pagination walks 5 runs as 2/2/1 with distinct traceable ids",
+      p1.page.length === 2 && p2.page.length === 2 && p3.page.length === 1 &&
+      p3.isDone === true && ids.size === 5,
+      JSON.stringify({ a: p1.page.length, b: p2.page.length, c: p3.page.length, ids: ids.size }));
+
+    let badId = false;
+    try {
+      await asA.query(api.analysis.get, { analysisId: "bad id with spaces" });
+    } catch (e) {
+      badId = String(e).includes("INVALID_REQUEST");
+    }
+    check("DB-ANALYSIS-010 malformed identifiers are rejected before any lookup", badId);
+  }
+
+  // ---- analysis pipeline: WAIT path (no entry trigger) -------------------
+  {
+    const t = fresh();
+    const { userA } = await seedAnalysisWorkspace(t, "FLAT");
+    const asA = t.withIdentity({ subject: userA });
+    const run = await asA.mutation(api.analysis.run, {
+      marketId: "MKT-T",
+      timeframe: "1h",
+      horizon: "SHORT",
+    });
+    check("DB-ANALYSIS-011 no entry trigger on validated data => WAIT (never a fabricated entry)",
+      run.verdict === "WAIT" && run.status === "COMPLETED" &&
+      run.strategyResults[0].signal === "FLAT" && run.risk.evaluated === false);
+  }
+
+  // ---- analysis pipeline: failure path (missing data) --------------------
+  {
+    const t = fresh();
+    const { userA } = await seedAnalysisWorkspace(t, "SPIKE");
+    const asA = t.withIdentity({ subject: userA });
+    const run = await asA.mutation(api.analysis.run, {
+      marketId: "MKT-T",
+      timeframe: "1d",
+      horizon: "MEDIUM",
+    });
+    check("DB-ANALYSIS-012 missing market data => UNAVAILABLE label + NO TRADE + INSUFFICIENT_DATA (honest)",
+      run.data.label === "UNAVAILABLE" && run.verdict === "NO TRADE" &&
+      run.status === "INSUFFICIENT_DATA" && run.data.qualityState === "MISSING");
+
+    // Unknown market: refused before anything is written.
+    let unknown = false;
+    try {
+      await asA.mutation(api.analysis.run, { marketId: "MKT-NOPE", timeframe: "1h", horizon: "SHORT" });
+    } catch (e) {
+      unknown = String(e).includes("INVALID_REQUEST");
+    }
+    check("DB-ANALYSIS-013 unknown market is refused with no record written", unknown);
+  }
+
+  // ---- chart queries: instrument/timeframe specific, bounded ------------
+  {
+    const t = fresh();
+    const { userA } = await seedAnalysisWorkspace(t, "FLAT");
+    const asA = t.withIdentity({ subject: userA });
+    const now = Date.now();
+    // Provider-sourced bars (fresh) + synthetic bars + a forming bar + a
+    // second timeframe + a second market: the query must never mix any of it.
+    await t.run(async (ctx) => {
+      for (let i = 0; i < 5; i++) {
+        await ctx.db.insert("candles", {
+          marketId: "MKT-T",
+          symbol: "BTC/USD",
+          assetClass: "CRYPTO",
+          venue: "KRAKEN",
+          timeframe: "4h",
+          eventTime: now - (5 - i) * 4 * HOUR,
+          open: 100,
+          high: 101,
+          low: 99,
+          close: 100,
+          volume: 1,
+          source: "KRAKEN",
+          providerTimestamp: now - (5 - i) * 4 * HOUR,
+          receivedTime: now - 10 * 60_000,
+          availabilityTime: now - (5 - i) * 4 * HOUR + 4 * HOUR,
+          qualityStatus: "VALID",
+        });
+      }
+      await ctx.db.insert("candles", {
+        marketId: "MKT-T",
+        symbol: "BTC/USD",
+        assetClass: "CRYPTO",
+        venue: "KRAKEN",
+        timeframe: "4h",
+        eventTime: now - 30 * 60_000,
+        open: 100,
+        high: 101,
+        low: 99,
+        close: 100,
+        volume: 1,
+        source: "KRAKEN",
+        providerTimestamp: now - 30 * 60_000,
+        receivedTime: now - 5 * 60_000,
+        availabilityTime: now - 30 * 60_000 + 4 * HOUR,
+        qualityStatus: "INCOMPLETE", // still forming — never in the series
+      });
+      await ctx.db.insert("markets", {
+        marketId: "MKT-T2",
+        symbol: "ETH/USD",
+        assetClass: "CRYPTO",
+        venue: "SIM-VENUE",
+        provider: "SIMULATED",
+        baseAsset: "ETH",
+        quoteAsset: "USD",
+        timezone: "UTC",
+        status: "OPEN",
+        providerState: "AVAILABLE",
+      });
+      await ctx.db.insert("candles", {
+        marketId: "MKT-T2",
+        symbol: "ETH/USD",
+        assetClass: "CRYPTO",
+        venue: "SIM-VENUE",
+        timeframe: "4h",
+        eventTime: now - 4 * HOUR,
+        open: 5,
+        high: 6,
+        low: 4,
+        close: 5,
+        volume: 1,
+        source: "SIMULATED",
+        providerTimestamp: now - 4 * HOUR,
+        receivedTime: now - 4 * HOUR,
+        availabilityTime: now,
+        qualityStatus: "VALID",
+      });
+    });
+
+    const chart = await asA.query(api.marketData.candles, {
+      marketId: "MKT-T",
+      timeframe: "4h",
+      limit: 10,
+    });
+    check("DB-CHART-001 instrument+timeframe query returns only that series, CACHED (never LIVE/SIMULATED), excludes forming bars",
+      chart.status === "OK" && chart.symbol === "BTC/USD" && chart.timeframe === "4h" &&
+      chart.label === "CACHED" && chart.partialBars === 1 &&
+      chart.bars.length === 5 &&
+      chart.bars.every((b) => b.source === "KRAKEN") &&
+      chart.bars.every((b, i, arr) => i === 0 || arr[i - 1].t < b.t),
+      JSON.stringify({ label: chart.label, bars: chart.bars.length, partial: chart.partialBars }));
+
+    const limited = await asA.query(api.marketData.candles, {
+      marketId: "MKT-T",
+      timeframe: "4h",
+      limit: 3,
+    });
+    const ranged = await asA.query(api.marketData.candles, {
+      marketId: "MKT-T",
+      timeframe: "4h",
+      startTime: now - 2 * 4 * HOUR,
+      endTime: now,
+      limit: 50,
+    });
+    // The `limit`-derived window is anchored at query time, so the oldest bar
+    // may sit on the moving boundary: assert the real invariants — never more
+    // than `limit` bars, recent bars always present, range honored strictly.
+    check("DB-CHART-002 result count and date range are bounded and honored",
+      limited.bars.length <= 3 && limited.bars.length >= 2 &&
+      ranged.bars.length <= 2 && ranged.bars.length >= 1 &&
+      ranged.bars.every((b) => b.t >= now - 2 * 4 * HOUR && b.t <= now),
+      JSON.stringify({ limited: limited.bars.length, ranged: ranged.bars.length }));
+
+    const empty = await asA.query(api.marketData.candles, {
+      marketId: "MKT-T",
+      timeframe: "1m",
+      limit: 10,
+    });
+    check("DB-CHART-003 empty instrument/timeframe is an honest EMPTY/UNAVAILABLE state (no filler candles)",
+      empty.status === "EMPTY" && empty.label === "UNAVAILABLE" && empty.bars.length === 0);
+
+    let badLimit = false;
+    try {
+      await asA.query(api.marketData.candles, { marketId: "MKT-T", timeframe: "4h", limit: 9999 });
+    } catch (e) {
+      badLimit = String(e).includes("INVALID_REQUEST");
+    }
+    let badTf2 = false;
+    try {
+      await asA.query(api.marketData.candles, { marketId: "MKT-T", timeframe: "7m" });
+    } catch (e) {
+      badTf2 = String(e).includes("INVALID_REQUEST");
+    }
+    check("DB-CHART-004 chart query validates limit and timeframe", badLimit && badTf2);
+
+    // Provider health via the real internal mutation.
+    await t.mutation(internal.marketData.recordHealth, {
+      provider: "KRAKEN",
+      kind: "MARKET_DATA",
+      assetClass: "CRYPTO",
+      ok: true,
+      note: "verified test fetch",
+      latencyMs: 42,
+      at: now,
+    });
+    await t.mutation(internal.marketData.recordHealth, {
+      provider: "KRAKEN",
+      kind: "MARKET_DATA",
+      assetClass: "CRYPTO",
+      ok: false,
+      failureClass: "NETWORK_ERROR",
+      note: "down",
+      at: now + 1,
+    });
+    const health = await asA.query(api.marketData.health, {});
+    const kraken = health.find((h) => h.provider === "KRAKEN");
+    check("DB-HEALTH-001 provider health tracks success/failure transitions honestly",
+      kraken !== undefined && kraken.status === "DEGRADED" &&
+      kraken.failureClass === "NETWORK_ERROR" && kraken.consecutiveFailures === 1 &&
+      kraken.lastSuccessAt !== null && kraken.lastFailureAt !== null);
+  }
+
+  // ---- news persistence + selection -------------------------------------
+  {
+    const t = fresh();
+    const { userA } = await seedAnalysisWorkspace(t, "FLAT");
+    const asA = t.withIdentity({ subject: userA });
+    const now = Date.now();
+    const base = {
+      provider: "YAHOO_FINANCE_RSS",
+      sourceName: "example.com",
+      sourceUrl: "https://example.com/a",
+      headline: "Fed signals rate decision surprise",
+      summary: "FOMC cites inflation",
+      publishedAt: now - 2 * HOUR,
+      retrievedAt: now,
+      instruments: ["BTC/USD"],
+      currencies: ["BTC", "USD"],
+      assets: ["BTC"],
+      impact: "HIGH" as const,
+      impactEvidence: ["HIGH:rate decision"],
+      relevanceScore: 2,
+      contentHash: "sha256:aaaa",
+      freshness: "FRESH",
+    };
+    const res = await t.mutation(internal.news.persist, {
+      marketId: "MKT-T",
+      items: [base, { ...base }, { ...base, contentHash: "sha256:bbbb", sourceUrl: "https://example.com/b", headline: "quiet" }],
+    });
+    check("DB-NEWS-001 news persistence deduplicates by content hash", res.inserted === 2 && res.duplicates === 1);
+
+    const latest = await asA.query(api.news.latest, { marketId: "MKT-T", limit: 10 });
+    check("DB-NEWS-002 news read is bounded, market-scoped, carries source URLs and impact evidence",
+      latest.length === 2 && latest.every((n) => n.sourceUrl.startsWith("https://")) &&
+      latest.some((n) => n.impact === "HIGH" && n.impactEvidence.length > 0));
+
+    const top = await asA.query(api.news.topImpact, { marketId: "MKT-T" });
+    check("DB-NEWS-003 high-impact selection returns the evidence-backed item",
+      top.selected !== null && top.selected.impact === "HIGH" && top.reason.includes("HIGH"));
+
+    const topNone = await asA.query(api.news.topImpact, { marketId: "MKT-T2" });
+    check("DB-NEWS-004 no news for a market discloses the limitation (null + reason, never invented)",
+      topNone.selected === null && topNone.reason.includes("NO_RELIABLE_NEWS"));
+
+    let badNewsLimit = false;
+    try {
+      await asA.query(api.news.latest, { marketId: "MKT-T", limit: 0 });
+    } catch (e) {
+      badNewsLimit = String(e).includes("INVALID_REQUEST");
+    }
+    check("DB-NEWS-005 news query limit is validated", badNewsLimit);
+  }
+
+  // ---- user preferences: validation + ownership --------------------------
+  {
+    const t = fresh();
+    const { userA, userB } = await seedAnalysisWorkspace(t, "FLAT");
+    const asA = t.withIdentity({ subject: userA });
+    const asB = t.withIdentity({ subject: userB });
+
+    const before = await asA.query(api.preferences.get, {});
+    check("DB-PREF-001 missing preferences return safe defaults with an explicit reason",
+      before.saved === null && before.reason === "NO_SAVED_PREFERENCES" && before.defaults !== null);
+
+    const saved = await asA.mutation(api.preferences.save, {
+      marketId: "MKT-T",
+      timeframe: "4h",
+      horizon: "MEDIUM",
+      notifications: { analysisComplete: true, riskBlocked: true, providerFailure: true, highImpactNews: false },
+    });
+    const after = await asA.query(api.preferences.get, {});
+    check("DB-PREF-002 save/get roundtrip persists validated settings; symbol is server-derived",
+      saved.ok === true && after.saved !== null && after.saved.symbol === "BTC/USD" &&
+      after.saved.timeframe === "4h" && after.saved.horizon === "MEDIUM" &&
+      after.saved.notifications.highImpactNews === false);
+
+    const forB = await asB.query(api.preferences.get, {});
+    check("DB-PREF-003 preferences are owner-scoped (one user never sees another's)",
+      forB.saved === null);
+
+    let badTf = false;
+    try {
+      await asA.mutation(api.preferences.save, {
+        marketId: "MKT-T", timeframe: "3h", horizon: "SHORT",
+        notifications: { analysisComplete: true, riskBlocked: true, providerFailure: true, highImpactNews: false },
+      });
+    } catch (e) {
+      badTf = String(e).includes("INVALID_REQUEST");
+    }
+    let badMarket = false;
+    try {
+      await asA.mutation(api.preferences.save, {
+        marketId: "MKT-NOPE", timeframe: "1h", horizon: "SHORT",
+        notifications: { analysisComplete: true, riskBlocked: true, providerFailure: true, highImpactNews: false },
+      });
+    } catch (e) {
+      badMarket = String(e).includes("INVALID_REQUEST");
+    }
+    check("DB-PREF-004 invalid timeframe/market are rejected server-side", badTf && badMarket);
+
+    // Corrupt stored row (simulating an out-of-range legacy value): must be
+    // reported invalid, never silently used.
+    await t.run(async (ctx) => {
+      const rows = await ctx.db.query("userPreferences").collect();
+      await ctx.db.replace(rows[0]._id, { ...rows[0], timeframe: "3h" });
+    });
+    const invalid = await asA.query(api.preferences.get, {});
+    check("DB-PREF-005 invalid stored settings are reported and replaced by defaults (safe fallback)",
+      invalid.saved === null && (invalid.reason ?? "").includes("SAVED_PREFERENCES_INVALID") &&
+      invalid.defaults !== null);
+  }
+
+  // ---- credential secrecy over the whole new surface ---------------------
+  {
+    const t = fresh();
+    const { userA } = await seedAnalysisWorkspace(t, "SPIKE");
+    const asA = t.withIdentity({ subject: userA });
+    await asA.mutation(api.analysis.run, { marketId: "MKT-T", timeframe: "1h", horizon: "SHORT" });
+    await t.mutation(internal.marketData.recordHealth, {
+      provider: "ECB-RATES",
+      kind: "MARKET_DATA",
+      assetClass: "FOREX",
+      ok: false,
+      failureClass: "NOT_CONFIGURED",
+      note: "no keyed FX provider configured; close-only ECB feed only",
+      at: Date.now(),
+    });
+    const dump = await t.run(async (ctx) => JSON.stringify({
+      runs: await ctx.db.query("analysisRuns").collect(),
+      health: await ctx.db.query("providerHealth").collect(),
+      audit: await ctx.db.query("auditEvents").collect(),
+      news: await ctx.db.query("newsItems").collect(),
+      prefs: await ctx.db.query("userPreferences").collect(),
+    }));
+    check("DB-SEC-001 no secret material appears in any new row (runs, health, audit, news, prefs)",
+      !dump.includes("sk_live") && !dump.includes("api_key") && !dump.includes("Bearer ") &&
+      !dump.includes("secret"));
+  }
+}
+
+await backendRepairBattery();
 
 console.log(`\n${pass} passed, ${fail} failed`);
 if (fail > 0) process.exit(1);

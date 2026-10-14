@@ -20,6 +20,7 @@
  */
 
 import { getAuthUserId } from "@convex-dev/auth/server";
+import { v } from "convex/values";
 import { query, QueryCtx } from "./_generated/server";
 import { verifyAuditChain, AuditRecord } from "./lib/audit";
 import { canViewRecord } from "./lib/authz";
@@ -130,35 +131,50 @@ export const overview = query({
 });
 
 export const data = query({
-  args: {},
-  handler: async (ctx) => {
+  args: {
+    timeframe: v.optional(v.string()),
+  },
+  handler: async (ctx, args) => {
     await requireUser(ctx);
     const markets = await ctx.db.query("markets").take(50);
     const quality = await ctx.db.query("dataQualityReports").take(50);
     const snapshots = await ctx.db.query("dataSnapshots").take(20);
-    const candles = await ctx.db.query("candles").take(2000);
+    // INSTRUMENT-SPECIFIC, TIMEFRAME-SPECIFIC bounded reads via the
+    // by_market_tf_time index — the previous global candles.take(2000) scan
+    // mixed every market into one window and is gone.
+    const timeframe = args.timeframe ?? "1h";
+    const series = [];
+    for (const m of markets) {
+      const rows = await ctx.db
+        .query("candles")
+        .withIndex("by_market_tf_time", (q) =>
+          q.eq("marketId", m.marketId).eq("timeframe", timeframe),
+        )
+        .order("desc")
+        .take(120);
+      const complete = rows.filter((c) => c.qualityStatus !== "INCOMPLETE").reverse();
+      series.push({
+        marketId: m.marketId,
+        symbol: m.symbol,
+        timeframe,
+        // Honest state: an instrument without bars yields an empty series —
+        // never generated filler candles.
+        points: complete.map((c) => ({
+          t: c.eventTime,
+          open: c.open,
+          high: c.high,
+          low: c.low,
+          close: c.close,
+          volume: c.volume,
+        })),
+      });
+    }
 
     return {
       markets,
       quality,
       snapshots,
-      series: markets.map((m) => ({
-        marketId: m.marketId,
-        symbol: m.symbol,
-        timeframe: candles.find((c) => c.marketId === m.marketId)?.timeframe ?? null,
-        points: candles
-          .filter((c) => c.marketId === m.marketId)
-          .sort((a, b) => a.eventTime - b.eventTime)
-          .slice(-120)
-          .map((c) => ({
-            t: c.eventTime,
-            open: c.open,
-            high: c.high,
-            low: c.low,
-            close: c.close,
-            volume: c.volume,
-          })),
-      })),
+      series,
     };
   },
 });

@@ -142,6 +142,27 @@ export const monitoringStateValidator = v.union(
   v.literal("FAILING"),
 );
 
+export const dataLabelValidator = v.union(
+  v.literal("LIVE"),
+  v.literal("CACHED"),
+  v.literal("STALE"),
+  v.literal("SIMULATED"),
+  v.literal("UNAVAILABLE"),
+);
+
+export const newsImpactValidator = v.union(
+  v.literal("HIGH"),
+  v.literal("MEDIUM"),
+  v.literal("UNKNOWN"),
+);
+
+export const analysisVerdictValidator = v.union(
+  v.literal("BUY"),
+  v.literal("SELL"),
+  v.literal("WAIT"),
+  v.literal("NO TRADE"),
+);
+
 export const failureClassValidator = v.union(
   v.literal("DATA_FAILURE"),
   v.literal("STRATEGY_FAILURE"),
@@ -575,6 +596,185 @@ const schema = defineSchema(
     })
       .index("by_connectionId", ["connectionId"])
       .index("by_userId", ["userId"]),
+
+    // -----------------------------------------------------------------------
+    // ANALYSIS RUNS (Section 04 backend repair) — one traceable record per
+    // authenticated analysis pipeline execution. Owner-scoped: the owner is
+    // ALWAYS server-derived from the auth identity, never client-supplied.
+    // -----------------------------------------------------------------------
+    analysisRuns: defineTable({
+      analysisId: v.string(),
+      ownerUserId: v.string(),
+      request: v.object({
+        marketId: v.string(),
+        symbol: v.string(),
+        timeframe: v.string(),
+        horizon: v.string(),
+        requestedAt: v.number(),
+      }),
+      data: v.object({
+        label: dataLabelValidator,
+        labelReason: v.string(),
+        origin: v.string(),
+        provider: v.string(),
+        barCount: v.number(),
+        lastBarEventTime: v.optional(v.number()),
+        freshnessAgeMs: v.optional(v.number()),
+        qualityState: dataQualityStateValidator,
+        qualityChecks: v.array(
+          v.object({
+            check: v.string(),
+            status: checkStatusValidator,
+            detail: v.string(),
+            count: v.number(),
+          }),
+        ),
+      }),
+      snapshot: v.object({
+        snapshotId: v.string(),
+        timeframe: v.string(),
+        rangeStart: v.number(),
+        rangeEnd: v.number(),
+        dataVersion: v.string(),
+        revision: v.number(),
+      }),
+      news: v.object({
+        status: v.union(v.literal("SELECTED"), v.literal("UNAVAILABLE")),
+        reason: v.string(),
+        newsId: v.optional(v.string()),
+        provider: v.optional(v.string()),
+        sourceName: v.optional(v.string()),
+        sourceUrl: v.optional(v.string()),
+        headline: v.optional(v.string()),
+        publishedAt: v.optional(v.number()),
+        retrievedAt: v.optional(v.number()),
+        impact: v.optional(newsImpactValidator),
+        impactEvidence: v.array(v.string()),
+      }),
+      strategyResults: v.array(
+        v.object({
+          strategyId: v.string(),
+          strategyVersionId: v.string(),
+          strategyName: v.string(),
+          evaluated: v.boolean(),
+          signal: v.string(),
+          reason: v.string(),
+          evidence: v.any(),
+        }),
+      ),
+      risk: v.object({
+        evaluated: v.boolean(),
+        outcome: v.string(),
+        policyRef: v.string(),
+        note: v.string(),
+        evaluations: v.array(
+          v.object({
+            strategyVersionId: v.string(),
+            side: v.string(),
+            outcome: v.string(),
+            checks: v.array(
+              v.object({ check: v.string(), status: v.string(), detail: v.string() }),
+            ),
+          }),
+        ),
+      }),
+      verdict: analysisVerdictValidator,
+      verdictEvidence: v.array(v.string()),
+      status: v.union(
+        v.literal("COMPLETED"),
+        v.literal("BLOCKED"),
+        v.literal("INSUFFICIENT_DATA"),
+        v.literal("FAILED"),
+      ),
+      errors: v.array(v.string()),
+      startedAt: v.number(),
+      completedAt: v.number(),
+    })
+      .index("by_analysisId", ["analysisId"])
+      .index("by_owner_started", ["ownerUserId", "startedAt"]),
+
+    // -----------------------------------------------------------------------
+    // MARKET NEWS (Section 06) — provider items with source URL, publication
+    // and retrieval timestamps, impact evidence and duplicate detection.
+    // -----------------------------------------------------------------------
+    newsItems: defineTable({
+      newsId: v.string(),
+      provider: v.string(),
+      sourceName: v.string(),
+      sourceUrl: v.string(),
+      headline: v.string(),
+      summary: v.string(),
+      publishedAt: v.optional(v.number()),
+      retrievedAt: v.number(),
+      marketId: v.string(),
+      instruments: v.array(v.string()),
+      currencies: v.array(v.string()),
+      assets: v.array(v.string()),
+      impact: newsImpactValidator,
+      impactEvidence: v.array(v.string()),
+      relevanceScore: v.number(),
+      contentHash: v.string(),
+      freshness: v.string(),
+    })
+      .index("by_contentHash", ["contentHash"])
+      .index("by_market_retrieved", ["marketId", "retrievedAt"]),
+
+    // -----------------------------------------------------------------------
+    // PROVIDER HEALTH — request outcomes, failures, rate limits, freshness.
+    // Status is derived from real request results only; a provider is never
+    // claimed connected without a verified response.
+    // -----------------------------------------------------------------------
+    providerHealth: defineTable({
+      provider: v.string(),
+      kind: v.union(v.literal("MARKET_DATA"), v.literal("NEWS")),
+      assetClass: v.optional(assetClassValidator),
+      status: providerStateValidator,
+      failureClass: v.optional(v.string()),
+      consecutiveFailures: v.number(),
+      lastSuccessAt: v.optional(v.number()),
+      lastFailureAt: v.optional(v.number()),
+      rateLimitUntil: v.optional(v.number()),
+      lastLatencyMs: v.optional(v.number()),
+      note: v.string(),
+      updatedAt: v.number(),
+    }).index("by_provider", ["provider"]),
+
+    // -----------------------------------------------------------------------
+    // FX RATE OBSERVATIONS — ECB daily reference fixes via Frankfurter.
+    // Close-ONLY by nature; deliberately NOT stored as candles (no synthetic
+    // OHLC is ever derived from a single published fix).
+    // -----------------------------------------------------------------------
+    rateObservations: defineTable({
+      marketId: v.string(),
+      symbol: v.string(),
+      base: v.string(),
+      quote: v.string(),
+      rate: v.number(),
+      rateDate: v.string(),
+      provider: v.string(),
+      sourceUrl: v.string(),
+      retrievedAt: v.number(),
+      labelNote: v.string(),
+    }).index("by_market_date", ["marketId", "rateDate"]),
+
+    // -----------------------------------------------------------------------
+    // USER PREFERENCES — server-validated market/instrument/timeframe/horizon
+    // and notification preferences. Owner-scoped (by_userId).
+    // -----------------------------------------------------------------------
+    userPreferences: defineTable({
+      userId: v.string(),
+      marketId: v.string(),
+      symbol: v.string(),
+      timeframe: v.string(),
+      horizon: v.string(),
+      notifications: v.object({
+        analysisComplete: v.boolean(),
+        riskBlocked: v.boolean(),
+        providerFailure: v.boolean(),
+        highImpactNews: v.boolean(),
+      }),
+      updatedAt: v.number(),
+    }).index("by_userId", ["userId"]),
 
     // -----------------------------------------------------------------------
     // SYSTEM STATE — mode, kill switch, controlled-live gates (Section 30)
