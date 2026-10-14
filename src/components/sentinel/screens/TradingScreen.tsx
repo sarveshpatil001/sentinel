@@ -46,7 +46,7 @@ export default function TradingScreen() {
 
         <GlassCard hero radius={16} className="min-h-[106px] px-4 pb-4 pt-[14px]">
           <div className="flex items-center justify-between">
-            <MicroLabel>SIMULATED MID-PRICE (DEMO DATA)</MicroLabel>
+            <MicroLabel>INSTITUTIONAL MID-PRICE (SIMULATED DEMO DATA)</MicroLabel>
             <span className="flex h-5 items-center rounded-[6px] bg-[#04231B] px-[10px] text-[11px] font-bold text-sp-cyan tabular-nums">
               +0.18% 24h
             </span>
