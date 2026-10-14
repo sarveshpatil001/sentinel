@@ -144,11 +144,19 @@ export const data = query({
       series: markets.map((m) => ({
         marketId: m.marketId,
         symbol: m.symbol,
+        timeframe: candles.find((c) => c.marketId === m.marketId)?.timeframe ?? null,
         points: candles
           .filter((c) => c.marketId === m.marketId)
           .sort((a, b) => a.eventTime - b.eventTime)
           .slice(-120)
-          .map((c) => ({ t: c.eventTime, close: c.close })),
+          .map((c) => ({
+            t: c.eventTime,
+            open: c.open,
+            high: c.high,
+            low: c.low,
+            close: c.close,
+            volume: c.volume,
+          })),
       })),
     };
   },
