@@ -1,8 +1,9 @@
+@import url("https://fonts.googleapis.com/css2?family=DM+Sans:opsz,wght@9..40,400..900&display=swap");
 @import "tailwindcss";
 @import "tw-animate-css";
 @custom-variant dark (&:is(.dark *));
 
-/* Framework compatibility only. No product theme or replacement design. */
+/* Framework compatibility token names retained for Tailwind v4 and platform tooling. */
 @theme inline {
   --radius-sm: calc(var(--radius) - 4px);
   --radius-md: calc(var(--radius) - 2px);
@@ -40,65 +41,84 @@
   --color-sidebar-accent-foreground: var(--sidebar-accent-foreground);
   --color-sidebar-border: var(--sidebar-border);
   --color-sidebar-ring: var(--sidebar-ring);
-  --font-sans: system-ui, sans-serif;
+  --font-sans: "DM Sans", ui-sans-serif, system-ui, sans-serif;
   --font-mono: ui-monospace, monospace;
+}
+
+/* Sentinel Prime palette (institutional analysis workspace, demo build). */
+@theme {
+  --color-sp-canvas: #050912;
+  --color-sp-glass: #0F1726;
+  --color-sp-glass-deep: #090F1A;
+  --color-sp-raised: #0B1322;
+  --color-sp-line: #162338;
+  --color-sp-line-hero: #1E2F48;
+  --color-sp-chip: #19273D;
+  --color-sp-cyan: #00E5C9;
+  --color-sp-amber: #FF9800;
+  --color-sp-red: #FF5252;
+  --color-sp-text: #FFFFFF;
+  --color-sp-soft: #C5D3E3;
+  --color-sp-muted: #6B809B;
+  --color-sp-muted-2: #8C9EB5;
+  --color-sp-status: #F0F6FC;
 }
 
 :root, .dark {
   --radius: 0.5rem;
-  --background: #ffffff;
-  --foreground: #171717;
-  --card: #ffffff;
-  --card-foreground: #171717;
-  --popover: #ffffff;
-  --popover-foreground: #171717;
-  --primary: #171717;
-  --primary-foreground: #ffffff;
-  --secondary: #f5f5f5;
-  --secondary-foreground: #171717;
-  --muted: #f5f5f5;
-  --muted-foreground: #525252;
-  --accent: #f5f5f5;
-  --accent-foreground: #171717;
-  --destructive: #171717;
-  --destructive-foreground: #ffffff;
-  --border: #a3a3a3;
-  --input: #a3a3a3;
-  --ring: #171717;
-  --chart-1: #171717;
-  --chart-2: #404040;
-  --chart-3: #525252;
-  --chart-4: #737373;
-  --chart-5: #a3a3a3;
-  --sidebar: #ffffff;
-  --sidebar-foreground: #171717;
-  --sidebar-primary: #171717;
-  --sidebar-primary-foreground: #ffffff;
-  --sidebar-accent: #f5f5f5;
-  --sidebar-accent-foreground: #171717;
-  --sidebar-border: #a3a3a3;
-  --sidebar-ring: #171717;
+  --background: #050912;
+  --foreground: #FFFFFF;
+  --card: #0B1322;
+  --card-foreground: #FFFFFF;
+  --popover: #0B1322;
+  --popover-foreground: #FFFFFF;
+  --primary: #00E5C9;
+  --primary-foreground: #050912;
+  --secondary: #0F1726;
+  --secondary-foreground: #C5D3E3;
+  --muted: #0B1322;
+  --muted-foreground: #6B809B;
+  --accent: #0F1726;
+  --accent-foreground: #00E5C9;
+  --destructive: #FF5252;
+  --destructive-foreground: #FFFFFF;
+  --border: #162338;
+  --input: #162338;
+  --ring: #00E5C9;
+  --chart-1: #00E5C9;
+  --chart-2: #FFC107;
+  --chart-3: #FF9800;
+  --chart-4: #FF5252;
+  --chart-5: #6B809B;
+  --sidebar: #0B1322;
+  --sidebar-foreground: #FFFFFF;
+  --sidebar-primary: #00E5C9;
+  --sidebar-primary-foreground: #050912;
+  --sidebar-accent: #0F1726;
+  --sidebar-accent-foreground: #C5D3E3;
+  --sidebar-border: #162338;
+  --sidebar-ring: #00E5C9;
 }
 
 @layer base {
   * { @apply border-border outline-ring/50; }
+  html { background-color: #050912; }
   body { @apply bg-background text-foreground font-sans; min-height: 100vh; }
   button:not([disabled]), [role="button"]:not([disabled]) { cursor: pointer; }
 }
 
-/* Restore native document readability after Tailwind's preflight reset.
-   Scoped to the temporary product, not the platform toolbar. */
-main { margin: 1rem; }
-main h1 { font-size: 1.5rem; font-weight: bold; margin-block: 1rem; }
-main h2 { font-size: 1.25rem; font-weight: bold; margin-block: 1rem; }
-main h3, main legend { font-weight: bold; }
-main p, main section, main details, main form { margin-block: 1rem; }
-main ul { list-style: disc; padding-inline-start: 1.5rem; }
-main a { text-decoration: underline; }
-main label { display: block; margin-block: 0.5rem; }
-main input, main select, main button { border: 1px solid; padding: 0.25rem 0.5rem; margin: 0.25rem; max-width: 100%; }
-main fieldset { border: 1px solid; padding: 0.5rem; min-width: 0; }
-main :disabled { opacity: 0.6; cursor: not-allowed; }
-main :focus-visible { outline: 2px solid; outline-offset: 2px; }
-main summary { cursor: pointer; text-decoration: underline; }
-main pre { white-space: pre-wrap; overflow-wrap: anywhere; font-family: ui-monospace, monospace; }
+/* Native document readability after Tailwind's preflight reset.
+   Scoped to the engineering data console, not the product screens. */
+.sp-console { margin-block: 1.5rem; }
+.sp-console h2 { font-size: 1.15rem; font-weight: bold; margin-block: 1rem; }
+.sp-console h3, .sp-console legend { font-weight: bold; }
+.sp-console p, .sp-console section, .sp-console details, .sp-console form { margin-block: 0.75rem; }
+.sp-console ul { list-style: disc; padding-inline-start: 1.5rem; }
+.sp-console a { text-decoration: underline; }
+.sp-console label { display: block; margin-block: 0.5rem; }
+.sp-console input, .sp-console select, .sp-console button { border: 1px solid; padding: 0.25rem 0.5rem; margin: 0.25rem; max-width: 100%; }
+.sp-console fieldset { border: 1px solid; padding: 0.5rem; min-width: 0; }
+.sp-console :disabled { opacity: 0.6; cursor: not-allowed; }
+.sp-console :focus-visible { outline: 2px solid; outline-offset: 2px; }
+.sp-console summary { cursor: pointer; }
+.sp-console pre { white-space: pre-wrap; overflow-wrap: anywhere; font-family: ui-monospace, monospace; }

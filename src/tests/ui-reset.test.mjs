@@ -62,14 +62,26 @@ function render(Component, path = "/") {
   return renderToStaticMarkup(createElement(MemoryRouter, { initialEntries: [path] }, createElement(Component, {})));
 }
 
+// [route, page title, design content, safety/trust label, existing data interface]
+const screens = [
+  ["/dashboard", "EUR/USD Workspace", "Run Market Analysis", "Simulated tick feed", "System state"],
+  ["/trading", "Trading Desk", "INSTITUTIONAL MID-PRICE", "Direct broker execution disabled", "Submit an authorized order"],
+  ["/charts", "Price Structure", "Model Supply Ceiling", "Illustrative", "Reproducible snapshots"],
+  ["/analysis", "Market Signals", "Consensus Evidence", "Automated execution disabled", "Create candidate"],
+  ["/history", "Analysis Archive", "Export CSV Log", "Aborted by Risk Manager", "Audit history"],
+  ["/settings", "Preferences", "Automated order execution is strictly disabled", "Locked to Demo", "Register connection"],
+];
+const routes = screens.map(([path]) => path);
+
 test("obsolete exclusive modules and logos are deleted", () => {
   for (const path of removed) expect(existsSync(resolve(root, path))).toBe(false);
 });
 
-test("every product entry and console panel is neutral and has no old imports/modes", () => {
-  const paths = ["src/main.tsx", "src/components/RequireAuth.tsx", ...readdirSync(resolve(root, "src/pages")).map((file) => `src/pages/${file}`), ...readdirSync(resolve(root, "src/components/console")).map((file) => `src/components/console/${file}`)];
+test("product surfaces keep deleted-design markers, inline style overrides, and UI-kit imports out", () => {
+  const sources = (dir) => readdirSync(resolve(root, dir)).filter((file) => /\.(ts|tsx)$/.test(file)).map((file) => `${dir}/${file}`);
+  const paths = ["src/main.tsx", "src/components/RequireAuth.tsx", ...sources("src/pages"), ...sources("src/components/console"), ...sources("src/components/sentinel"), ...sources("src/components/sentinel/screens")];
   for (const path of paths) {
-    expect(read(path)).not.toMatch(/className=|style=|lucide-react|framer-motion|ThemeToggle|ViewMode|isSimple|proOnly|sp-theme|sp-view-mode|assets\/logo|components\/ui\//);
+    expect(read(path)).not.toMatch(/style=|lucide-react|framer-motion|ThemeToggle|ViewMode|isSimple|proOnly|sp-theme|sp-view-mode|assets\/logo|components\/ui\//);
   }
 });
 
@@ -79,7 +91,7 @@ test("entry retains global CSS, providers, protected six-screen routes, and auth
   expect(main).toContain("<ConvexAuthProvider client={convex}>");
   expect(main).toContain("<RequireAuth redirectImmediately><Dashboard /></RequireAuth>");
   expect(main).toContain('redirectAfterAuth="/dashboard"');
-  for (const route of ["/dashboard", "/trading", "/charts", "/analysis", "/history", "/settings"]) expect(main).toContain(`"${route}"`);
+  for (const route of routes) expect(main).toContain(`"${route}"`);
 });
 
 test("old palette/fonts/bootstrap/manifest icons are gone; framework foundation remains", () => {
@@ -88,35 +100,60 @@ test("old palette/fonts/bootstrap/manifest icons are gone; framework foundation 
   const css = read("src/index.css");
   expect(css).toContain('@import "tailwindcss"');
   expect(css).toContain("--color-background: var(--background)");
+  expect(css).toContain('"DM Sans"');
   expect(css).not.toMatch(/Poppins|Roboto|#ffc0cb|#87ceeb|#ffff00|#3b82f6|gradient|box-shadow/);
   const manifest = JSON.parse(read("public/manifest.webmanifest"));
   expect(manifest.icons).toBeUndefined();
   expect(manifest.theme_color).toBeUndefined();
 });
 
-test("every neutral screen renders its native controls and existing data interface", () => {
-  for (const [path, title, content] of [
-    ["/dashboard", "Dashboard", "System state"], ["/trading", "Trading", "Submit an authorized order"],
-    ["/charts", "Charts", "Reproducible snapshots"], ["/analysis", "Analysis", "Create candidate"],
-    ["/history", "History", "Audit history"], ["/settings", "Settings", "Register connection"],
-  ]) {
+test("every screen renders its design architecture and the existing data interface", () => {
+  for (const [path, title, content, safety, data] of screens) {
     const html = render(Dashboard, path);
-    expect(html).toContain(`<h1>${title}</h1>`);
+    expect(html).toMatch(new RegExp(`<h1[^>]*>${title}</h1>`));
     expect(html).toContain(content);
-    expect(html).not.toMatch(/class=|style=|<svg/);
-    for (const route of ["/dashboard", "/trading", "/charts", "/analysis", "/history", "/settings"]) expect(html).toContain(`href="${route}"`);
+    expect(html).toContain(safety);
+    expect(html).toContain(data);
+    expect(html).toContain("Demo");
+    expect(html).not.toMatch(/style=/);
+    for (const route of routes) expect(html).toContain(`href="${route}"`);
   }
   expect(mutationCalls).toBe(0);
 });
 
+test("BUY/WAIT/SELL stance cluster exists only on market signals and records no execution", () => {
+  for (const [path] of routes.map((p) => [p])) {
+    const html = render(Dashboard, path[0]);
+    const clusters = html.match(/data-decision-cluster/g)?.length ?? 0;
+    if (path[0] === "/analysis") {
+      expect(clusters).toBe(1);
+      expect(html).toContain("BUY");
+      expect(html).toContain("WAIT");
+      expect(html).toContain("SELL");
+      expect(html).toContain("Informational analysis only");
+    } else {
+      expect(clusters).toBe(0);
+    }
+  }
+  expect(mutationCalls).toBe(0);
+});
+
+test("six-tab bottom navigation highlights only the current tab", () => {
+  for (const path of routes) {
+    const html = render(Dashboard, path);
+    expect(html.match(/aria-current="page"/g)?.length ?? 0).toBe(1);
+    expect(html).toMatch(new RegExp(`<a[^>]*aria-current="page"[^>]*href="${path}"`));
+  }
+});
+
 test("router-accepted trailing slash and mixed-case URLs show the requested screen", () => {
   for (const [path, route, title] of [
-    ["/charts/", "/charts", "Charts"], ["/CHARTS", "/charts", "Charts"],
-    ["/trading/", "/trading", "Trading"], ["/Settings/", "/settings", "Settings"],
+    ["/charts/", "/charts", "Price Structure"], ["/CHARTS", "/charts", "Price Structure"],
+    ["/trading/", "/trading", "Trading Desk"], ["/Settings/", "/settings", "Preferences"],
   ]) {
     const html = renderToStaticMarkup(createElement(MemoryRouter, { initialEntries: [path] },
       createElement(Routes, {}, createElement(Route, { path: route, element: createElement(RequireAuth, { children: createElement(Dashboard) }) }))));
-    expect(html).toContain(`<h1>${title}</h1>`);
+    expect(html).toMatch(new RegExp(`<h1[^>]*>${title}</h1>`));
     expect(html).toMatch(new RegExp(`<a[^>]*aria-current="page"[^>]*href="${route}"`));
   }
 });
@@ -147,7 +184,7 @@ test("action errors remain visible and successful/denied results remain literal"
   expect(resultHtml).toContain("Policy is provisional");
 });
 
-test("public/auth/404 pages render without product design or lost entry links", () => {
+test("public/auth/404 pages render without lost entry links", () => {
   expect(render(Landing)).toContain('href="/auth?returnTo=%2Fdashboard"');
   expect(render(Auth)).toContain('name="email"');
   expect(render(Auth)).toContain("Continue as guest");
@@ -166,7 +203,7 @@ test("signed-out route guard preserves full intended path; authenticated childre
 
 test("loading states render real text, not blank product surfaces", () => {
   loadingData = true;
-  for (const path of ["/dashboard", "/trading", "/charts", "/analysis", "/history", "/settings"]) expect(render(Dashboard, path)).toContain('role="status"');
+  for (const path of routes) expect(render(Dashboard, path)).toContain('role="status"');
   loadingData = false;
   loadingAuth = true;
   const html = renderToStaticMarkup(createElement(MemoryRouter, {}, createElement(RequireAuth, { children: createElement("p", null, "Private") })));

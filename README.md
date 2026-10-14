@@ -1,10 +1,8 @@
-## UI reset status
+## UI status
 
-The previous Sentinel Prime product design has been removed. Replacement UI design has **not** started. Application pages now use neutral native forms, links, and record readouts.
+The Sentinel Prime mobile frontend design (390×844 frame, DM Sans, glass/cyan design system) is now implemented across the six protected screens: `/dashboard`, `/trading`, `/charts`, `/analysis`, `/history`, `/settings`. The BUY/WAIT/SELL stance cluster appears only on `/analysis` and records an informational stance — automated order execution, broker APIs, and real-money routing remain absent. `/auth` retains email OTP and anonymous sign-in; `/` is the themed entry page. All original frontend API entry points remain available, backend security/risk/execution logic is unchanged, and the engineering data console (records, connections, admin initialization) remains accessible behind the “Backend data console” disclosure below the app frame.
 
-Protected temporary screens: `/dashboard`, `/trading`, `/charts`, `/analysis`, `/history`, `/settings`. `/auth` retains email OTP and anonymous sign-in; `/` is a neutral entry page. All original frontend API entry points remain available, and backend security/risk/execution logic is unchanged. Initialization is an explicit admin-gated operation in Settings, not a page-mount mutation.
-
-See [the UI reset audit](docs/ui-reset-audit.md) for the inventory, deletion scope, retained framework infrastructure, and verification limitations. Generic UI-kit modules and platform diagnostics remain infrastructure; they are not the active product design. Styling guidance below describes the starter framework and must not be used to start replacement design before approval.
+See [the UI reset audit](docs/ui-reset-audit.md) for the earlier reset inventory, deletion scope, retained framework infrastructure, and verification limitations. Generic UI-kit modules and platform diagnostics remain infrastructure; they are not the active product design. Styling guidance below describes the starter framework and is superseded by the implemented Sentinel Prime design system.
 
 ## Overview
 
