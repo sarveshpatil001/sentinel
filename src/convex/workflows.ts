@@ -545,11 +545,10 @@ export async function loadRiskContext(
     .query("dataQualityReports")
     .withIndex("by_market", (q) => q.eq("marketId", args.marketId))
     .first();
-  const lastCandle = (await ctx.db
-    .query("candles")
-    .withIndex("by_market_tf_time", (q) => q.eq("marketId", args.marketId).eq("timeframe", "1h"))
-    .order("desc")
-    .first()) ?? null;
+  // V4c: freshness is measured on the newest ELIGIBLE candle (INCOMPLETE
+  // bars are never risk prices); no eligible candle -> age unknown -> the
+  // engine fails closed.
+  const lastCandle = await latestEligibleCandle(ctx, args.marketId);
 
   // BOUNDED-SCAN SAFETY (G2-scoped): positions are read from the caller's
   // risk scope only — own + shared SYSTEM rows, never another customer's —
@@ -920,27 +919,31 @@ export const placeOrder = mutation({
 
     const scopeCheck = validateAuthorizationScope(auth as never, intent, now);
     const state = await ctx.db.query("systemState").first();
-    const lastCandle = await ctx.db
-      .query("candles")
-      .withIndex("by_market_tf_time", (q) => q.eq("marketId", args.marketId).eq("timeframe", "1h"))
-      .order("desc")
-      .first();
+    // V4c: fill pricing and freshness use the newest ELIGIBLE candle — an
+    // INCOMPLETE bar can never price a fill or prove freshness; with no
+    // eligible candle `dataAgeMs` is null and the precheck BLOCKS below.
+    const lastCandle = await latestEligibleCandle(ctx, args.marketId);
     // ONE order-state policy with the risk context (lib/execution.ts
     // UNRESOLVED_SUBMISSION_STATES): SUBMITTING, SUBMITTED and UNKNOWN orders
     // are unresolved submissions — an earlier submission may already have
     // reached the provider, so new exposure is blocked until reconciliation
-    // resolves them (fail-closed; no duplicate exposure). The gate covers the
-    // caller's visibility scope (own + shared SYSTEM rows — canViewRecord
-    // semantics): another customer's records must not improperly affect this
-    // customer's decisions, while shared SYSTEM rows block every scope.
+    // resolves them (fail-closed; no duplicate exposure).
+    // DECISION A (finding D4, re-ratified): the gate is ACCOUNT-GLOBAL — it
+    // covers EVERY order on this authorization's execution account
+    // (`<mode>:paper-account`), any owner: an unresolved submission anywhere
+    // on the account means the account's exposure is unknown. Unrelated
+    // accounts are never scanned.
     // Resolved/terminal orders (ACKNOWLEDGED, PARTIALLY_FILLED, FILLED,
     // REJECTED, CANCELLED, EXPIRED) never block merely because of a former
     // state.
-    // BOUNDED-SCAN SAFETY: per-owner-per-state INDEXED reads with per-scope
-    // saturation detection (see scanUnresolvedOrders) — complete at any
-    // database size/age for this scope; the duplicate-key input reuses the
-    // targeted lookup already performed above (never a bounded global scan).
-    const unresolvedScan = await scanUnresolvedOrders(ctx, userId);
+    // BOUNDED-SCAN SAFETY: per-mode-per-state INDEXED reads with per-state
+    // saturation detection (see scanUnresolvedAccountOrders) — complete at
+    // any database size/age for this account; the duplicate-key input reuses
+    // the targeted lookup already performed above (never a bounded scan).
+    const unresolvedScan = await scanUnresolvedAccountOrders(
+      ctx,
+      auth.scope.mode as Doc<"orders">["mode"],
+    );
 
     const precheck = runPrechecks(intent, {
       systemEnabled: state?.mode !== "DISABLED",
@@ -1018,136 +1021,15 @@ export const placeOrder = mutation({
         fees = fillPrice * filledQuantity * 0.001;
         slippage = slip * filledQuantity;
 
-        // Canonical position accounting. `fillDelta` guards against duplicate
-        // fill application (a repeated provider fill event adds 0).
-        const delta = fillDelta(filledQuantity, 0);
-        // Position rows are USER-OWNED: a fill only ever updates the caller's
-        // own position. Shared SYSTEM rows (e.g. seeded demo positions) are
-        // never merged into — a new owner-bound row is created instead.
-        const existingPos = await ctx.db
-          .query("positions")
-          .withIndex("by_owner_market", (q) =>
-            q.eq("ownerUserId", userId).eq("marketId", args.marketId),
-          )
-          .first();
-        const prev: PositionState | null = existingPos
-          ? {
-              side: existingPos.side,
-              quantity: existingPos.quantity,
-              avgEntryPrice: existingPos.avgEntryPrice,
-              realizedPnl: existingPos.realizedPnl,
-            }
-          : null;
-        const next = applyFill(prev, { side: args.side, quantity: delta, price: fillPrice });
-        if (existingPos) {
-          await ctx.db.patch(existingPos._id, {
-            side: next.side,
-            quantity: next.quantity,
-            avgEntryPrice: next.avgEntryPrice,
-            realizedPnl: next.realizedPnl,
-            updatedAt: now + 6,
-          });
-        } else {
-          await ctx.db.insert("positions", {
-            positionId: `POS-${args.idempotencyKey}`,
-            account: `${auth.scope.mode}:paper-account`,
-            marketId: args.marketId,
-            symbol,
-            side: next.side,
-            quantity: next.quantity,
-            avgEntryPrice: next.avgEntryPrice,
-            realizedPnl: next.realizedPnl,
-            source: "PAPER",
-            updatedAt: now + 6,
-            ownerUserId: userId,
-          });
-        }
-
-        // Account-level risk accounting maintained server-side at fill time:
-        // daily realized PnL (UTC day) and all-time peak equity.
-        const realizedDelta = next.realizedPnl - (prev?.realizedPnl ?? 0);
-        // REALIZED TRADE OUTCOME (finding C): a completion event exists iff
-        // this fill application CLOSED a positive portion of the position —
-        // exactly the moment realized PnL enters the ledger. Classification
-        // is by the sign of the realized delta (no invented breakeven
-        // epsilon); the STABLE event id (order id + cumulative filled qty)
-        // makes re-application idempotent, and the row is written in THIS
-        // transaction — atomic with the accounting event it describes.
-        const closedQty = closedQuantity(prev, { side: args.side, quantity: delta, price: fillPrice });
-        const realizedOutcome = classifyRealizedOutcome(realizedDelta, closedQty);
-        if (realizedOutcome !== null) {
-          await recordRealizedOutcome(ctx, {
-            outcomeId: `OUT-${intent.orderId}-${filledQuantity}`,
-            ownerUserId: userId,
-            orderId: intent.orderId,
-            marketId: args.marketId,
-            realizedPnl: realizedDelta,
-            outcome: realizedOutcome,
-            closedQuantity: closedQty,
-            at: now,
-          });
-        }
-        // BOUNDED-SCAN SAFETY: saturation-aware, G2-SCOPED read (see
-        // readRiskScopePositions). Equity is recomputed over the CALLER's
-        // risk scope only — another customer's realized PnL can never enter
-        // this customer's equity — and is MARK-TO-MARKET (realized +
-        // unrealized at fresh, valid marks). If the scope read saturates or
-        // the valuation cannot be established, `loadRiskContext` reports
-        // incompleteness and ALL new exposure is blocked fail-closed (UNKNOWN
-        // verdict).
-        const scopePositions = await readRiskScopePositions(ctx, userId);
-        const totalRealized = scopePositions.rows.reduce((a, p) => a + p.realizedPnl, 0);
-        const valuation = await valueScopePositions(ctx, scopePositions.rows, now);
-        const equityNow = PAPER_EQUITY_BASE + totalRealized + valuation.unrealized;
-        const dayKey = new Date(now).toISOString().slice(0, 10);
-        // PER-CUSTOMER accounting ledger (G2): this row is consumed ONLY by
-        // this customer's risk context. One customer's fill can never move
-        // another customer's daily PnL or peak equity.
-        const accountState = await readRiskAccountState(ctx, userId);
-        const realizedPnlDay =
-          accountState?.pnlDay === dayKey
-            ? (accountState.realizedPnlDay ?? 0) + realizedDelta
-            : realizedDelta;
-        // Peak equity: raised only from a RELIABLE valuation (finding D) —
-        // never lowered, and never moved, by an unreliable one.
-        const peakEquityNow = valuation.complete
-          ? Math.max(accountState?.peakEquity ?? PAPER_EQUITY_BASE, equityNow)
-          : (accountState?.peakEquity ?? PAPER_EQUITY_BASE);
-        if (accountState) {
-          await ctx.db.patch(accountState._id, {
-            peakEquity: peakEquityNow,
-            pnlDay: dayKey,
-            realizedPnlDay,
-            updatedAt: now,
-          });
-        } else {
-          await ctx.db.insert("riskAccountState", {
-            ownerUserId: userId,
-            peakEquity: peakEquityNow,
-            pnlDay: dayKey,
-            realizedPnlDay,
-            updatedAt: now,
-          });
-        }
-        // LEGACY platform-aggregate telemetry (all customers summed): kept
-        // maintained for the documented shared-account ledger, but NOT
-        // consumed by any risk calculation (loadRiskContext reads
-        // riskAccountState) and separate from the shared platform controls
-        // (kill switch/mode) in this same row. Removal is deferred to plan
-        // Step 2 migration.
-        if (state) {
-          await ctx.db.patch(state._id, {
-            peakEquity: Math.max(state.peakEquity ?? PAPER_EQUITY_BASE, equityNow),
-            pnlDay: dayKey,
-            realizedPnlDay:
-              state?.pnlDay === dayKey ? (state.realizedPnlDay ?? 0) + realizedDelta : realizedDelta,
-            updatedAt: now,
-          });
-        }
+        // Position/PnL/outcome accounting is applied AFTER the order row is
+        // persisted, through the SAME cumulative-fill accounting path
+        // reconciliation uses (applyProviderFill — findings D1/D2): one
+        // atomic, idempotent accounting path for every provider fill, keyed
+        // on the order's persisted `fillAppliedQuantity`.
       }
     }
 
-    await ctx.db.insert("orders", {
+    const insertedOrderId = await ctx.db.insert("orders", {
       orderId: intent.orderId,
       idempotencyKey: args.idempotencyKey,
       authorizationId: args.authorizationId,
@@ -1167,6 +1049,7 @@ export const placeOrder = mutation({
       providerTruth,
       fillPrice,
       fillQuantity: filledQuantity > 0 ? filledQuantity : undefined,
+      fillAppliedQuantity: filledQuantity > 0 ? 0 : undefined,
       fees,
       slippage,
       history,
@@ -1174,6 +1057,28 @@ export const placeOrder = mutation({
       createdAt: now,
       updatedAt: now + 100_000,
     });
+
+    if (filledQuantity > 0) {
+      // CUMULATIVE FILL ACCOUNTING (findings D1/D2): the recorded provider
+      // fill is accounted through the one shared atomic path — position,
+      // realized PnL, realized-outcome event and riskAccountState are updated
+      // together, and `fillAppliedQuantity` is persisted so the same fill can
+      // never be counted twice in any accounting record.
+      const orderRow = (await ctx.db.get(insertedOrderId))!;
+      const application = await applyProviderFill(
+        ctx,
+        orderRow,
+        { cumulativeFilled: filledQuantity, price: fillPrice ?? NaN },
+        now,
+      );
+      if (!application.applied) {
+        // Unreachable by construction (owner-bound order, provider-priced
+        // fill). If accounting cannot be established the transaction FAILS
+        // CLOSED atomically — no order, no consumed authorization and no
+        // partial accounting survives; nothing pretends the fill happened.
+        throw new Error(`FILL_ACCOUNTING_REFUSED: ${application.reason ?? "unaccountable fill"}`);
+      }
+    }
 
     await appendAudit(
       ctx,
@@ -1207,17 +1112,23 @@ export const reconcile = mutation({
   handler: async (ctx) => {
     const userId = await requireUser(ctx);
     const now = Date.now();
-    // OWNERSHIP: reconciliation only touches records the caller may act on —
-    // their OWN orders plus shared SYSTEM records. A foreign unresolved order
-    // is its owner's to reconcile; it stays fail-closed for everyone else and
-    // is never disclosed here (no cross-user leak).
-    // BOUNDED-SCAN SAFETY: per-owner-per-state INDEXED scans over the SAME
-    // order-state policy the execution gate uses (UNRESOLVED_SUBMISSION_STATES
-    // = SUBMITTING/SUBMITTED/UNKNOWN), with per-scope saturation detection
-    // (see scanUnresolvedOrders) — any order that requires reconciliation is
-    // found at any table size for this scope. If a scan saturates, completeness
-    // cannot be established: `healthy` is false, `scanComplete` is false and
-    // new exposure stays blocked (fail-closed).
+    // OWNERSHIP (Decision B): reconciliation only ACTS ON records the caller
+    // may act on — their OWN orders plus shared SYSTEM records. A foreign
+    // unresolved order is its owner's to reconcile; it is never patched and
+    // never disclosed here (no cross-user leak) — only its COUNT enters the
+    // account health below, exactly as the execution gate already reports it.
+    //
+    // HEALTH (Decision A): health is ACCOUNT-HONEST — the shared execution
+    // account is healthy only when NO unresolved submission remains on it
+    // (any owner) AND the caller's actionable rows are clear. Reconciliation
+    // output therefore agrees with the actual execution gate (same state
+    // policy, same account scope).
+    // BOUNDED-SCAN SAFETY: INDEXED scans (by_owner_state for the actionable
+    // set, by_mode_state for the account) over the SAME order-state policy
+    // (UNRESOLVED_SUBMISSION_STATES = SUBMITTING/SUBMITTED/UNKNOWN), with
+    // saturation detection — if any scan saturates, completeness cannot be
+    // established: `healthy` is false, `scanComplete` is false and new
+    // exposure stays blocked (fail-closed).
     //
     // EXHAUSTIVE CLASSIFICATION (finding B): EVERY scanned order gets exactly
     // one outcome via classifyOrderReconciliation (lib/execution.ts) —
@@ -1226,9 +1137,17 @@ export const reconcile = mutation({
     // CONTRADICTORY_EVIDENCE / UNRECOGNIZED_STATE). A timeout, a missing
     // response or an absent provider record is never proof of rejection or of
     // non-submission, and no terminal result is ever manufactured.
-    const scan = await scanUnresolvedOrders(ctx, userId);
+    const systemStateRow = await ctx.db.query("systemState").first();
+    const accountMode = (systemStateRow?.mode ?? "PAPER") as Doc<"orders">["mode"];
+    const actionable = await scanUnresolvedOwnedOrders(ctx, userId);
+    const accountScan = await scanUnresolvedAccountOrders(ctx, accountMode);
+    // Foreign rows: COUNTED for account health, never classified, patched or
+    // disclosed (Decision B — no cross-user leak).
+    const unresolvedForeign = accountScan.rows.filter(
+      (o) => !canViewRecord(o.ownerUserId, userId),
+    ).length;
 
-    const resolved: { orderId: string; from: string; to: string }[] = [];
+    const resolved: { orderId: string; from: string; to: string; fillAccounted: boolean }[] = [];
     const unresolved: {
       orderId: string;
       state: string;
@@ -1236,7 +1155,7 @@ export const reconcile = mutation({
       note: string;
     }[] = [];
 
-    for (const o of scan.rows) {
+    for (const o of actionable.rows) {
       const outcome = classifyOrderReconciliation({
         state: o.state,
         providerTruth: o.providerTruth ?? null,
@@ -1245,6 +1164,33 @@ export const reconcile = mutation({
         fillPrice: o.fillPrice ?? null,
       });
       if (outcome.kind === "RESOLVED") {
+        // D1: a resolution carrying fill evidence MUST account those fills in
+        // THIS transaction (same atomic accounting path as order placement —
+        // findings D1/D2). Resolution with unapplied fill data is forbidden:
+        // if the fill cannot be accounted, the order stays UNRESOLVED and
+        // keeps blocking — it is never merely marked ACKNOWLEDGED.
+        const fillQty = o.fillQuantity;
+        const hasFillEvidence =
+          fillQty !== undefined && fillQty !== null && fillQty > 0;
+        let fillAccounted = true;
+        if (hasFillEvidence) {
+          const application = await applyProviderFill(
+            ctx,
+            o,
+            { cumulativeFilled: fillQty, price: o.fillPrice ?? NaN },
+            now,
+          );
+          fillAccounted = application.applied;
+        }
+        if (!fillAccounted) {
+          unresolved.push({
+            orderId: o.orderId,
+            state: o.state,
+            category: "CONTRADICTORY_EVIDENCE",
+            note: "RECONCILIATION: fill evidence is recorded but could not be accounted (unaccountable fill data) — resolution REFUSED; the order stays unresolved and keeps blocking (findings D1/D2).",
+          });
+          continue;
+        }
         await ctx.db.patch(o._id, {
           state: outcome.to,
           history: [
@@ -1257,7 +1203,12 @@ export const reconcile = mutation({
           ],
           updatedAt: now,
         });
-        resolved.push({ orderId: o.orderId, from: o.state, to: outcome.to });
+        resolved.push({
+          orderId: o.orderId,
+          from: o.state,
+          to: outcome.to,
+          fillAccounted: hasFillEvidence,
+        });
       } else {
         // Explicitly classified and REPORTED — never dropped, never silently
         // resolved. The order stays in its current state (visible in the next
@@ -1273,10 +1224,13 @@ export const reconcile = mutation({
     }
 
     // Completeness cannot be established over a saturated scan -> NOT healthy.
-    // Reconciliation output agrees with the execution gate: after this run,
-    // every remaining `unresolved` order is exactly one that still restricts
-    // new exposure (same state policy, same visibility scope).
-    const healthy = scan.complete && unresolved.length === 0;
+    // Health is ACCOUNT-HONEST (Decision A): healthy only when no unresolved
+    // submission remains ANYWHERE on the shared execution account (foreign
+    // rows counted, never disclosed) and the caller's actionable rows are
+    // clear — exactly the state that still restricts new exposure.
+    const scanComplete = actionable.complete && accountScan.complete;
+    const healthy =
+      scanComplete && unresolved.length === 0 && unresolvedForeign === 0;
     await appendAudit(
       ctx,
       {
@@ -1288,13 +1242,13 @@ export const reconcile = mutation({
         outcome: healthy ? "HEALTHY" : "MISMATCH",
         correlationId: `RECON-${now}`,
         detail: healthy
-          ? `Orders reconciled against provider ledger evidence. Resolved: ${resolved.map((r) => `${r.orderId} ${r.from}->${r.to}`).join(", ") || "none"}. Scan complete; no unresolved submission remains.`
-          : `${scan.complete ? "" : "INCOMPLETE SCAN (bounded read saturated) — additional orders may remain unreconciled and the result is NOT fully healthy. "}${unresolved.length > 0 ? `Unresolved orders remain: ${unresolved.map((u) => `${u.orderId} [${u.state}/${u.category}]`).join(", ")}. ` : ""}NEW EXPOSURE IS BLOCKED until reconciliation succeeds.`,
+          ? `Orders reconciled against provider ledger evidence. Resolved: ${resolved.map((r) => `${r.orderId} ${r.from}->${r.to}${r.fillAccounted ? " (fill accounted)" : ""}`).join(", ") || "none"}. Scan complete; no unresolved submission remains on the shared execution account or in the caller's actionable set.`
+          : `${scanComplete ? "" : "INCOMPLETE SCAN (bounded read saturated) — additional orders may remain unreconciled and the result is NOT fully healthy. "}${unresolved.length > 0 ? `Unresolved orders remain: ${unresolved.map((u) => `${u.orderId} [${u.state}/${u.category}]`).join(", ")}. ` : ""}${unresolvedForeign > 0 ? `${unresolvedForeign} unresolved order(s) on the shared execution account are owned by other users (not disclosed; their owner must reconcile them) — the account stays blocked. ` : ""}NEW EXPOSURE IS BLOCKED until reconciliation succeeds.`,
       },
       now,
     );
 
-    return { healthy, scanComplete: scan.complete, resolved, unresolved };
+    return { healthy, scanComplete, resolved, unresolved, unresolvedForeign };
   },
 });
 

@@ -798,6 +798,16 @@ export const seed = mutation({
       source: "PAPER",
       updatedAt: now - 7200_000 + 60,
     });
+    // DECISION C (documented in docs/execution-architecture-decisions.md):
+    // this ownerless position is SHARED account state on the shared execution
+    // account (Decision A). Its realized PnL (420.5) is account-level demo
+    // economics: it enters every risk input that measures the ACCOUNT
+    // (equity, drawdown, daily PnL fallback) consistently. It NEVER enters a
+    // customer's behavioral loss streak (streaks are owner-scoped and walk
+    // only that owner's realized-outcome rows — see lib/positions.ts).
+    // The fixture's baked-in realized result predates the realized-outcome
+    // ledger and is carried in the position row itself; no outcome event is
+    // fabricated for it (no fill is ever pretended to have been applied).
 
     await ctx.db.insert("orders", {
       orderId: "ORD-SEED-0002",

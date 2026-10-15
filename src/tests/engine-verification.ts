@@ -1030,6 +1030,60 @@ check(
     rc8.category === "CONTRADICTORY_EVIDENCE",
 );
 
+// Findings D1/D2: fill evidence is part of the accepted truth. An order
+// carrying fills is NEVER merely ACKNOWLEDGED — the resolution target reflects
+// the fill and the caller must account it atomically with the transition.
+const rc9 = classifyOrderReconciliation({
+  state: "UNKNOWN",
+  providerTruth: "ACCEPTED",
+  quantity: 2,
+  fillQuantity: 1,
+  fillPrice: 100,
+});
+const rc9b = classifyOrderReconciliation({
+  state: "SUBMITTED",
+  providerTruth: "ACCEPTED",
+  quantity: 2,
+  fillQuantity: 1,
+  fillPrice: 100,
+});
+check(
+  "TEST-RECON-107 ACCEPTED with partial fill evidence resolves to PARTIALLY_FILLED (never merely ACKNOWLEDGED)",
+  rc9.kind === "RESOLVED" &&
+    rc9.to === "PARTIALLY_FILLED" &&
+    rc9b.kind === "RESOLVED" &&
+    rc9b.to === "PARTIALLY_FILLED",
+);
+const rc10 = classifyOrderReconciliation({
+  state: "SUBMITTED",
+  providerTruth: "ACCEPTED",
+  quantity: 2,
+  fillQuantity: 2,
+  fillPrice: 100,
+});
+const rc11 = classifyOrderReconciliation({
+  state: "UNKNOWN",
+  providerTruth: "ACCEPTED",
+  quantity: 2,
+  fillQuantity: 1,
+  fillPrice: null,
+});
+const rc12 = classifyOrderReconciliation({
+  state: "UNKNOWN",
+  providerTruth: "ACCEPTED",
+  quantity: 2,
+  fillQuantity: 1,
+});
+check(
+  "TEST-RECON-108 full fill -> FILLED; a fill without a usable price is CONTRADICTORY (never resolved with unaccountable fill data)",
+  rc10.kind === "RESOLVED" &&
+    rc10.to === "FILLED" &&
+    rc11.kind === "UNRESOLVED" &&
+    rc11.category === "CONTRADICTORY_EVIDENCE" &&
+    rc12.kind === "UNRESOLVED" &&
+    rc12.category === "CONTRADICTORY_EVIDENCE",
+);
+
 // Finding C: loss-streak policy (newest-first rows with per-owner seq).
 const st = (rows: [number, string][], complete = true) =>
   computeLossStreak(rows.map(([seq, outcome]) => ({ seq, outcome })), complete);

@@ -1,10 +1,10 @@
 # Sentinel Prime — Execution Architecture Decisions
 
-Status: **DECIDED constraints + OPEN proposals.** This file records two product
-decisions (A, B) and the audit-verification semantics they depend on. Live
-trading is not implemented, not enabled, and not auto-resumable. Nothing in
-this file approves a risk limit, ratifies a policy, or provisions an
-administrator.
+Status: **DECIDED constraints + OPEN proposals.** This file records three
+product decisions (A, B, C) and the audit-verification semantics they depend
+on. Live trading is not implemented, not enabled, and not auto-resumable.
+Nothing in this file approves a risk limit, ratifies a policy, or provisions
+an administrator.
 
 ---
 
@@ -13,13 +13,29 @@ administrator.
 The current build runs PAPER/DEMO on a single **shared** account
 (`PAPER:paper-account`). For this model:
 
-1. **The exposure gate is GLOBAL and fail-closed.** While ANY order is in
-   `UNKNOWN` state, new exposure is blocked for EVERY user — at risk-decision
-   time (`reconciliation_state` in the deterministic risk engine) and again at
-   submission time (execution prechecks). The gate is deliberately **not**
-   scoped to the initiating user: on a shared account the external state is
-   shared, so unknown state anywhere means the account's true exposure is
-   unknown.
+1. **The exposure gate is ACCOUNT-GLOBAL and fail-closed.** While ANY order
+   **on the shared execution account** — from ANY owner — is in an unresolved
+   submission state (`SUBMITTING` / `SUBMITTED` / `UNKNOWN`, one shared
+   order-state policy), new exposure is blocked for EVERY customer of that
+   account: at risk-decision time (`reconciliation_state` in the deterministic
+   risk engine) and again at submission time (execution prechecks). The gate
+   is deliberately **not** scoped to the initiating user: on a shared account
+   the external state is shared, so unknown state anywhere on the account
+   means the account's true exposure is unknown. The scan is indexed per
+   account (`orders.by_mode_state`) and is saturation-detected — it never
+   degrades other accounts' scan completeness, and an unresolved order on an
+   UNRELATED execution account (e.g. `DEMO:paper-account`) never blocks this
+   account (tested: `DB-GATE-005`, `DB-GATE-005c`).
+   **RATIFIED (post-audit corrective patch, finding D4):** this rule — an
+   unresolved submission from either customer blocks risk-increasing exposure
+   for BOTH on the shared account — is the confirmed policy; the previous
+   per-customer gate behavior was a defect, not a design. Customer-private
+   DATA remains strictly isolated: foreign rows are only ever COUNTED for
+   account health, never disclosed, patched or classified by another customer
+   (Decision B). The global kill-switch release gate agrees with this rule:
+   release is refused while ANY unresolved submission remains on ANY account
+   (the switch is one shared platform control), and succeeds once the account
+   is clear (tested: `DB-GATE-005-ks`).
 2. **Risk accounting is account-global and consistent** with that model:
    equity, realized PnL, peak equity and daily PnL are computed over the whole
    shared account at fill time and at proposal time. Per-user accounting would
@@ -53,7 +69,8 @@ Until then the shared-account fail-closed behavior above stays in force.
 
 | Requirement | Where enforced |
 | --- | --- |
-| Ordinary users cannot reconcile or mutate another user's orders | `workflows.reconcile` touches only the caller's own + shared SYSTEM rows; not-found ≡ not-owned |
+| Ordinary users cannot reconcile or mutate another user's orders | `workflows.reconcile` transitions only the caller's own + shared SYSTEM rows; not-found ≡ not-owned. Foreign rows on the shared account are only COUNTED into the account-honest health summary (`unresolvedForeign`) so a run never reports healthy while they block the account — their ids are never disclosed (tested: `DB-GATE-005-ks`) |
+| A resolution carrying fill evidence accounts the fill atomically | `reconcile` applies fills through the one cumulative-fill accounting path (persisted `orders.fillAppliedQuantity`, stable `OUT-<orderId>-<cumulative>` event ids) in the SAME transaction as the transition; if the fill cannot be accounted the order stays unresolved (CONTRADICTORY_EVIDENCE) and is never merely marked `ACKNOWLEDGED` (findings D1/D2) |
 | Resolution only from recorded evidence | An `UNKNOWN` order resolves ONLY on its recorded provider truth (`ACCEPTED` → `ACKNOWLEDGED`, `REJECTED` → `REJECTED`) |
 | Never infer failure from a timeout | A timeout leaves provider truth `NONE`; the order STAYS `UNKNOWN` and is listed as unresolved — never assumed failed, never blindly retried |
 | Unresolvable state keeps blocking | Unresolved `UNKNOWN` orders remain `UNKNOWN` and the global gate (Decision A) keeps blocking new shared-account exposure |
@@ -98,6 +115,37 @@ Until then the shared-account fail-closed behavior above stays in force.
 Until this design is approved AND an authoritative evidence source exists,
 cross-owner `UNKNOWN` orders remain their owner's to reconcile, and the global
 fail-closed gate (Decision A) keeps shared-account exposure blocked.
+
+---
+
+## Decision C — Shared SYSTEM fixture accounting (DECIDED — documented rule)
+
+Ownerless (`ownerUserId` undefined/empty) records are **shared SYSTEM**
+records: the seeded demo workspace and other fixtures live on the shared
+execution account (Decision A). The rule for their accounting inputs:
+
+1. **Shared fixture P&L is shared ACCOUNT economics.** Because every customer
+   shares the execution account, ownerless positions and their realized PnL
+   enter every risk input that measures the ACCOUNT — equity, drawdown, peak
+   equity and the daily PnL fallback — exactly as a customer's own records do.
+   This is not silent contamination: it is the documented consequence of the
+   shared-account model (Decision A), applied CONSISTENTLY across all
+   account-level inputs (`readRiskScopePositions` = own + shared).
+2. **Behavioral streaks are owner-scoped and stay owner-scoped.** The
+   consecutive-loss streak is a per-customer behavioral instrument: it walks
+   only that customer's own realized-outcome rows (`realizedTradeOutcomes`
+   `by_owner_seq`). Shared SYSTEM fixture outcomes NEVER extend or reset any
+   customer's streak (tested: `DB-D3-001..003`).
+3. **No ledger rows are fabricated.** The seeded fixture's baked-in realized
+   result (`POS-SEED-BTC` +420.5) predates the realized-outcome ledger and is
+   carried in the position row; no outcome event is invented for it, and no
+   unaccounted fill is ever pretended to have been applied.
+4. Rationale for the asymmetry (explicit, as required): account economics
+   answer "what is this account worth" — the account is shared, so the answer
+   is shared. Streaks answer "how has THIS customer been trading" — fixture
+   results are not anyone's trading behavior, so they must not enter them.
+   Per-customer daily ledgers for a shared account remain future work (see
+   Decision A's multi-user requirement).
 
 ---
 

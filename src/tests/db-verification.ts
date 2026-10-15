@@ -225,6 +225,8 @@ type OrderRow = {
   quantity?: number;
   fillQuantity?: number;
   fillPrice?: number;
+  side?: "BUY" | "SELL";
+  mode?: "PAPER" | "DEMO";
 };
 
 /** Schema-complete fixture orders, inserted in one transaction. */
@@ -240,11 +242,11 @@ async function insertOrderRows(t: T, rows: OrderRow[]) {
         strategyVersionId: "SV-T",
         marketId: "MKT-T",
         symbol: "BTC/USD",
-        side: "BUY",
+        side: r.side ?? "BUY",
         quantity: r.quantity ?? 1,
         orderType: "MARKET",
         timeInForce: "GTC",
-        mode: "PAPER",
+        mode: r.mode ?? "PAPER",
         state: r.state as never,
         providerTruth: r.providerTruth,
         fillQuantity: r.fillQuantity,
@@ -3129,10 +3131,18 @@ async function insertMark(t: T, marketId: string, close: number, ageMs: number) 
   const t = fresh();
   const { userA, userB } = await seedWorkspace(t, "ACK");
   const asA = t.withIdentity({ subject: userA });
+  // DECISION A (finding D4, RATIFIED from docs/execution-architecture-
+  // decisions.md): the exposure gate is ACCOUNT-GLOBAL. On the shared
+  // execution account an unresolved submission from EITHER customer means the
+  // account's exposure is unknown — it blocks BOTH customers' risk-increasing
+  // actions. Customer-private DATA stays isolated (G2): the foreign rows are
+  // only ever COUNTED for account health — never disclosed, never patched,
+  // never classified by the other customer (Decision B).
+  const asB = t.withIdentity({ subject: userB });
   await insertOrderRows(t, [
-    { orderId: "ORD-G5-B1", state: "SUBMITTING", providerTruth: "NONE", ownerUserId: userB },
-    { orderId: "ORD-G5-B2", state: "SUBMITTED", providerTruth: "NONE", ownerUserId: userB },
-    { orderId: "ORD-G5-B3", state: "UNKNOWN", providerTruth: "NONE", ownerUserId: userB },
+    { orderId: "ORD-G5-B1", state: "SUBMITTING", providerTruth: "ACCEPTED", ownerUserId: userB },
+    { orderId: "ORD-G5-B2", state: "SUBMITTED", providerTruth: "ACCEPTED", ownerUserId: userB },
+    { orderId: "ORD-G5-B3", state: "UNKNOWN", providerTruth: "ACCEPTED", ownerUserId: userB },
   ]);
   const bundleA = await ctxOf(t, userA, "IK-GATE-5A");
   const bundleB = await ctxOf(t, userB, "IK-GATE-5B");
@@ -3140,12 +3150,80 @@ async function insertMark(t: T, marketId: string, close: number, ageMs: number) 
   await seedAuthorization(t, { authorizationId: "AUTH-G5", ownerUserId: userA });
   const placed = await asA.mutation(api.workflows.placeOrder, placeArgs("AUTH-G5", "IK-GATE-5P"));
   check(
-    "DB-GATE-005 cross-customer records never leak into another customer's decision",
-    bundleA.ctx.unresolvedOrders === 0 &&
+    "DB-GATE-005 either customer's unresolved submission blocks the WHOLE shared execution account (Decision A)",
+    bundleA.ctx.unresolvedOrders === 3 &&
       bundleB.ctx.unresolvedOrders === 3 &&
-      !verdictA.checks.some((c) => c.check === "reconciliation_state" && c.status !== "PASS") &&
-      placed.state === "ACKNOWLEDGED",
-    JSON.stringify({ a: bundleA.ctx.unresolvedOrders, b: bundleB.ctx.unresolvedOrders, placed: placed.state }),
+      verdictA.checks.some((c) => c.check === "reconciliation_state" && c.status === "BLOCK") &&
+      placed.state === "REJECTED" &&
+      placed.note.includes("reconciliation_state"),
+    JSON.stringify({ a: bundleA.ctx.unresolvedOrders, b: bundleB.ctx.unresolvedOrders, placed: placed.state, note: placed.note }),
+  );
+
+  // Kill-switch release consistency (finding D4): the GLOBAL release gate and
+  // the shared-account exposure gate AGREE. While the account holds B's
+  // unresolved submissions (which only B may reconcile — Decision B) release
+  // is refused; ENGAGING (a safety action) stays available; after B reconciles
+  // their own rows the account opens and release succeeds. The foreign rows'
+  // ids are never disclosed to A in any payload.
+  await t.run(async (ctx) => ctx.db.patch(userA as never, { role: "admin" }));
+  const engage = await asA.mutation(api.workflows.setKillSwitch, { engaged: true, reason: "consistency probe" });
+  const releaseBlocked = await asA.mutation(api.workflows.setKillSwitch, { engaged: false, reason: "consistency probe" });
+  const reconA = await asA.mutation(api.workflows.reconcile, {});
+  const releaseStillBlocked = await asA.mutation(api.workflows.setKillSwitch, { engaged: false, reason: "consistency probe" });
+  const reconB = await asB.mutation(api.workflows.reconcile, {});
+  const releaseAfter = await asA.mutation(api.workflows.setKillSwitch, { engaged: false, reason: "consistency probe" });
+  const bundleAfter = await ctxOf(t, userA, "IK-GATE-5A2");
+  const placedAfter = await asA.mutation(api.workflows.placeOrder, placeArgs("AUTH-G5", "IK-GATE-5P2"));
+  check(
+    "DB-GATE-005-ks kill-switch release stays consistent with the shared-account gate (Decision A/B)",
+    engage.ok === true &&
+      releaseBlocked.ok === false &&
+      reconA.healthy === false &&
+      reconA.unresolvedForeign === 3 &&
+      !JSON.stringify(reconA).includes("ORD-G5-B1") &&
+      releaseStillBlocked.ok === false &&
+      reconB.healthy === true &&
+      reconB.resolved.length === 3 &&
+      releaseAfter.ok === true &&
+      bundleAfter.ctx.unresolvedOrders === 0 &&
+      placedAfter.state === "ACKNOWLEDGED",
+    JSON.stringify({
+      engage,
+      releaseBlocked,
+      reconA: { healthy: reconA.healthy, foreign: reconA.unresolvedForeign },
+      reconB: { healthy: reconB.healthy, resolved: reconB.resolved.length },
+      releaseAfter,
+      after: bundleAfter.ctx.unresolvedOrders,
+      placedAfter: placedAfter.state,
+    }),
+  );
+}
+
+{
+  // Decision A scopes the shared gate to the ACTUAL shared execution account:
+  // an unresolved submission on an unrelated account (DEMO) never blocks the
+  // PAPER account's exposure — while the GLOBAL kill-switch release (one
+  // shared platform control) still refuses to resume ANY execution until
+  // every account is clear (fail-safe direction).
+  const t = fresh();
+  const { userA, userB } = await seedWorkspace(t, "ACK");
+  const asA = t.withIdentity({ subject: userA });
+  await insertOrderRows(t, [
+    { orderId: "ORD-G5C-DEMO", state: "UNKNOWN", providerTruth: "NONE", ownerUserId: userB, mode: "DEMO" },
+  ]);
+  await seedAuthorization(t, { authorizationId: "AUTH-G5C", ownerUserId: userA });
+  const bundle = await ctxOf(t, userA, "IK-GATE-5C");
+  const placed = await asA.mutation(api.workflows.placeOrder, placeArgs("AUTH-G5C", "IK-GATE-5CP"));
+  await t.run(async (ctx) => ctx.db.patch(userA as never, { role: "admin" }));
+  const engage = await asA.mutation(api.workflows.setKillSwitch, { engaged: true, reason: "consistency probe" });
+  const release = await asA.mutation(api.workflows.setKillSwitch, { engaged: false, reason: "consistency probe" });
+  check(
+    "DB-GATE-005c the exposure gate is account-scoped (unrelated DEMO account isolated) while the GLOBAL release gate stays fail-safe",
+    bundle.ctx.unresolvedOrders === 0 &&
+      placed.state === "ACKNOWLEDGED" &&
+      engage.ok === true &&
+      release.ok === false,
+    JSON.stringify({ gate: bundle.ctx.unresolvedOrders, placed: placed.state, engage, release }),
   );
 }
 
@@ -3311,28 +3389,53 @@ async function insertMark(t: T, marketId: string, close: number, ageMs: number) 
   const t = fresh();
   const { userA } = await seedWorkspace(t, "TIMEOUT");
   const asA = t.withIdentity({ subject: userA });
-  await seedAuthorization(t, { authorizationId: "AUTH-R17", ownerUserId: userA });
-  await asA.mutation(api.workflows.placeOrder, placeArgs("AUTH-R17", "IK-R17"));
+  // DB-RECON-017 (rewritten per the post-audit corrective patch): repeated
+  // reconciliation applies fill accounting EXACTLY ONCE. The previous version
+  // asserted "no duplicate fills/accounting" against an order carrying NO
+  // fills — vacuous. This version drives a REAL partial fill through the
+  // reconcile mutation and proves the fill is accounted atomically on the
+  // first run and can never be counted twice in any accounting record
+  // (position, realized PnL, outcome ledger, daily ledger) on any later run.
+  await insertOpenPosition(t, "POS-R17", userA, 110, 2);
+  await insertOrderRows(t, [
+    {
+      orderId: "ORD-R17-FILL", state: "UNKNOWN", providerTruth: "ACCEPTED", ownerUserId: userA,
+      side: "SELL", quantity: 2, fillQuantity: 1, fillPrice: CLOSE,
+    },
+  ]);
   const snapshotOf = async () =>
     await t.run(async (ctx) => ({
       positions: await ctx.db.query("positions").collect(),
       accounts: await ctx.db.query("riskAccountState").collect(),
       outcomes: await ctx.db.query("realizedTradeOutcomes").collect(),
     }));
-  const before = await snapshotOf();
   const recon1 = await asA.mutation(api.workflows.reconcile, {});
+  const afterFirst = await snapshotOf();
   const recon2 = await asA.mutation(api.workflows.reconcile, {});
-  const after = await snapshotOf();
-  const order = (await ordersIn(t)).find((o) => o.orderId === "ORD-IK-R17");
+  const recon3 = await asA.mutation(api.workflows.reconcile, {});
+  const afterLater = await snapshotOf();
+  const order = (await ordersIn(t)).find((o) => o.orderId === "ORD-R17-FILL");
+  const pos = afterLater.positions.find((p) => p.positionId === "POS-R17");
+  const acct = afterLater.accounts.find((a) => a.ownerUserId === userA);
   check(
-    "DB-RECON-017 repeated reconciliation is idempotent: no duplicate fills/accounting, stable transitions",
+    "DB-RECON-017 repeated reconciliation is idempotent: fill accounting applied exactly once (position, realized PnL, outcome ledger, daily ledger)",
     recon1.healthy === true &&
+      recon1.resolved.length === 1 &&
+      recon1.resolved[0].fillAccounted === true &&
       recon2.healthy === true &&
       recon2.resolved.length === 0 &&
-      JSON.stringify(before) === JSON.stringify(after) &&
-      order?.state === "ACKNOWLEDGED" &&
+      recon3.resolved.length === 0 &&
+      JSON.stringify(afterFirst) === JSON.stringify(afterLater) &&
+      afterLater.outcomes.length === 1 &&
+      afterLater.outcomes[0].outcomeId === "OUT-ORD-R17-FILL-1" &&
+      afterLater.outcomes[0].outcome === "LOSS" &&
+      Math.abs((pos?.realizedPnl ?? 0) - -10) < 1e-9 &&
+      pos?.quantity === 1 &&
+      Math.abs((acct?.realizedPnlDay ?? 0) - -10) < 1e-9 &&
+      order?.state === "PARTIALLY_FILLED" &&
+      (order?.fillAppliedQuantity ?? 0) === 1 &&
       order.history.filter((h) => h.note.includes("RECONCILIATION")).length === 1,
-    JSON.stringify({ r1: recon1.resolved, r2: recon2.resolved, state: order?.state }),
+    JSON.stringify({ r1: recon1.resolved, state: order?.state, applied: order?.fillAppliedQuantity }),
   );
 }
 
@@ -3826,6 +3929,451 @@ async function insertMark(t: T, marketId: string, close: number, ageMs: number) 
       !vetoAllows(verdict.outcome) &&
       verdict.checks.some((c) => c.check === "account_state_completeness" && c.status === "UNKNOWN"),
     JSON.stringify({ complete: bundle.ctx.accountStateComplete }),
+  );
+}
+
+// ---------------------------------------------------------------------------
+// POST-AUDIT CORRECTIVE PATCH REGRESSIONS (findings D1, D2, D3, D4, V4c)
+//
+// D1/D2 — reconciliation never resolves an order carrying unapplied fill
+//         data; the one shared cumulative-fill accounting path (persisted
+//         `fillAppliedQuantity` + stable `OUT-<orderId>-<cumulative>` event
+//         ids) counts each provider fill exactly once across retries,
+//         replays and repeated reconciliation.
+// D3    — Decision C: shared SYSTEM fixture P&L is shared ACCOUNT economics
+//         (enters equity and the daily PnL fallback consistently); it NEVER
+//         enters any customer's behavioral loss streak (owner-scoped).
+// V4c   — candles marked INCOMPLETE never price valuation or fills; with no
+//         eligible candle the valuation is incomplete and risk-increasing
+//         action is blocked (fail closed).
+// ---------------------------------------------------------------------------
+
+const accountingSnapshot = (t: T) =>
+  t.run(async (ctx) => ({
+    positions: await ctx.db.query("positions").collect(),
+    accounts: await ctx.db.query("riskAccountState").collect(),
+    outcomes: await ctx.db.query("realizedTradeOutcomes").collect(),
+    system: await ctx.db.query("systemState").collect(),
+  }));
+
+// ---- findings D1/D2: reconciliation never drops fill accounting ------------
+
+{
+  const t = fresh();
+  const { userA } = await seedWorkspace(t, "ACK");
+  const asA = t.withIdentity({ subject: userA });
+  await insertOpenPosition(t, "POS-D1", userA, 110, 2);
+  await insertOrderRows(t, [
+    {
+      orderId: "ORD-D1-1", state: "UNKNOWN", providerTruth: "ACCEPTED", ownerUserId: userA,
+      side: "SELL", quantity: 2, fillQuantity: 1, fillPrice: CLOSE,
+    },
+  ]);
+  const recon = await asA.mutation(api.workflows.reconcile, {});
+  const order = (await ordersIn(t)).find((o) => o.orderId === "ORD-D1-1");
+  const rows = await t.run(async (ctx) => ({
+    positions: await ctx.db.query("positions").collect(),
+    outcomes: await ctx.db.query("realizedTradeOutcomes").collect(),
+    accounts: await ctx.db.query("riskAccountState").collect(),
+  }));
+  const pos = rows.positions.find((p) => p.positionId === "POS-D1");
+  const acct = rows.accounts.find((a) => a.ownerUserId === userA);
+  const bundle = await ctxOf(t, userA, "IK-D1-1");
+  check(
+    "DB-D1-001 an UNKNOWN order with ACCEPTED evidence and a positive partial fill resolves ONLY with its fill accounted atomically (position, realized PnL, outcome ledger consistent)",
+    recon.healthy === true &&
+      recon.resolved.length === 1 &&
+      recon.resolved[0].orderId === "ORD-D1-1" &&
+      recon.resolved[0].to === "PARTIALLY_FILLED" &&
+      recon.resolved[0].fillAccounted === true &&
+      order?.state === "PARTIALLY_FILLED" &&
+      (order?.fillAppliedQuantity ?? 0) === 1 &&
+      Math.abs((pos?.realizedPnl ?? 0) - -10) < 1e-9 &&
+      pos?.quantity === 1 &&
+      rows.outcomes.length === 1 &&
+      rows.outcomes[0].outcomeId === "OUT-ORD-D1-1-1" &&
+      rows.outcomes[0].ownerUserId === userA &&
+      rows.outcomes[0].outcome === "LOSS" &&
+      rows.outcomes[0].closedQuantity === 1 &&
+      Math.abs((acct?.realizedPnlDay ?? 0) - -10) < 1e-9 &&
+      Math.abs((bundle.ctx.realizedPnlToday ?? 0) - -10) < 1e-9 &&
+      bundle.ctx.consecutiveLosses === 1,
+    JSON.stringify({ recon, state: order?.state, outcomes: rows.outcomes.length }),
+  );
+}
+
+{
+  const t = fresh();
+  const { userA } = await seedWorkspace(t, "ACK");
+  const asA = t.withIdentity({ subject: userA });
+  await insertOpenPosition(t, "POS-D1U", userA, 110, 2);
+  // (a) ownerless (shared SYSTEM) order carrying fill evidence: the fill
+  // cannot be attributed to a customer ledger. (b) a fill without a usable
+  // price. Neither may resolve while its fill remains unapplied — the order
+  // is classified contradictory and stays fail-closed (never merely
+  // ACKNOWLEDGED), and no accounting record is touched.
+  await insertOrderRows(t, [
+    {
+      orderId: "ORD-D1-2", state: "UNKNOWN", providerTruth: "ACCEPTED",
+      side: "SELL", quantity: 2, fillQuantity: 1, fillPrice: CLOSE,
+    },
+    {
+      orderId: "ORD-D1-3", state: "UNKNOWN", providerTruth: "ACCEPTED", ownerUserId: userA,
+      side: "SELL", quantity: 2, fillQuantity: 1,
+    },
+  ]);
+  const recon = await asA.mutation(api.workflows.reconcile, {});
+  const rows = await t.run(async (ctx) => ({
+    orders: await ctx.db.query("orders").collect(),
+    positions: await ctx.db.query("positions").collect(),
+    outcomes: await ctx.db.query("realizedTradeOutcomes").collect(),
+  }));
+  const stateOf = (id: string) => rows.orders.find((o) => o.orderId === id)?.state;
+  const pos = rows.positions.find((p) => p.positionId === "POS-D1U");
+  check(
+    "DB-D1-002 an order whose fill cannot be accounted never resolves and never reports healthy (fail closed)",
+    recon.healthy === false &&
+      recon.resolved.length === 0 &&
+      recon.unresolved.length === 2 &&
+      recon.unresolved.every((u) => u.category === "CONTRADICTORY_EVIDENCE") &&
+      stateOf("ORD-D1-2") === "UNKNOWN" &&
+      stateOf("ORD-D1-3") === "UNKNOWN" &&
+      rows.outcomes.length === 0 &&
+      rows.positions.length === 1 &&
+      pos?.quantity === 2 &&
+      (pos?.realizedPnl ?? 0) === 0,
+    JSON.stringify({ recon }),
+  );
+}
+
+// ---- finding D2: authoritative cumulative-fill accounting ------------------
+
+{
+  const t = fresh();
+  const { userA } = await seedWorkspace(t, "ACK");
+  const asA = t.withIdentity({ subject: userA });
+  await insertOpenPosition(t, "POS-D2R", userA, 110, 2);
+  await insertOrderRows(t, [
+    {
+      orderId: "ORD-D2-1", state: "UNKNOWN", providerTruth: "ACCEPTED", ownerUserId: userA,
+      side: "SELL", quantity: 2, fillQuantity: 1, fillPrice: CLOSE,
+    },
+  ]);
+  await asA.mutation(api.workflows.reconcile, {});
+  const afterFirst = await accountingSnapshot(t);
+  // STALE RE-SCAN / replayed fill event: the order is put back into the
+  // unresolved set WITHOUT resetting its persisted applied quantity — the
+  // same provider fill must not be counted twice in any accounting record.
+  await t.run(async (ctx) => {
+    const o = (await ctx.db.query("orders").collect()).find((x) => x.orderId === "ORD-D2-1");
+    if (o) await ctx.db.patch(o._id, { state: "UNKNOWN" });
+  });
+  const replay = await asA.mutation(api.workflows.reconcile, {});
+  const afterReplay = await accountingSnapshot(t);
+  const order = (await ordersIn(t)).find((o) => o.orderId === "ORD-D2-1");
+  check(
+    "DB-D2-001 a replayed/stale fill event is recognized by the persisted applied quantity and never re-applied",
+    replay.resolved.length === 1 &&
+      replay.resolved[0].fillAccounted === true &&
+      JSON.stringify(afterFirst) === JSON.stringify(afterReplay) &&
+      afterReplay.outcomes.length === 1 &&
+      order?.state === "PARTIALLY_FILLED" &&
+      order?.fillAppliedQuantity === 1,
+    JSON.stringify({ replay: replay.resolved, outcomes: afterReplay.outcomes.length }),
+  );
+}
+
+{
+  const t = fresh();
+  const { userA } = await seedWorkspace(t, "ACK");
+  const asA = t.withIdentity({ subject: userA });
+  await insertOpenPosition(t, "POS-D2C", userA, 110, 2);
+  await insertOrderRows(t, [
+    {
+      orderId: "ORD-D2-2", state: "UNKNOWN", providerTruth: "ACCEPTED", ownerUserId: userA,
+      side: "SELL", quantity: 2, fillQuantity: 1, fillPrice: CLOSE,
+    },
+  ]);
+  // Repeated/concurrent reconciliation requests for the same provider fill.
+  // Convex serializes mutations (OCC), and the persisted cumulative applied
+  // quantity makes every repetition after the first a no-op.
+  await Promise.all([
+    asA.mutation(api.workflows.reconcile, {}),
+    asA.mutation(api.workflows.reconcile, {}),
+    asA.mutation(api.workflows.reconcile, {}),
+  ]);
+  const rows = await t.run(async (ctx) => ({
+    positions: await ctx.db.query("positions").collect(),
+    outcomes: await ctx.db.query("realizedTradeOutcomes").collect(),
+    accounts: await ctx.db.query("riskAccountState").collect(),
+    orders: await ctx.db.query("orders").collect(),
+  }));
+  const pos = rows.positions.find((p) => p.positionId === "POS-D2C");
+  const acct = rows.accounts.find((a) => a.ownerUserId === userA);
+  const order = rows.orders.find((o) => o.orderId === "ORD-D2-2");
+  check(
+    "DB-D2-002 repeated/concurrent reconciliation of one provider fill never double-counts any accounting record",
+    rows.outcomes.length === 1 &&
+      Math.abs((pos?.realizedPnl ?? 0) - -10) < 1e-9 &&
+      pos?.quantity === 1 &&
+      Math.abs((acct?.realizedPnlDay ?? 0) - -10) < 1e-9 &&
+      order?.state === "PARTIALLY_FILLED" &&
+      order?.fillAppliedQuantity === 1,
+    JSON.stringify({ outcomes: rows.outcomes.length, realized: pos?.realizedPnl, day: acct?.realizedPnlDay }),
+  );
+}
+
+{
+  const t = fresh();
+  const { userA } = await seedWorkspace(t, "PARTIAL");
+  const asA = t.withIdentity({ subject: userA });
+  await insertOpenPosition(t, "POS-D2P", userA, 110, 2);
+  await seedAuthorization(t, { authorizationId: "AUTH-D2P", ownerUserId: userA, side: "SELL", quantity: 2 });
+  const first = await asA.mutation(api.workflows.placeOrder, placeArgs("AUTH-D2P", "IK-D2P", "SELL", 2));
+  const afterFirst = await accountingSnapshot(t);
+  const retry = await asA.mutation(api.workflows.placeOrder, placeArgs("AUTH-D2P", "IK-D2P", "SELL", 2));
+  const afterRetry = await accountingSnapshot(t);
+  const order = (await ordersIn(t)).find((o) => o.orderId === "ORD-IK-D2P");
+  check(
+    "DB-D2-003 the mutation path persists authoritative cumulative fill accounting; a retried request never re-applies it",
+    first.state === "PARTIALLY_FILLED" &&
+      retry.state === first.state &&
+      JSON.stringify(afterFirst) === JSON.stringify(afterRetry) &&
+      afterRetry.outcomes.length === 1 &&
+      afterRetry.outcomes[0].outcomeId === "OUT-ORD-IK-D2P-1" &&
+      (order?.fillQuantity ?? 0) === 1 &&
+      order?.fillAppliedQuantity === 1 &&
+      order?.fillPrice !== undefined &&
+      Math.abs(order.fillPrice - 99.95) < 1e-9,
+    JSON.stringify({ first: first.state, retry: retry.state, outcomes: afterRetry.outcomes.length, applied: order?.fillAppliedQuantity }),
+  );
+}
+
+// ---- finding V4c: INCOMPLETE candles never price anything ------------------
+
+/** Newest-bar INCOMPLETE candle (V4c): must never price valuation or fills. */
+async function insertIncompleteMark(t: T, marketId: string, close: number) {
+  const at = Date.now();
+  await t.run(async (ctx) =>
+    ctx.db.insert("candles", {
+      marketId,
+      symbol: marketId === "MKT-T" ? "BTC/USD" : "ETH/USD",
+      assetClass: "CRYPTO",
+      venue: "SIM-VENUE",
+      timeframe: "1h",
+      eventTime: at + 1,
+      open: close,
+      high: close,
+      low: close,
+      close,
+      volume: 10,
+      source: "SIMULATED",
+      providerTimestamp: at + 1,
+      receivedTime: at + 1,
+      availabilityTime: at + 1,
+      qualityStatus: "INCOMPLETE",
+    }),
+  );
+}
+
+/** data-quality report for a second market (placeOrder precheck input). */
+async function ensureQuality(t: T, marketId: string) {
+  await t.run(async (ctx) =>
+    ctx.db.insert("dataQualityReports", {
+      marketId,
+      symbol: marketId === "MKT-T" ? "BTC/USD" : "ETH/USD",
+      timeframe: "1h",
+      state: "VALID",
+      checks: [],
+      counts: { candles: 1, duplicates: 0, gaps: 0, ohlcViolations: 0, invalidValues: 0 },
+      generatedAt: Date.now(),
+    }),
+  );
+}
+
+{
+  const t = fresh();
+  const { userA } = await seedWorkspace(t, "FILL");
+  const asA = t.withIdentity({ subject: userA });
+  await ensureMarket(t, "MKT-G2-2");
+  await ensureQuality(t, "MKT-G2-2");
+  await insertOpenPosition(t, "POS-V1", userA, 100, 1, 0, "MKT-G2-2");
+  await insertMark(t, "MKT-G2-2", 110, 0); // eligible, fresh
+  await insertIncompleteMark(t, "MKT-G2-2", 500); // NEWER bar, INCOMPLETE
+  const bundle = await ctxOf(t, userA, "IK-V4C-1");
+  await seedAuthorization(t, {
+    authorizationId: "AUTH-V4C", ownerUserId: userA, marketId: "MKT-G2-2", side: "SELL", quantity: 1,
+  });
+  const placed = await asA.mutation(api.workflows.placeOrder, {
+    ...placeArgs("AUTH-V4C", "IK-V4C-1P", "SELL", 1),
+    marketId: "MKT-G2-2",
+  });
+  const order = (await ordersIn(t)).find((o) => o.orderId === "ORD-IK-V4C-1P");
+  check(
+    "DB-V4C-001 a newest INCOMPLETE candle never overrides the eligible price (valuation AND fill pricing)",
+    bundle.ctx.valuationComplete === true &&
+      Math.abs(bundle.ctx.equity - 100010) < 1e-9 &&
+      placed.state === "FILLED" &&
+      order?.fillPrice !== undefined &&
+      Math.abs(order.fillPrice - 109.945) < 1e-9,
+    JSON.stringify({ valuation: bundle.ctx.valuationComplete, equity: bundle.ctx.equity, placed: placed.state, fillPrice: order?.fillPrice }),
+  );
+}
+
+{
+  const t = fresh();
+  const { userA } = await seedWorkspace(t, "FILL");
+  const asA = t.withIdentity({ subject: userA });
+  await ensureMarket(t, "MKT-G2-2");
+  await ensureQuality(t, "MKT-G2-2");
+  await insertOpenPosition(t, "POS-V2", userA, 100, 1, 0, "MKT-G2-2");
+  await insertIncompleteMark(t, "MKT-G2-2", 500); // the ONLY bar — never eligible
+  const bundle = await ctxOf(t, userA, "IK-V4C-2");
+  const verdict = evaluateRisk(cleanProposal, bundle.ctx, FIXTURE_APPROVED);
+  await seedAuthorization(t, {
+    authorizationId: "AUTH-V4C2", ownerUserId: userA, marketId: "MKT-G2-2", side: "SELL", quantity: 1,
+  });
+  const placed = await asA.mutation(api.workflows.placeOrder, {
+    ...placeArgs("AUTH-V4C2", "IK-V4C-2P", "SELL", 1),
+    marketId: "MKT-G2-2",
+  });
+  const pos = await t.run(async (ctx) =>
+    (await ctx.db.query("positions").collect()).find((p) => p.positionId === "POS-V2"),
+  );
+  check(
+    "DB-V4C-002 with no eligible candle the valuation is incomplete and the risk-increasing action is blocked (fail closed)",
+    bundle.ctx.valuationComplete === false &&
+      verdict.checks.some((c) => c.check === "equity_valuation" && c.status === "UNKNOWN") &&
+      !vetoAllows(verdict.outcome) &&
+      placed.state === "REJECTED" &&
+      placed.note.includes("data_freshness") &&
+      pos?.quantity === 1 &&
+      (pos?.realizedPnl ?? 0) === 0,
+    JSON.stringify({ valuation: bundle.ctx.valuationComplete, placed: placed.state, note: placed.note }),
+  );
+}
+
+// ---- finding D3: seeded/shared SYSTEM fixture P&L policy (Decision C) ------
+// The seeded workspace is INTENTIONALLY shared account state on the shared
+// execution account (Decision A). Shared fixture realized P&L is account-
+// level demo economics: it enters equity and the daily PnL fallback
+// consistently with the shared account. It NEVER enters any customer's
+// behavioral loss streak — streaks are owner-scoped behavioral instruments
+// that observe only the customer's own realized outcomes (lib/positions.ts
+// readLossStreak walks `by_owner_seq` for that owner only).
+
+{
+  const t = fresh();
+  const { userA } = await seedUsers(t);
+  await t.run(async (ctx) => ctx.db.patch(userA as never, { role: "admin" }));
+  const asAdmin = t.withIdentity({ subject: userA });
+  await asAdmin.mutation(api.seed.seed, {});
+  const bundle = await ctxOf(t, userA, "IK-D3-1");
+  const rows = await t.run(async (ctx) => ({
+    positions: await ctx.db.query("positions").collect(),
+    outcomes: await ctx.db.query("realizedTradeOutcomes").collect(),
+  }));
+  const btc = rows.positions.find((p) => p.positionId === "POS-SEED-BTC");
+  const mark = await t.run(async (ctx) =>
+    (await ctx.db
+      .query("candles")
+      .withIndex("by_market_tf_time", (q) =>
+        q.eq("marketId", "MKT-BTCUSD-SIM").eq("timeframe", "1h"),
+      )
+      .order("desc")
+      .first())?.close,
+  );
+  check(
+    "DB-D3-001 seeded positions follow the documented policy (Decision C): shared account PnL in equity/daily, owner-scoped streak",
+    btc !== undefined &&
+      btc.ownerUserId === undefined &&
+      Math.abs(btc.realizedPnl - 420.5) < 1e-9 &&
+      mark !== undefined &&
+      Math.abs(bundle.ctx.equity - (100000 + 420.5 + (mark - 62150.25) * 0.25)) < 1e-6 &&
+      Math.abs(bundle.ctx.realizedPnlToday - 420.5) < 1e-9 &&
+      bundle.ctx.consecutiveLosses === 0 &&
+      bundle.ctx.valuationComplete === true,
+    JSON.stringify({ equity: bundle.ctx.equity, today: bundle.ctx.realizedPnlToday, streak: bundle.ctx.consecutiveLosses, mark }),
+  );
+}
+
+{
+  const t = fresh();
+  const { userA } = await seedWorkspace(t, "FILL");
+  const asA = t.withIdentity({ subject: userA });
+  await insertOpenPosition(t, "POS-D3", userA, 110, 2);
+  for (const [auth, key] of [["AUTH-D3A", "IK-D3A"], ["AUTH-D3B", "IK-D3B"]] as const) {
+    await seedAuthorization(t, { authorizationId: auth, ownerUserId: userA, side: "SELL", quantity: 1 });
+    await asA.mutation(api.workflows.placeOrder, placeArgs(auth, key, "SELL", 1));
+  }
+  // Shared SYSTEM fixture outcomes (mixed results) — Decision C rule: they
+  // are shared ACCOUNT demo economics and NEVER extend or reset any
+  // customer's behavioral streak (streaks are owner-scoped by construction).
+  await t.run(async (ctx) => {
+    const now = Date.now();
+    for (const [i, row] of (
+      [
+        { outcome: "LOSS", realizedPnl: -5 },
+        { outcome: "LOSS", realizedPnl: -5 },
+        { outcome: "WIN", realizedPnl: 7 },
+      ] as const
+    ).entries()) {
+      await ctx.db.insert("realizedTradeOutcomes", {
+        outcomeId: `OUT-SHARED-${i}`,
+        ownerUserId: "",
+        orderId: `ORD-SHARED-${i}`,
+        marketId: "MKT-T",
+        realizedPnl: row.realizedPnl,
+        outcome: row.outcome,
+        closedQuantity: 1,
+        seq: i + 1,
+        createdAt: now,
+      });
+    }
+  });
+  const bundle = await ctxOf(t, userA, "IK-D3-2");
+  const ownRows = await t.run(async (ctx) =>
+    (await ctx.db.query("realizedTradeOutcomes").collect()).filter((o) => o.ownerUserId === userA),
+  );
+  check(
+    "DB-D3-002 shared SYSTEM fixture outcomes never extend or reset a customer's behavioral streak (Decision C rule)",
+    bundle.ctx.consecutiveLosses === 2 &&
+      bundle.ctx.accountStateComplete === true &&
+      ownRows.length === 2 &&
+      Math.abs(bundle.ctx.realizedPnlToday - -20.1) < 1e-9,
+    JSON.stringify({ streak: bundle.ctx.consecutiveLosses, today: bundle.ctx.realizedPnlToday, own: ownRows.length }),
+  );
+}
+
+{
+  // Fresh customer, no trades of their own, in a workspace carrying shared
+  // SYSTEM fixture state (the demo-workspace shape). Decision C: shared
+  // account economics enter equity and the daily fallback; the behavioral
+  // streak input stays EMPTY (owner-scoped) and is never fabricated.
+  const t = fresh();
+  const { userA } = await seedWorkspace(t, "ACK");
+  await insertOpenPosition(t, "POS-SHARED-FIX", undefined, 100, 2, 250);
+  await t.run(async (ctx) =>
+    ctx.db.insert("realizedTradeOutcomes", {
+      outcomeId: "OUT-SHARED-FIX-1",
+      ownerUserId: "",
+      orderId: "ORD-SHARED-FIX",
+      marketId: "MKT-T",
+      realizedPnl: -50,
+      outcome: "LOSS",
+      closedQuantity: 1,
+      seq: 1,
+      createdAt: Date.now(),
+    }),
+  );
+  const bundle = await ctxOf(t, userA, "IK-D3-3");
+  check(
+    "DB-D3-003 a fresh customer with no trades follows the documented policy: shared fixture economics in equity/daily, empty owner streak",
+    Math.abs(bundle.ctx.equity - 100250) < 1e-9 &&
+      Math.abs(bundle.ctx.realizedPnlToday - 250) < 1e-9 &&
+      bundle.ctx.consecutiveLosses === 0 &&
+      bundle.ctx.valuationComplete === true,
+    JSON.stringify({ equity: bundle.ctx.equity, today: bundle.ctx.realizedPnlToday, streak: bundle.ctx.consecutiveLosses }),
   );
 }
 

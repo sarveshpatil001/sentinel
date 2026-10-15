@@ -226,3 +226,71 @@ work establishes profitability or guarantees risk-free trading.
   console/panels show raw backend state only (verified by search).
 - No secrets, credentials, or env files touched; nothing sensitive in diffs,
   logs, or this report.
+
+---
+
+## Post-audit corrective patch (findings D1, D2, D3, D4, V4c) — SUPERSEDES
+## specific claims above
+
+Date: 2026-10-15. An independent post-audit confirmed five defects in this
+report's earlier claims. The narrative above is preserved as a dated record;
+the following corrections supersede it where they conflict:
+
+1. **D2 — "fills counted once (dedup by order + fill id)" was not true.**
+   The guard `fillDelta(filledQuantity, 0)` never subtracted an already-
+   applied quantity. Now: **authoritative cumulative-fill accounting** —
+   `orders.fillAppliedQuantity` is persisted and every provider fill is
+   applied as the delta through one atomic path (`applyProviderFill`) that
+   updates position, realized PnL, `realizedTradeOutcomes` (stable event id
+   `OUT-<orderId>-<cumulativeFilled>`) and `riskAccountState` together. The
+   same fill cannot be counted twice in any accounting record across retries,
+   replays and repeated reconciliation (`DB-D2-001..003`, `DB-RECON-017`).
+2. **D1 — reconciliation could resolve an order while dropping its fill
+   accounting.** Now a RESOLVED classification carrying fill evidence applies
+   that fill in the SAME transaction as the state transition; if the fill
+   cannot be accounted (ownerless row, unusable price, applied-quantity
+   inconsistency) the order stays UNRESOLVED/CONTRADICTORY_EVIDENCE and keeps
+   blocking — it is never merely marked ACKNOWLEDGED (`DB-D1-001/002`,
+   `TEST-RECON-107/108`).
+3. **D4 — the per-customer gate scoping described under Finding A (and in the
+   "Gate scoping per canViewRecord" risk row) is SUPERSEDED by ratified
+   Decision A.** On the shared execution account an unresolved submission
+   from EITHER customer blocks risk-increasing exposure for BOTH; the gate is
+   account-global (`orders.by_mode_state`), while customer-private DATA stays
+   isolated (foreign rows counted for account health, never disclosed or
+   patched — Decision B). Unrelated accounts remain isolated; the global
+   kill-switch release gate agrees with the account gate
+   (`DB-GATE-005/005-ks/005c`). `DB-GATE-005`'s old assertion (foreign
+   unresolved rows did not block another customer) encoded the defect and was
+   rewritten to the ratified policy; its data-isolation intent is preserved
+   and asserted in the new tests.
+4. **DB-RECON-017's "no duplicate fills/accounting" assertion was vacuous**
+   (the fixture order carried no fills). Rewritten to drive a real partial
+   fill through `reconcile` and prove exactly-once accounting across repeated
+   runs.
+5. **V4c — candles marked `INCOMPLETE` were eligible price sources.** Now
+   every mark-to-market and fill-pricing path selects only ELIGIBLE candles
+   (never `INCOMPLETE`, finite/positive close, fresh within the existing 2h
+   bound); with no eligible candle the valuation is reported incomplete and
+   risk-increasing action is blocked (`DB-V4C-001/002`).
+6. **D3 — the seeded/shared fixture P&L policy is now explicit (Decision C in
+   `docs/execution-architecture-decisions.md`):** shared SYSTEM fixture P&L is
+   shared ACCOUNT economics (enters equity, drawdown and the daily PnL
+   fallback consistently) and NEVER enters any customer's behavioral streak;
+   no ledger rows are fabricated for fixture baselines (`DB-D3-001..003`).
+
+### Corrective-patch verification (commands actually run, exit codes actual)
+
+| Check | Command | Result |
+|---|---|---|
+| Full test battery | `bun run test` | **exit 0** — engine 137/0 · db 209/0 · marketdata 50/0 · databricks 16/0 · ui 14/0 = **426 checks, 0 failures** (prior baseline 412 = 135+197+50+16+14; +14 new regression checks) |
+| Typecheck | `bunx convex dev --once` (exit 0) then `bunx tsc -b --noEmit` | **exit 0** |
+| Lint | `bun run lint` | **exit 0** — 0 errors, 17 warnings (exact pre-existing baseline) |
+| Build | `bun run build` | **exit 0** — built in 8.25s |
+
+No assertion was weakened or removed except the two mandated corrections
+above (D4's `DB-GATE-005` policy assertion and the vacuous `DB-RECON-017`
+fill assertion), each replaced by strictly stronger coverage. Live trading
+remains disabled (mode allowlist PAPER/DEMO; `CONTROLLED_LIVE` blocked in
+engine and prechecks; live credential ingestion rejected —
+`DB-RESET-CONN-*`).
