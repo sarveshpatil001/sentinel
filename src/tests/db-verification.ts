@@ -1397,6 +1397,7 @@ async function seedUsers(t: T) {
       strategyVersionId: "SV-T",
       marketId: "MKT-T",
       proposalIdempotencyKey: "IK-BOUNDS-1",
+      accountOwnerUserId: userA,
     }),
   );
   check(
@@ -1459,15 +1460,19 @@ async function seedUsers(t: T) {
 
 {
   const t = fresh();
-  await seedWorkspace(t, "ACK");
+  const { userA } = await seedWorkspace(t, "ACK");
   // 150 positions with known realized PnL (+10 each = +1500) — beyond the old
-  // positions.take(100) boundary.
+  // positions.take(100) boundary. Shared SYSTEM rows legitimately aggregate
+  // into every customer's risk scope (canViewRecord semantics — G2 keeps this
+  // "explicitly authorized shared workspace" aggregation while excluding
+  // OTHER customers' rows).
   await insertPositionRows(t, 150, 10);
   const { ctx: riskCtx } = await t.run(async (ctx) =>
     loadRiskContext(ctx, {
       strategyVersionId: "SV-T",
       marketId: "MKT-T",
       proposalIdempotencyKey: "IK-BOUNDS-2",
+      accountOwnerUserId: userA,
     }),
   );
   check(
@@ -1489,7 +1494,7 @@ async function seedUsers(t: T) {
 
 {
   const t = fresh();
-  await seedWorkspace(t, "ACK");
+  const { userA } = await seedWorkspace(t, "ACK");
   // Saturate the bounded read entirely (SCAN_CAP = 2000): completeness can no
   // longer be established and must surface as fail-closed, never a silent
   // undercount.
@@ -1499,6 +1504,7 @@ async function seedUsers(t: T) {
       strategyVersionId: "SV-T",
       marketId: "MKT-T",
       proposalIdempotencyKey: "IK-BOUNDS-3",
+      accountOwnerUserId: userA,
     }),
   );
   check(
@@ -2688,6 +2694,172 @@ async function backendRepairBattery() {
   const auditAll = await t.run(async (ctx) => ctx.db.query("auditEvents").collect());
   check("DB-G1-010 no audit record contains private strategy definition parameters",
     !auditAll.some((a) => a.detail.includes("131") || a.detail.includes("277")));
+}
+
+// ---------------------------------------------------------------------------
+// DB-G2-* — G2 HOTFIX REGRESSION: per-customer risk isolation.
+// Before the fix, loadRiskContext aggregated positions/equity/realized PnL
+// over ALL owners and read daily-PnL/peak-equity from the SHARED systemState
+// row: one customer's positions or losses changed every other customer's risk
+// verdict. Now risk inputs come from the caller's risk scope only (own +
+// shared SYSTEM rows — canViewRecord semantics; the shared SYSTEM demo
+// workspace is explicitly authorized for every customer), and accounting
+// lives in a PER-CUSTOMER ledger (riskAccountState).
+// ---------------------------------------------------------------------------
+{
+  const t = fresh();
+  const { userA, userB } = await seedWorkspace(t, "FILL");
+  const asA = t.withIdentity({ subject: userA });
+  const asB = t.withIdentity({ subject: userB });
+
+  // Fixture: A owns +100 and +50 across two markets; B owns -5000; one shared
+  // SYSTEM demo row (+1000). Per-customer ledgers: A's daily PnL -100, B's
+  // daily PnL -3000 (beyond the seeded maxDailyLoss of 2000).
+  const dayKey = new Date().toISOString().slice(0, 10);
+  await t.run(async (ctx) => {
+    const now = Date.now();
+    const insertPos = (positionId: string, ownerUserId: string | undefined, marketId: string, symbol: string, realizedPnl: number) =>
+      ctx.db.insert("positions", {
+        positionId,
+        account: "PAPER:paper-account",
+        marketId,
+        symbol,
+        side: "LONG",
+        quantity: 1,
+        avgEntryPrice: 100,
+        realizedPnl,
+        source: "PAPER",
+        updatedAt: now,
+        ...(ownerUserId !== undefined ? { ownerUserId } : {}),
+      });
+    await insertPos("POS-G2-A1", userA, "MKT-T", "BTC/USD", 100);
+    await insertPos("POS-G2-A2", userA, "MKT-G2-2", "ETH/USD", 50);
+    await insertPos("POS-G2-B1", userB, "MKT-T", "BTC/USD", -5000);
+    await insertPos("POS-G2-SYS", undefined, "MKT-T", "BTC/USD", 1000);
+    await ctx.db.insert("riskAccountState", {
+      ownerUserId: userA, peakEquity: 100000, pnlDay: dayKey, realizedPnlDay: -100, updatedAt: now,
+    });
+    await ctx.db.insert("riskAccountState", {
+      ownerUserId: userB, peakEquity: 100000, pnlDay: dayKey, realizedPnlDay: -3000, updatedAt: now,
+    });
+  });
+
+  const scopeA = await t.run(async (ctx) =>
+    loadRiskContext(ctx, {
+      strategyVersionId: "SV-T", marketId: "MKT-T",
+      proposalIdempotencyKey: "IK-G2-A", accountOwnerUserId: userA,
+    }),
+  );
+  const scopeB = await t.run(async (ctx) =>
+    loadRiskContext(ctx, {
+      strategyVersionId: "SV-T", marketId: "MKT-T",
+      proposalIdempotencyKey: "IK-G2-B", accountOwnerUserId: userB,
+    }),
+  );
+
+  // (1) A's risk inputs exclude B's positions and losses:
+  // equity = 100000 + 100 + 50 (own) + 1000 (shared SYSTEM); B's -5000 gone.
+  check("DB-G2-001 customer A's risk context excludes customer B's positions and losses",
+    scopeA.ctx.equity === 100000 + 150 + 1000 &&
+    scopeA.ctx.openPositions === 3 &&
+    scopeA.ctx.realizedPnlToday === -100 &&
+    scopeA.ctx.accountStateComplete === true,
+    JSON.stringify({ equity: scopeA.ctx.equity, open: scopeA.ctx.openPositions, today: scopeA.ctx.realizedPnlToday }));
+
+  // (2) B's risk inputs exclude A's positions and losses:
+  // equity = 100000 - 5000 (own) + 1000 (shared SYSTEM); A's +150 gone.
+  check("DB-G2-002 customer B's risk context excludes customer A's positions and losses",
+    scopeB.ctx.equity === 100000 - 5000 + 1000 &&
+    scopeB.ctx.openPositions === 2 &&
+    scopeB.ctx.realizedPnlToday === -3000,
+    JSON.stringify({ equity: scopeB.ctx.equity, open: scopeB.ctx.openPositions, today: scopeB.ctx.realizedPnlToday }));
+
+  // (3) One customer's loss does not alter another customer's risk verdict:
+  // identical proposal + identical policy -> A's daily_loss PASSES (loss 100
+  // within 2000) while B's daily_loss BLOCKS on B's OWN loss (3000 >= 2000).
+  const fixturePolicy: RiskPolicy = {
+    policyId: "TEST-FIXTURE-NOT-RATIFIED",
+    version: 1,
+    status: "APPROVED",
+    limits: SEEDED_POLICY.limits,
+  };
+  const proposal: TradeProposal = {
+    proposalId: "PROP-G2",
+    side: "BUY",
+    quantity: 0.1,
+    referencePrice: CLOSE,
+    orderType: "MARKET",
+    mode: "PAPER",
+  };
+  const verdictA = evaluateRisk(proposal, scopeA.ctx, fixturePolicy);
+  const verdictB = evaluateRisk(proposal, scopeB.ctx, fixturePolicy);
+  const dailyA = verdictA.checks.find((c) => c.check === "daily_loss");
+  const dailyB = verdictB.checks.find((c) => c.check === "daily_loss");
+  check("DB-G2-003 one customer's loss does not alter another customer's risk verdict",
+    dailyA?.status === "PASS" && dailyB?.status === "BLOCK",
+    JSON.stringify({ a: dailyA, b: dailyB }));
+
+  // (4) Same-customer positions aggregate correctly across markets, through
+  // the REAL fill path (placeOrder with FILL behavior): A sells 1 BTC,
+  // closing POS-G2-A1 at 99.95 -> realized 99.95; equity aggregates A's rows
+  // (99.95 + 50) plus the shared SYSTEM row (1000).
+  await seedAuthorization(t, { authorizationId: "AUTH-G2-A", ownerUserId: userA, side: "SELL", quantity: 1 });
+  await asA.mutation(api.workflows.placeOrder, placeArgs("AUTH-G2-A", "IK-G2-AFILL", "SELL", 1));
+  const scopeA2 = await t.run(async (ctx) =>
+    loadRiskContext(ctx, {
+      strategyVersionId: "SV-T", marketId: "MKT-T",
+      proposalIdempotencyKey: "IK-G2-A2", accountOwnerUserId: userA,
+    }),
+  );
+  const acctA = await t.run(async (ctx) =>
+    ctx.db.query("riskAccountState").withIndex("by_ownerUserId", (q) => q.eq("ownerUserId", userA)).first());
+  check("DB-G2-004 same-customer positions aggregate correctly and fills update the customer's own ledger",
+    Math.abs(scopeA2.ctx.equity - (100000 + 99.95 + 50 + 1000)) < 1e-6 &&
+    scopeA2.ctx.openPositions === 2 &&
+    Math.abs((acctA?.realizedPnlDay ?? 999) - -100.05) < 1e-6 &&
+    Math.abs((acctA?.peakEquity ?? 0) - (100000 + 99.95 + 50 + 1000)) < 1e-6,
+    JSON.stringify({ equity: scopeA2.ctx.equity, open: scopeA2.ctx.openPositions, acctA }));
+
+  // (5) Unauthorized account/position references are rejected: B's own fill
+  // (SELL 1, closing POS-G2-B1 at 99.95 -> realized -5000.05) must touch ONLY
+  // B's position and B's ledger — A's position row and A's ledger stay
+  // byte-identical.
+  const posA1Before = await t.run(async (ctx) =>
+    (await ctx.db.query("positions").collect()).find((p) => p.positionId === "POS-G2-A1"));
+  const acctABefore = await t.run(async (ctx) =>
+    ctx.db.query("riskAccountState").withIndex("by_ownerUserId", (q) => q.eq("ownerUserId", userA)).first());
+  await seedAuthorization(t, { authorizationId: "AUTH-G2-B", ownerUserId: userB, side: "SELL", quantity: 1 });
+  await asB.mutation(api.workflows.placeOrder, placeArgs("AUTH-G2-B", "IK-G2-BFILL", "SELL", 1));
+  const posA1After = await t.run(async (ctx) =>
+    (await ctx.db.query("positions").collect()).find((p) => p.positionId === "POS-G2-A1"));
+  const acctAAfter = await t.run(async (ctx) =>
+    ctx.db.query("riskAccountState").withIndex("by_ownerUserId", (q) => q.eq("ownerUserId", userA)).first());
+  const acctBAfter = await t.run(async (ctx) =>
+    ctx.db.query("riskAccountState").withIndex("by_ownerUserId", (q) => q.eq("ownerUserId", userB)).first());
+  const posB1After = await t.run(async (ctx) =>
+    (await ctx.db.query("positions").collect()).find((p) => p.positionId === "POS-G2-B1"));
+  check("DB-G2-005 a fill never touches another customer's position or account state",
+    JSON.stringify(posA1Before) === JSON.stringify(posA1After) &&
+    JSON.stringify(acctABefore) === JSON.stringify(acctAAfter) &&
+    Math.abs((acctBAfter?.realizedPnlDay ?? 999) - -3000.05) < 1e-6 &&
+    Math.abs((posB1After?.realizedPnl ?? 0) - -5000.05) < 1e-6,
+    JSON.stringify({ acctB: acctBAfter, posB: posB1After }));
+
+  // (6) The shared platform controls remain separate from customer accounting:
+  // the per-customer ledger is what feeds verdicts; and B's loss never moved
+  // A's daily-loss input (re-checked after B's fill).
+  const scopeA3 = await t.run(async (ctx) =>
+    loadRiskContext(ctx, {
+      strategyVersionId: "SV-T", marketId: "MKT-T",
+      proposalIdempotencyKey: "IK-G2-A3", accountOwnerUserId: userA,
+    }),
+  );
+  const verdictA3 = evaluateRisk(proposal, scopeA3.ctx, fixturePolicy);
+  check("DB-G2-006 after B's loss, A's daily-loss verdict is unchanged (controls stay separate)",
+    scopeA3.ctx.realizedPnlToday === -100.05 &&
+    verdictA3.checks.find((c) => c.check === "daily_loss")?.status === "PASS" &&
+    scopeA3.ctx.killSwitchEngaged === false,
+    JSON.stringify({ today: scopeA3.ctx.realizedPnlToday, checks: verdictA3.checks.filter((c) => c.status !== "PASS") }));
 }
 
 await backendRepairBattery();

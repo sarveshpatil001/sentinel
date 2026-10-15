@@ -5,8 +5,13 @@ Date: 2026-10-15. Phase: PLANNING ONLY — **no source code was modified** for t
 deliverable (this document is the only file created).
 
 > **STATUS UPDATE 2026-10-15:** Step 0 (G1 hotfix) has been IMPLEMENTED and
-> verified — see `docs/SENTINEL_PRIME_G1_HOTFIX_REPORT.md`. Steps 1–6 remain
-> unimplemented; G2+ untouched as instructed.
+> verified — see `docs/SENTINEL_PRIME_G1_HOTFIX_REPORT.md`.
+> **UPDATE 2 (2026-10-15):** the G2 risk-isolation hotfix (per-customer risk
+> inputs + per-customer accounting ledger `riskAccountState`) has been
+> IMPLEMENTED and verified — see `docs/SENTINEL_PRIME_G2_HOTFIX_REPORT.md`.
+> Within Step 2 that covers per-tenant accounting only; the tenancy tables,
+> kill-switch scoping (G3), UNKNOWN-gate/idempotency scoping (G4/G5) and the
+> legacy `systemState` accounting removal remain open. Steps 3–6 untouched.
 
 Core product principle preserved throughout:
 **One product. Many customers. Multiple supported markets. Multiple supported

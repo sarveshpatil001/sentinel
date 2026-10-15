@@ -401,6 +401,10 @@ export async function executeAnalysis(
       strategyVersionId: result.strategyVersionId,
       marketId: market.marketId,
       proposalIdempotencyKey: `${analysisId}:${result.strategyId}`,
+      // G2: hypothetical proposals are evaluated against the ANALYSIS OWNER's
+      // risk scope (server-derived from the auth identity by the pipeline
+      // entry points — never client-supplied).
+      accountOwnerUserId: ownerUserId,
     });
     // Hypothetical proposal derived from REAL data + the candidate's own
     // sizing definition. Analysis-only: no order/authorization is created.

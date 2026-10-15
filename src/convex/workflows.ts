@@ -58,12 +58,60 @@ export interface RiskContextBundle {
   policy: RiskPolicy;
 }
 
+/**
+ * RISK-SCOPE POSITION READS (G2 tenant risk isolation).
+ *
+ * A customer's risk inputs are their OWN positions PLUS shared SYSTEM demo
+ * rows — exactly `canViewRecord` semantics (the shared SYSTEM workspace is
+ * explicitly authorized for every customer; see lib/authz.ts). NEVER another
+ * customer's rows: another customer's positions or losses must not change
+ * this customer's risk verdict.
+ *
+ * Both reads are INDEXED and saturation-detected PER SCOPE (`by_owner_market`
+ * prefix; Convex indexes include documents missing the field, matched with
+ * `.eq(..., undefined)`), so another customer's row volume can never affect
+ * this scope's completeness. Saturation at SCAN_CAP fails CLOSED.
+ */
+async function readRiskScopePositions(
+  ctx: MutationCtx,
+  accountOwnerUserId: string,
+): Promise<{ rows: { realizedPnl: number; quantity: number }[]; complete: boolean }> {
+  const own = await ctx.db
+    .query("positions")
+    .withIndex("by_owner_market", (q) => q.eq("ownerUserId", accountOwnerUserId))
+    .take(SCAN_CAP);
+  const shared = await ctx.db
+    .query("positions")
+    .withIndex("by_owner_market", (q) => q.eq("ownerUserId", undefined))
+    .take(SCAN_CAP);
+  return {
+    rows: [...own, ...shared],
+    complete: own.length < SCAN_CAP && shared.length < SCAN_CAP,
+  };
+}
+
+/** Per-customer accounting ledger (daily PnL, peak equity). */
+async function readRiskAccountState(ctx: MutationCtx, accountOwnerUserId: string) {
+  return await ctx.db
+    .query("riskAccountState")
+    .withIndex("by_ownerUserId", (q) => q.eq("ownerUserId", accountOwnerUserId))
+    .first();
+}
+
 export async function loadRiskContext(
   ctx: MutationCtx,
   args: {
     strategyVersionId: string;
     marketId: string;
     proposalIdempotencyKey: string;
+    /**
+     * G2: owner of the risk account whose inputs are being assembled.
+     * ALWAYS server-derived from the trusted auth identity at the mutation
+     * boundary (submitTradeProposal derives it via getAuthUserId; the
+     * analysis pipeline passes the authenticated analysis owner). NEVER a
+     * client-supplied value — a caller cannot widen or shift their scope.
+     */
+    accountOwnerUserId: string;
   },
 ): Promise<RiskContextBundle> {
   const state = await ctx.db.query("systemState").first();
@@ -99,10 +147,16 @@ export async function loadRiskContext(
     .order("desc")
     .first()) ?? null;
 
-  // BOUNDED-SCAN SAFETY: positions are read with saturation detection (see
-  // SCAN_CAP). The UNKNOWN-gate and duplicate-key reads below are INDEXED
-  // checks — complete at any table size and any record age.
-  const positions = await ctx.db.query("positions").take(SCAN_CAP);
+  // BOUNDED-SCAN SAFETY (G2-scoped): positions are read from the caller's
+  // risk scope only — own + shared SYSTEM rows, never another customer's —
+  // with PER-SCOPE saturation detection (see readRiskScopePositions). The
+  // UNKNOWN-gate and duplicate-key reads below are INDEXED checks — complete
+  // at any table size and any record age. The UNKNOWN gate remains GLOBAL and
+  // fail-closed by design (plan gap G4): any unresolved UNKNOWN order blocks
+  // new exposure regardless of owner until the tenancy adjudication in plan
+  // Step 2.
+  const scopePositions = await readRiskScopePositions(ctx, args.accountOwnerUserId);
+  const positions = scopePositions.rows;
   const unknownRows = await ctx.db
     .query("orders")
     .withIndex("by_state", (q) => q.eq("state", "UNKNOWN"))
@@ -112,25 +166,32 @@ export async function loadRiskContext(
     .withIndex("by_idempotencyKey", (q) => q.eq("idempotencyKey", args.proposalIdempotencyKey))
     .first();
   // Completeness CANNOT be established past the cap -> fail closed upstream.
-  const accountStateComplete = positions.length < SCAN_CAP && unknownRows.length < SCAN_CAP;
+  // Scope completeness is independent of other customers' row volume.
+  const accountStateComplete = scopePositions.complete && unknownRows.length < SCAN_CAP;
 
+  // G2: equity and exposure aggregate ONLY over this customer's risk scope
+  // (own + shared SYSTEM rows). Another customer's positions or losses never
+  // enter these figures.
   const realized = positions.reduce((a, p) => a + p.realizedPnl, 0);
   const equity = PAPER_EQUITY_BASE + realized;
   const openPositions = positions.filter((p) => p.quantity > 0).length;
 
-  // Daily-loss accounting: server-tracked UTC-day realized PnL. Legacy rows
-  // without day tracking fall back to the CUMULATIVE realized PnL — never
-  // zero (MISSING must not become a permissive default).
+  // Daily-loss accounting: PER-CUSTOMER server-tracked UTC-day realized PnL
+  // (riskAccountState). A customer without day tracking falls back to their
+  // own CUMULATIVE realized PnL — never zero (MISSING must not become a
+  // permissive default), and never another customer's ledger.
   const dayKey = new Date().toISOString().slice(0, 10);
+  const accountState = await readRiskAccountState(ctx, args.accountOwnerUserId);
   const realizedPnlToday =
-    state?.pnlDay === undefined
+    accountState?.pnlDay === undefined
       ? realized
-      : state.pnlDay === dayKey
-        ? (state.realizedPnlDay ?? 0)
+      : accountState.pnlDay === dayKey
+        ? (accountState.realizedPnlDay ?? 0)
         : 0;
-  // Peak equity is server-maintained at fill time; the legacy fallback is the
-  // contribution base (never `equity` itself, which would force drawdown to 0).
-  const peakEquity = Math.max(state?.peakEquity ?? PAPER_EQUITY_BASE, equity);
+  // Peak equity is per-customer and server-maintained at fill time; the
+  // fallback is the contribution base (never `equity` itself, which would
+  // force drawdown to 0).
+  const peakEquity = Math.max(accountState?.peakEquity ?? PAPER_EQUITY_BASE, equity);
   // Indexed state read: detection of unresolved UNKNOWN orders is complete at
   // any table size (the count is exact below SCAN_CAP; at/above the cap the
   // exact total is unknown — `accountStateComplete` is false and exposure is
@@ -233,6 +294,9 @@ export const submitTradeProposal = mutation({
       strategyVersionId: args.strategyVersionId,
       marketId: args.marketId,
       proposalIdempotencyKey: args.idempotencyKey,
+      // G2: risk inputs are scoped to the CALLER's account (server-derived
+      // from the auth identity above — never a client-supplied owner id).
+      accountOwnerUserId: userId,
     });
 
     const proposal: TradeProposal = {
@@ -571,22 +635,56 @@ export const placeOrder = mutation({
         // Account-level risk accounting maintained server-side at fill time:
         // daily realized PnL (UTC day) and all-time peak equity.
         const realizedDelta = next.realizedPnl - (prev?.realizedPnl ?? 0);
-        // BOUNDED-SCAN SAFETY: saturation-aware read (see SCAN_CAP). If the
-        // scan ever saturates, `loadRiskContext` reports incompleteness and
-        // ALL new exposure is blocked fail-closed (UNKNOWN verdict), so a
-        // fill-time equity figure can only undercount inside a regime where no
-        // new authorization can be granted anyway.
-        const allPositions = await ctx.db.query("positions").take(SCAN_CAP);
-        const totalRealized = allPositions.reduce((a, p) => a + p.realizedPnl, 0);
+        // BOUNDED-SCAN SAFETY: saturation-aware, G2-SCOPED read (see
+        // readRiskScopePositions). Equity is recomputed over the CALLER's
+        // risk scope only — another customer's realized PnL can never enter
+        // this customer's equity. If the scope read saturates,
+        // `loadRiskContext` reports incompleteness and ALL new exposure is
+        // blocked fail-closed (UNKNOWN verdict).
+        const scopePositions = await readRiskScopePositions(ctx, userId);
+        const totalRealized = scopePositions.rows.reduce((a, p) => a + p.realizedPnl, 0);
         const equityNow = PAPER_EQUITY_BASE + totalRealized;
         const dayKey = new Date(now).toISOString().slice(0, 10);
+        // PER-CUSTOMER accounting ledger (G2): this row is consumed ONLY by
+        // this customer's risk context. One customer's fill can never move
+        // another customer's daily PnL or peak equity.
+        const accountState = await readRiskAccountState(ctx, userId);
         const realizedPnlDay =
-          state?.pnlDay === dayKey ? (state.realizedPnlDay ?? 0) + realizedDelta : realizedDelta;
+          accountState?.pnlDay === dayKey
+            ? (accountState.realizedPnlDay ?? 0) + realizedDelta
+            : realizedDelta;
+        const peakEquityNow = Math.max(
+          accountState?.peakEquity ?? PAPER_EQUITY_BASE,
+          equityNow,
+        );
+        if (accountState) {
+          await ctx.db.patch(accountState._id, {
+            peakEquity: peakEquityNow,
+            pnlDay: dayKey,
+            realizedPnlDay,
+            updatedAt: now,
+          });
+        } else {
+          await ctx.db.insert("riskAccountState", {
+            ownerUserId: userId,
+            peakEquity: peakEquityNow,
+            pnlDay: dayKey,
+            realizedPnlDay,
+            updatedAt: now,
+          });
+        }
+        // LEGACY platform-aggregate telemetry (all customers summed): kept
+        // maintained for the documented shared-account ledger, but NOT
+        // consumed by any risk calculation (loadRiskContext reads
+        // riskAccountState) and separate from the shared platform controls
+        // (kill switch/mode) in this same row. Removal is deferred to plan
+        // Step 2 migration.
         if (state) {
           await ctx.db.patch(state._id, {
             peakEquity: Math.max(state.peakEquity ?? PAPER_EQUITY_BASE, equityNow),
             pnlDay: dayKey,
-            realizedPnlDay,
+            realizedPnlDay:
+              state?.pnlDay === dayKey ? (state.realizedPnlDay ?? 0) + realizedDelta : realizedDelta,
             updatedAt: now,
           });
         }

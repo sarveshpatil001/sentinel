@@ -781,6 +781,23 @@ const schema = defineSchema(
     }).index("by_userId", ["userId"]),
 
     // -----------------------------------------------------------------------
+    // RISK ACCOUNTING (per customer account) — G2 isolation.
+    //
+    // Server-derived at fill time and consumed ONLY by the owning customer's
+    // risk context (`loadRiskContext`). One row per customer account: daily
+    // realized PnL (UTC day) and all-time peak equity. Shared platform
+    // controls (kill switch, mode, simulation config) stay in `systemState`
+    // and never mix with customer-specific accounting.
+    // -----------------------------------------------------------------------
+    riskAccountState: defineTable({
+      ownerUserId: v.string(),
+      peakEquity: v.number(),
+      pnlDay: v.optional(v.string()),
+      realizedPnlDay: v.optional(v.number()),
+      updatedAt: v.number(),
+    }).index("by_ownerUserId", ["ownerUserId"]),
+
+    // -----------------------------------------------------------------------
     // SYSTEM STATE — mode, kill switch, controlled-live gates (Section 30)
     // -----------------------------------------------------------------------
     systemState: defineTable({
