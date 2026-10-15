@@ -64,18 +64,21 @@ export function isUnresolvedSubmissionState(state: string): boolean {
  * Evidence contract (the repository's provider contract,
  * normalizeProviderResponse): provider evidence is ACCEPTED, REJECTED or
  * NONE. The rules:
- *  - ACCEPTED (authoritative: the provider ledger has the order) -> RESOLVED
- *    to ACKNOWLEDGED; REJECTED -> RESOLVED to REJECTED. This is the documented
- *    resolution condition for a pending/ambiguous submission.
+ *  - ACCEPTED (authoritative: the provider ledger has the order) -> RESOLVED:
+ *    to ACKNOWLEDGED when no fill is recorded, or to the FILL-TRUTHFUL state
+ *    (PARTIALLY_FILLED / FILLED) when fill evidence is recorded. REJECTED ->
+ *    RESOLVED to REJECTED. Resolution with fill evidence obliges the caller to
+ *    account those fills in the SAME transaction (finding D1): an order
+ *    carrying unapplied fill data is never merely marked ACKNOWLEDGED.
  *  - NONE / absent evidence -> NEVER a terminal result. A timeout, a missing
  *    response or an absent provider record is not proof of rejection or of
  *    non-submission: the order stays in its current state and is reported
  *    UNRESOLVED (PENDING_SUBMISSION for SUBMITTING/SUBMITTED — a normal known
  *    pending order; AMBIGUOUS for UNKNOWN — a possible submission).
  *  - Contradictory evidence (fills on a rejected order, a fill quantity beyond
- *    the order quantity, invalid price/quantity fields) -> UNRESOLVED
- *    (CONTRADICTORY_EVIDENCE): contradictory evidence never manufactures a
- *    terminal result.
+ *    the order quantity, fills without a usable price, invalid price/quantity
+ *    fields) -> UNRESOLVED (CONTRADICTORY_EVIDENCE): contradictory evidence
+ *    never manufactures a terminal result.
  *  - Any unrecognized state value -> UNRESOLVED (UNRECOGNIZED_STATE), fail
  *    closed.
  */
@@ -115,6 +118,9 @@ export function classifyOrderReconciliation(order: {
     quantity <= 0 ||
     (hasFill && (!Number.isFinite(fillQuantity) || (fillQuantity as number) < 0 || (fillQuantity as number) > quantity)) ||
     (fillPrice !== undefined && fillPrice !== null && (!Number.isFinite(fillPrice) || (fillPrice as number) <= 0)) ||
+    // A recorded fill without a usable price can never be ACCOUNTED — fail
+    // closed as contradictory (finding D1: never resolve with unapplied fills).
+    (hasFill && (fillQuantity as number) > 0 && (fillPrice === undefined || fillPrice === null)) ||
     (providerTruth === "REJECTED" && hasFill && (fillQuantity as number) > 0);
   if (contradictory) {
     return {
@@ -125,6 +131,26 @@ export function classifyOrderReconciliation(order: {
   }
 
   if (providerTruth === "ACCEPTED") {
+    // Fill evidence is part of the accepted truth: the resolved state must
+    // reflect it (an order carrying fills is never merely ACKNOWLEDGED), and
+    // the caller MUST account those fills atomically with this transition
+    // (findings D1/D2). The contradictory-evidence guard above has already
+    // ruled out unusable fill data.
+    const filled = hasFill ? (fillQuantity as number) : 0;
+    if (filled > 0 && filled < quantity) {
+      return {
+        kind: "RESOLVED",
+        to: "PARTIALLY_FILLED",
+        note: "RECONCILIATION: provider ledger shows ACCEPTED with partial fill evidence — the fill MUST be accounted atomically with this transition (never resolved with unapplied fill data).",
+      };
+    }
+    if (filled >= quantity) {
+      return {
+        kind: "RESOLVED",
+        to: "FILLED",
+        note: "RECONCILIATION: provider ledger shows ACCEPTED with full fill evidence — the fill MUST be accounted atomically with this transition (never resolved with unapplied fill data).",
+      };
+    }
     return {
       kind: "RESOLVED",
       to: "ACKNOWLEDGED",

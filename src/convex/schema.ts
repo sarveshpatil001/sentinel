@@ -446,6 +446,12 @@ const schema = defineSchema(
       ),
       fillPrice: v.optional(v.number()),
       fillQuantity: v.optional(v.number()),
+      // CUMULATIVE provider fill quantity already applied to position/P&L/
+      // outcome accounting (finding D2). `fillQuantity` is what the provider
+      // reported; `fillAppliedQuantity` is what has been accounted. Only the
+      // difference may touch the ledger, so a re-applied or replayed fill
+      // event can never double-count in any accounting record.
+      fillAppliedQuantity: v.optional(v.number()),
       fees: v.optional(v.number()),
       slippage: v.optional(v.number()),
       history: v.array(
@@ -469,11 +475,18 @@ const schema = defineSchema(
       // indexed existence checks stay complete at any table size — safety
       // decisions must never depend on a bounded scan.
       .index("by_state", ["state"])
-      // PER-OWNER, PER-STATE lookup (the unresolved-submission gate and the
-      // reconciliation scan): own + shared SYSTEM rows are read through this
-      // index, so another customer's row volume can never degrade this
-      // scope's scan completeness (same doctrine as positions.by_owner_market).
-      .index("by_owner_state", ["ownerUserId", "state"]),
+      // PER-OWNER, PER-STATE lookup (the reconciliation ACTION scan — own +
+      // shared SYSTEM rows the caller may act on): indexed reads stay complete
+      // at any table size, and another customer's row volume can never
+      // degrade this scope's scan completeness.
+      .index("by_owner_state", ["ownerUserId", "state"])
+      // PER-ACCOUNT, PER-STATE lookup (Decision A shared-account exposure
+      // gate): the account is derived from `mode` per the authorization-scope
+      // contract (`<mode>:paper-account`). EVERY order on the execution
+      // account restricts that account regardless of owner, while unrelated
+      // accounts are never scanned (their volume can never degrade this
+      // account's scan completeness).
+      .index("by_mode_state", ["mode", "state"]),
 
     positions: defineTable({
       positionId: v.string(),

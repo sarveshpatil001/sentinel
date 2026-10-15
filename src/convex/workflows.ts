@@ -124,24 +124,50 @@ async function readRiskAccountState(ctx: MutationCtx, accountOwnerUserId: string
 }
 
 /**
- * UNRESOLVED-SUBMISSION GATE READ (findings A/B, one shared policy with
+ * UNRESOLVED-SUBMISSION GATE READ (findings A/B/D4, one shared policy with
  * lib/execution.ts UNRESOLVED_SUBMISSION_STATES).
  *
- * Scans the orders that REQUIRE RECONCILIATION — SUBMITTING / SUBMITTED /
- * UNKNOWN — within the caller's risk scope (own + shared SYSTEM rows, exactly
- * canViewRecord semantics; NEVER another customer's rows: one customer's
- * records must not improperly affect another customer's risk decisions).
+ * DECISION A (docs/execution-architecture-decisions.md, re-ratified by the
+ * post-fix audit): the exposure gate is ACCOUNT-GLOBAL and fail-closed. The
+ * account is derived from `mode` per the authorization-scope contract
+ * (`<mode>:paper-account`). While ANY order on the execution account is in an
+ * unresolved submission state — SUBMITTING / SUBMITTED / UNKNOWN, ANY owner —
+ * the account's true exposure is unknown and risk-increasing action on that
+ * account is blocked. Unrelated accounts are never scanned: their row volume
+ * can never degrade this account's completeness.
  *
- * BOUNDED-SCAN SAFETY: six INDEXED per-owner-per-state reads via
- * `by_owner_state`; saturation is detected PER STATE AND SCOPE, so another
- * customer's row volume can never degrade this scope's completeness. At/above
- * the cap the exact count is unknown -> `complete: false` -> the engine fails
- * CLOSED (never a silent undercount).
+ * BOUNDED-SCAN SAFETY: INDEXED per-mode-per-state reads via `by_mode_state`,
+ * with saturation detected PER STATE. At/above the cap the exact count is
+ * unknown -> `complete: false` -> the engine fails CLOSED (never a silent
+ * undercount).
  */
-async function scanUnresolvedOrders(
+async function scanUnresolvedAccountOrders(
+  ctx: MutationCtx,
+  accountMode: Doc<"orders">["mode"],
+): Promise<{ rows: Doc<"orders">[]; count: number; complete: boolean }> {
+  const rows: Doc<"orders">[] = [];
+  let complete = true;
+  for (const state of UNRESOLVED_SUBMISSION_STATES) {
+    const found = await ctx.db
+      .query("orders")
+      .withIndex("by_mode_state", (q) => q.eq("mode", accountMode).eq("state", state))
+      .take(SCAN_CAP);
+    rows.push(...found);
+    if (found.length >= SCAN_CAP) complete = false;
+  }
+  return { rows, count: rows.length, complete };
+}
+
+/**
+ * ACTIONABLE unresolved-submission read (Decision B): own + shared SYSTEM
+ * rows — the records this caller may reconcile (never another customer's
+ * rows; not-found == not-owned, no cross-user leak). Indexed per-owner-
+ * per-state reads with per-scope saturation detection.
+ */
+async function scanUnresolvedOwnedOrders(
   ctx: MutationCtx,
   accountOwnerUserId: string,
-): Promise<{ rows: Doc<"orders">[]; count: number; complete: boolean }> {
+): Promise<{ rows: Doc<"orders">[]; complete: boolean }> {
   const rows: Doc<"orders">[] = [];
   let complete = true;
   for (const owner of [accountOwnerUserId, undefined]) {
@@ -154,7 +180,7 @@ async function scanUnresolvedOrders(
       if (found.length >= SCAN_CAP) complete = false;
     }
   }
-  return { rows, count: rows.length, complete };
+  return { rows, complete };
 }
 
 /**
@@ -163,6 +189,14 @@ async function scanUnresolvedOrders(
  * computeLossStreak). Bounded at SCAN_CAP with explicit saturation detection —
  * an unestablishable streak is NEVER silently substituted as zero: the read
  * reports `complete: false` and the engine fails closed upstream.
+ *
+ * DECISION C (docs/execution-architecture-decisions.md): the loss streak is a
+ * OWNER-SCOPED BEHAVIORAL limit — it counts the completed trades of ONE
+ * decision-maker. Shared SYSTEM fixture outcomes (e.g. the seeded demo
+ * workspace) belong to no decision-maker: they are RECORDED in the ledger for
+ * completeness/audit but deliberately NEVER read here, so demo data can
+ * neither mask a real losing run nor fabricate one. Per-owner sequence gap
+ * detection requires exactly this single-owner ledger.
  */
 async function readLossStreak(ctx: MutationCtx, accountOwnerUserId: string) {
   const rows = await ctx.db
@@ -187,6 +221,31 @@ const MARK_MAX_AGE_MS = 2 * HOUR;
 // reported INCOMPLETE (fail closed) rather than silently skipping markets.
 const MARKET_FANOUT_CAP = 256;
 
+// CANDLE ELIGIBILITY FOR RISK PRICES (V4c): every candle-selection path used
+// for mark-to-market valuation and fill pricing goes through this helper. A
+// bar flagged INCOMPLETE is never an eligible price source, and an eligible
+// bar must still carry a finite, positive close. The newest-first walk is
+// bounded (eligibility window); if no eligible bar exists the answer is null
+// — never a filler price — and the callers fail CLOSED (valuation incomplete /
+// data freshness blocked).
+const CANDLE_ELIGIBILITY_WINDOW = 50;
+
+async function latestEligibleCandle(ctx: MutationCtx, marketId: string) {
+  const rows = await ctx.db
+    .query("candles")
+    .withIndex("by_market_tf_time", (q) =>
+      q.eq("marketId", marketId).eq("timeframe", "1h"),
+    )
+    .order("desc")
+    .take(CANDLE_ELIGIBILITY_WINDOW);
+  for (const c of rows) {
+    if (c.qualityStatus === "INCOMPLETE") continue;
+    if (!Number.isFinite(c.close) || c.close <= 0) continue;
+    return c;
+  }
+  return null;
+}
+
 /**
  * Mark-to-market unrealized PnL over a risk scope. Absent, stale or invalid
  * marks are NEVER treated as zero unrealized PnL: the valuation is reported
@@ -202,13 +261,10 @@ async function valueScopePositions(
   if (markets.length > MARKET_FANOUT_CAP) return { unrealized: 0, complete: false };
   let unrealized = 0;
   for (const marketId of markets) {
-    const mark = await ctx.db
-      .query("candles")
-      .withIndex("by_market_tf_time", (q) =>
-        q.eq("marketId", marketId).eq("timeframe", "1h"),
-      )
-      .order("desc")
-      .first();
+    // V4c: only ELIGIBLE candles may price a position — the newest INCOMPLETE
+    // bar can never override an older eligible one (and if none is eligible
+    // the mark is null -> the valuation is honestly incomplete).
+    const mark = await latestEligibleCandle(ctx, marketId);
     const markPrice =
       mark &&
       Number.isFinite(mark.close) &&
@@ -277,6 +333,175 @@ export async function recordRealizedOutcome(
   return { recorded: true };
 }
 
+/**
+ * CUMULATIVE PROVIDER-FILL ACCOUNTING (findings D1/D2) — the ONE accounting
+ * path every provider fill goes through (order placement AND reconciliation).
+ *
+ * Authoritative cumulative accounting: `orders.fillAppliedQuantity` persists
+ * how much of the provider's cumulative `fillQuantity` has already been
+ * accounted. Only the difference (`fillDelta`) may touch the ledger, so a
+ * repeated, replayed or concurrently re-scanned fill event can NEVER
+ * double-count in any accounting record (position, realized PnL,
+ * realizedTradeOutcomes, riskAccountState). The realized-outcome event uses
+ * the STABLE id `OUT-<orderId>-<cumulativeFilled>` and is written in the SAME
+ * transaction as the position/ledger accounting it describes (atomic).
+ *
+ * Fail-closed: unaccountable input — ownerless (shared SYSTEM) orders (no
+ * customer ledger to account into), non-finite/out-of-range quantities,
+ * unusable prices, or persisted applied-quantity inconsistency — is REFUSED
+ * and NOTHING is applied. The caller must then keep the order unresolved
+ * (never resolve an order carrying unapplied fill data).
+ */
+async function applyProviderFill(
+  ctx: MutationCtx,
+  order: Doc<"orders">,
+  fill: { cumulativeFilled: number; price: number },
+  now: number,
+): Promise<{ applied: boolean; delta: number; reason?: string }> {
+  const refusal = (reason: string) => ({ applied: false as const, delta: 0, reason });
+  if (!order.ownerUserId) {
+    return refusal(
+      "ownerless (shared SYSTEM) order fills cannot be attributed to a customer ledger — fail closed",
+    );
+  }
+  const { cumulativeFilled, price } = fill;
+  if (
+    !Number.isFinite(cumulativeFilled) ||
+    cumulativeFilled <= 0 ||
+    cumulativeFilled > order.quantity
+  ) {
+    return refusal("unaccountable cumulative fill quantity — fail closed");
+  }
+  if (!Number.isFinite(price) || (price as number) <= 0) {
+    return refusal("unaccountable fill price — fail closed");
+  }
+  const alreadyApplied = order.fillAppliedQuantity ?? 0;
+  if (
+    !Number.isFinite(alreadyApplied) ||
+    alreadyApplied < 0 ||
+    alreadyApplied > cumulativeFilled
+  ) {
+    return refusal("persisted applied-quantity inconsistency — fail closed");
+  }
+  // Only the NOT-YET-ACCOUNTED portion may touch the ledger (finding D2).
+  const delta = fillDelta(cumulativeFilled, alreadyApplied);
+  if (delta > 0) {
+    // Canonical position accounting over the OWNER's rows only — a fill only
+    // ever updates the caller-of-record's own position (shared SYSTEM rows are
+    // never merged into).
+    const existingPos = await ctx.db
+      .query("positions")
+      .withIndex("by_owner_market", (q) =>
+        q.eq("ownerUserId", order.ownerUserId!).eq("marketId", order.marketId),
+      )
+      .first();
+    const prev: PositionState | null = existingPos
+      ? {
+          side: existingPos.side,
+          quantity: existingPos.quantity,
+          avgEntryPrice: existingPos.avgEntryPrice,
+          realizedPnl: existingPos.realizedPnl,
+        }
+      : null;
+    const appliedFill = { side: order.side, quantity: delta, price: price as number };
+    const next = applyFill(prev, appliedFill);
+    if (existingPos) {
+      await ctx.db.patch(existingPos._id, {
+        side: next.side,
+        quantity: next.quantity,
+        avgEntryPrice: next.avgEntryPrice,
+        realizedPnl: next.realizedPnl,
+        updatedAt: now,
+      });
+    } else {
+      await ctx.db.insert("positions", {
+        positionId: `POS-${order.idempotencyKey}`,
+        account: `${order.mode}:paper-account`,
+        marketId: order.marketId,
+        symbol: order.symbol,
+        side: next.side,
+        quantity: next.quantity,
+        avgEntryPrice: next.avgEntryPrice,
+        realizedPnl: next.realizedPnl,
+        source: "PAPER",
+        updatedAt: now,
+        ownerUserId: order.ownerUserId,
+      });
+    }
+
+    // REALIZED TRADE OUTCOME (finding C): one event per realization — the
+    // application of a fill portion that CLOSED part of the position.
+    const realizedDelta = next.realizedPnl - (prev?.realizedPnl ?? 0);
+    const closedQty = closedQuantity(prev, appliedFill);
+    const realizedOutcome = classifyRealizedOutcome(realizedDelta, closedQty);
+    if (realizedOutcome !== null) {
+      await recordRealizedOutcome(ctx, {
+        outcomeId: `OUT-${order.orderId}-${cumulativeFilled}`,
+        ownerUserId: order.ownerUserId,
+        orderId: order.orderId,
+        marketId: order.marketId,
+        realizedPnl: realizedDelta,
+        outcome: realizedOutcome,
+        closedQuantity: closedQty,
+        at: now,
+      });
+    }
+
+    // Account-level risk accounting maintained server-side at fill time:
+    // daily realized PnL (UTC day) and all-time peak equity. Equity is
+    // recomputed over the owner's risk scope and is MARK-TO-MARKET (finding
+    // D); an unreliable valuation never lowers (or raises) an established
+    // peak. DECISION C: shared SYSTEM fixture P&L is account-level demo
+    // economics (Decision A shared account) and is included here exactly as
+    // before; it never enters behavioral streaks (see readLossStreak).
+    const scopePositions = await readRiskScopePositions(ctx, order.ownerUserId);
+    const totalRealized = scopePositions.rows.reduce((a, p) => a + p.realizedPnl, 0);
+    const valuation = await valueScopePositions(ctx, scopePositions.rows, now);
+    const equityNow = PAPER_EQUITY_BASE + totalRealized + valuation.unrealized;
+    const dayKey = new Date(now).toISOString().slice(0, 10);
+    const accountState = await readRiskAccountState(ctx, order.ownerUserId);
+    const realizedPnlDay =
+      accountState?.pnlDay === dayKey
+        ? (accountState.realizedPnlDay ?? 0) + realizedDelta
+        : realizedDelta;
+    const peakEquityNow = valuation.complete
+      ? Math.max(accountState?.peakEquity ?? PAPER_EQUITY_BASE, equityNow)
+      : (accountState?.peakEquity ?? PAPER_EQUITY_BASE);
+    if (accountState) {
+      await ctx.db.patch(accountState._id, {
+        peakEquity: peakEquityNow,
+        pnlDay: dayKey,
+        realizedPnlDay,
+        updatedAt: now,
+      });
+    } else {
+      await ctx.db.insert("riskAccountState", {
+        ownerUserId: order.ownerUserId,
+        peakEquity: peakEquityNow,
+        pnlDay: dayKey,
+        realizedPnlDay,
+        updatedAt: now,
+      });
+    }
+    // LEGACY platform-aggregate telemetry (all customers summed): kept
+    // maintained for the documented shared-account ledger, but NOT consumed by
+    // any risk calculation. Removal is deferred to plan Step 2 migration.
+    const state = await ctx.db.query("systemState").first();
+    if (state) {
+      await ctx.db.patch(state._id, {
+        peakEquity: Math.max(state.peakEquity ?? PAPER_EQUITY_BASE, equityNow),
+        pnlDay: dayKey,
+        realizedPnlDay:
+          state?.pnlDay === dayKey ? (state.realizedPnlDay ?? 0) + realizedDelta : realizedDelta,
+        updatedAt: now,
+      });
+    }
+  }
+  // Persist the authoritative cumulative applied quantity (finding D2).
+  await ctx.db.patch(order._id, { fillAppliedQuantity: cumulativeFilled });
+  return { applied: true, delta };
+}
+
 export async function loadRiskContext(
   ctx: MutationCtx,
   args: {
@@ -330,15 +555,22 @@ export async function loadRiskContext(
   // risk scope only — own + shared SYSTEM rows, never another customer's —
   // with PER-SCOPE saturation detection (see readRiskScopePositions). The
   // unresolved-submission gate and duplicate-key reads below are INDEXED
-  // checks — complete at any table size and any record age. The gate applies
-  // the ONE order-state policy (lib/execution.ts UNRESOLVED_SUBMISSION_STATES:
-  // SUBMITTING / SUBMITTED / UNKNOWN) over the SAME visibility scope
-  // (canViewRecord): one customer's records must not improperly affect
-  // another customer's risk decisions, while shared SYSTEM rows remain in
-  // every scope.
+  // checks — complete at any table size and any record age.
+  //
+  // DECISION A (re-ratified by the post-fix audit, finding D4): the exposure
+  // gate is ACCOUNT-GLOBAL — the ONE order-state policy
+  // (lib/execution.ts UNRESOLVED_SUBMISSION_STATES: SUBMITTING / SUBMITTED /
+  // UNKNOWN) applies to EVERY order on the shared execution account
+  // (`<mode>:paper-account`), any owner: an unresolved submission anywhere on
+  // the account means the account's true exposure is unknown, so new
+  // risk-increasing exposure is blocked for everyone on it. Unrelated
+  // accounts are never scanned.
   const scopePositions = await readRiskScopePositions(ctx, args.accountOwnerUserId);
   const positions = scopePositions.rows;
-  const unresolvedScan = await scanUnresolvedOrders(ctx, args.accountOwnerUserId);
+  const unresolvedScan = await scanUnresolvedAccountOrders(
+    ctx,
+    (state?.mode ?? "PAPER") as Doc<"orders">["mode"],
+  );
   const duplicateKeyOrder = await ctx.db
     .query("orders")
     .withIndex("by_idempotencyKey", (q) => q.eq("idempotencyKey", args.proposalIdempotencyKey))
@@ -353,7 +585,11 @@ export async function loadRiskContext(
 
   // G2: equity and exposure aggregate ONLY over this customer's risk scope
   // (own + shared SYSTEM rows). Another customer's positions or losses never
-  // enter these figures. Finding D: equity is MARK-TO-MARKET — realized PnL
+  // enter these figures. DECISION C: shared SYSTEM rows are the explicitly
+  // shared demo/account workspace (Decision A shared account) — their P&L is
+  // account-level economics and is included here by policy; it is the
+  // BEHAVIORAL loss streak alone that stays owner-scoped (see readLossStreak).
+  // Finding D: equity is MARK-TO-MARKET — realized PnL
   // PLUS unrealized PnL of open positions at fresh, valid marks. When a
   // reliable valuation cannot be established the context is marked incomplete
   // and the engine fails closed (absent prices are never treated as zero
@@ -382,9 +618,9 @@ export async function loadRiskContext(
   // peak (finding D): it is left untouched.
   const peakBase = accountState?.peakEquity ?? PAPER_EQUITY_BASE;
   const peakEquity = valuation.complete ? Math.max(peakBase, equity) : peakBase;
-  // Indexed, per-scope state reads: detection of unresolved submissions is
-  // complete at any table size for THIS scope (the count is exact below the
-  // per-state caps; at/above a cap the exact total is unknown —
+  // Indexed, per-account state reads: detection of unresolved submissions is
+  // complete at any table size for THIS execution account (the count is exact
+  // below the per-state caps; at/above a cap the exact total is unknown —
   // `accountStateComplete` is false and exposure is blocked regardless).
   const unresolvedOrders = unresolvedScan.count;
 
