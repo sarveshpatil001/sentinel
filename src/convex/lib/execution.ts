@@ -28,6 +28,132 @@ export type OrderState =
   | "EXPIRED"
   | "UNKNOWN";
 
+/**
+ * ORDER-STATE POLICY — the ONE definition of which orders require
+ * reconciliation and restrict new exposure (shared by the execution precheck,
+ * the risk context and the reconciliation engine).
+ *
+ * Lifecycle: CREATED -> VALIDATING -> AUTHORIZED -> READY -> SUBMITTING ->
+ * SUBMITTED -> { ACKNOWLEDGED | PARTIALLY_FILLED | FILLED | REJECTED |
+ * CANCELLED | EXPIRED | UNKNOWN }.
+ *
+ * Classification:
+ *  - UNRESOLVED SUBMISSION (external state not established — requires
+ *    reconciliation and blocks new exposure): SUBMITTING (submission in
+ *    flight, no provider response recorded), SUBMITTED (awaiting the
+ *    provider's result), UNKNOWN (ambiguous: a submission MAY have reached
+ *    the provider).
+ *  - RESOLVED / KNOWN states (never block merely by a former state):
+ *    ACKNOWLEDGED (accepted and working — a normal pending order),
+ *    PARTIALLY_FILLED (partial execution, remainder open — known state),
+ *    FILLED / REJECTED / CANCELLED / EXPIRED (terminal).
+ *  - Internal pre-submission history states (never persisted as order.state in
+ *    this architecture): CREATED, VALIDATING, AUTHORIZED, READY.
+ */
+export const UNRESOLVED_SUBMISSION_STATES = ["SUBMITTING", "SUBMITTED", "UNKNOWN"] as const;
+
+export function isUnresolvedSubmissionState(state: string): boolean {
+  return (UNRESOLVED_SUBMISSION_STATES as readonly string[]).includes(state);
+}
+
+/**
+ * RECONCILIATION CLASSIFICATION — exhaustive over the states the
+ * reconciliation engine scans (SUBMITTING / SUBMITTED / UNKNOWN). Every
+ * scanned order gets EXACTLY ONE outcome; nothing falls through silently.
+ *
+ * Evidence contract (the repository's provider contract,
+ * normalizeProviderResponse): provider evidence is ACCEPTED, REJECTED or
+ * NONE. The rules:
+ *  - ACCEPTED (authoritative: the provider ledger has the order) -> RESOLVED
+ *    to ACKNOWLEDGED; REJECTED -> RESOLVED to REJECTED. This is the documented
+ *    resolution condition for a pending/ambiguous submission.
+ *  - NONE / absent evidence -> NEVER a terminal result. A timeout, a missing
+ *    response or an absent provider record is not proof of rejection or of
+ *    non-submission: the order stays in its current state and is reported
+ *    UNRESOLVED (PENDING_SUBMISSION for SUBMITTING/SUBMITTED — a normal known
+ *    pending order; AMBIGUOUS for UNKNOWN — a possible submission).
+ *  - Contradictory evidence (fills on a rejected order, a fill quantity beyond
+ *    the order quantity, invalid price/quantity fields) -> UNRESOLVED
+ *    (CONTRADICTORY_EVIDENCE): contradictory evidence never manufactures a
+ *    terminal result.
+ *  - Any unrecognized state value -> UNRESOLVED (UNRECOGNIZED_STATE), fail
+ *    closed.
+ */
+export type ReconciliationCategory =
+  | "PENDING_SUBMISSION"
+  | "AMBIGUOUS"
+  | "CONTRADICTORY_EVIDENCE"
+  | "UNRECOGNIZED_STATE";
+
+export type ReconciliationOutcome =
+  | { kind: "RESOLVED"; to: OrderState; note: string }
+  | { kind: "UNRESOLVED"; category: ReconciliationCategory; note: string };
+
+export function classifyOrderReconciliation(order: {
+  state: string;
+  providerTruth?: "ACCEPTED" | "REJECTED" | "NONE" | null;
+  quantity: number;
+  fillQuantity?: number | null;
+  fillPrice?: number | null;
+}): ReconciliationOutcome {
+  const { state, providerTruth, quantity, fillQuantity, fillPrice } = order;
+
+  // Only the three reconcilable states are ever resolved; an unrecognized
+  // state value fails CLOSED even if evidence looks authoritative.
+  if (!isUnresolvedSubmissionState(state)) {
+    return {
+      kind: "UNRESOLVED",
+      category: "UNRECOGNIZED_STATE",
+      note: `RECONCILIATION: order state ${String(state)} is not a known reconcilable state — fail closed, remains unresolved.`,
+    };
+  }
+
+  // Contradictory evidence is checked next and never resolves anything.
+  const hasFill = fillQuantity !== undefined && fillQuantity !== null;
+  const contradictory =
+    !Number.isFinite(quantity) ||
+    quantity <= 0 ||
+    (hasFill && (!Number.isFinite(fillQuantity) || (fillQuantity as number) < 0 || (fillQuantity as number) > quantity)) ||
+    (fillPrice !== undefined && fillPrice !== null && (!Number.isFinite(fillPrice) || (fillPrice as number) <= 0)) ||
+    (providerTruth === "REJECTED" && hasFill && (fillQuantity as number) > 0);
+  if (contradictory) {
+    return {
+      kind: "UNRESOLVED",
+      category: "CONTRADICTORY_EVIDENCE",
+      note: "Order evidence is self-contradictory (invalid fields or fills incompatible with the provider truth). No terminal result is manufactured — manual/authoritative adjudication required.",
+    };
+  }
+
+  if (providerTruth === "ACCEPTED") {
+    return {
+      kind: "RESOLVED",
+      to: "ACKNOWLEDGED",
+      note: "RECONCILIATION: provider ledger shows ACCEPTED. Local state recovered — no duplicate submission was made.",
+    };
+  }
+  if (providerTruth === "REJECTED") {
+    return {
+      kind: "RESOLVED",
+      to: "REJECTED",
+      note: "RECONCILIATION: provider ledger shows REJECTED.",
+    };
+  }
+
+  // No authoritative evidence (NONE / absent / unknown value): NEVER resolved.
+  if (state === "SUBMITTING" || state === "SUBMITTED") {
+    return {
+      kind: "UNRESOLVED",
+      category: "PENDING_SUBMISSION",
+      note: `RECONCILIATION: ${state} with no provider response recorded — normal pending submission, external state not yet known. Not assumed failed; not retried; remains unresolved until provider evidence arrives.`,
+    };
+  }
+  return {
+    kind: "UNRESOLVED",
+    category: "AMBIGUOUS",
+    note: "RECONCILIATION: UNKNOWN (possible submission) with no provider evidence — ambiguous outcome. Never assumed failed, never assumed never-submitted; remains unresolved.",
+  };
+}
+
 export interface AuthorizationScope {
   account: string;
   strategyVersionId: string;
@@ -73,8 +199,12 @@ export interface PrecheckContext {
   maxDataAgeMs: number | null;
   now: number;
   existingIdempotencyKeys: string[];
-  /** Orders in UNKNOWN state awaiting reconciliation. > 0 blocks exposure. */
-  unresolvedUnknownOrders: number;
+  /**
+   * Orders in an UNRESOLVED SUBMISSION state (SUBMITTING / SUBMITTED /
+   * UNKNOWN — see UNRESOLVED_SUBMISSION_STATES) awaiting reconciliation.
+   * > 0 blocks new exposure until external state is known.
+   */
+  unresolvedOrders: number;
 }
 
 export interface PrecheckResult {
@@ -264,9 +394,9 @@ export function runPrechecks(intent: OrderIntent, ctx: PrecheckContext): Prechec
     ctx.existingIdempotencyKeys.every((k) => typeof k === "string")
       ? []
       : ["ctx.existingIdempotencyKeys must be an array of strings"]),
-    ...(finite(ctx.unresolvedUnknownOrders) && ctx.unresolvedUnknownOrders >= 0
+    ...(finite(ctx.unresolvedOrders) && ctx.unresolvedOrders >= 0
       ? []
-      : ["ctx.unresolvedUnknownOrders must be a finite number >= 0"]),
+      : ["ctx.unresolvedOrders must be a finite number >= 0"]),
   ];
   if (problems.length > 0) {
     add(
@@ -295,13 +425,13 @@ export function runPrechecks(intent: OrderIntent, ctx: PrecheckContext): Prechec
   if (ctx.killSwitchEngaged === true) add("kill_switch", "BLOCK", "Kill switch ENGAGED.");
   else add("kill_switch", "PASS", "Kill switch released.");
 
-  if (ctx.unresolvedUnknownOrders > 0)
+  if (ctx.unresolvedOrders > 0)
     add(
       "reconciliation_state",
       "BLOCK",
-      `${ctx.unresolvedUnknownOrders} order(s) in UNKNOWN state await reconciliation — new exposure blocked until external state is known.`,
+      `${ctx.unresolvedOrders} order(s) in an unresolved submission state (SUBMITTING/SUBMITTED/UNKNOWN) await reconciliation — new exposure blocked until external state is known.`,
     );
-  else add("reconciliation_state", "PASS", "No unresolved UNKNOWN order state.");
+  else add("reconciliation_state", "PASS", "No unresolved submission order state.");
 
   // Provider state is an ALLOWLIST: only AVAILABLE passes; anything else is
   // UNKNOWN (never a permissive default).

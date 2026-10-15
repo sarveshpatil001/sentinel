@@ -8,7 +8,17 @@
  * the build green (Rule 38/39).
  */
 import { evaluateRisk, vetoAllows, RiskContext, RiskPolicy, TradeProposal } from "../convex/lib/risk";
-import { normalizeProviderResponse, validateAuthorizationScope, runPrechecks, AuthorizationRecord, OrderIntent, PrecheckContext } from "../convex/lib/execution";
+import {
+  normalizeProviderResponse,
+  validateAuthorizationScope,
+  runPrechecks,
+  classifyOrderReconciliation,
+  isUnresolvedSubmissionState,
+  UNRESOLVED_SUBMISSION_STATES,
+  AuthorizationRecord,
+  OrderIntent,
+  PrecheckContext,
+} from "../convex/lib/execution";
 import { validateCandles } from "../convex/lib/dataQuality";
 import { simulate, StrategyDefinition, ValidationConfig } from "../convex/lib/backtest";
 import { computeAuditHash, verifyAuditChain, sha256Hex, CURRENT_HASH_VERSION, AuditRecord } from "../convex/lib/audit";
@@ -20,7 +30,14 @@ import {
   PROVIDERS,
 } from "../convex/lib/credentials";
 import { canUseAuthorization, canViewRecord, requireRole, executionAllowedInMode } from "../convex/lib/authz";
-import { applyFill, fillDelta } from "../convex/lib/positions";
+import {
+  applyFill,
+  fillDelta,
+  closedQuantity,
+  classifyRealizedOutcome,
+  computeLossStreak,
+  unrealizedPnl,
+} from "../convex/lib/positions";
 import {
   runValidationPipeline,
   verifySnapshotBinding,
@@ -54,7 +71,7 @@ const baseCtx: RiskContext = {
   dataAgeMs: 60000, dataQualityState: "VALID", spreadBps: 2, openPositions: 1,
   realizedPnlToday: 100, equity: 100100, peakEquity: 100100, consecutiveLosses: 0,
   existingOrderIdempotencyKeys: [], proposalIdempotencyKey: "k1",
-  unresolvedUnknownOrders: 0,
+  unresolvedOrders: 0,
 };
 const proposal: TradeProposal = { proposalId: "P1", side: "BUY", quantity: 0.1, referencePrice: 62000, orderType: "MARKET", mode: "PAPER" };
 
@@ -107,11 +124,11 @@ check("TEST-EXEC-004 wrong quantity rejected", !validateAuthorizationScope(auth,
 check("TEST-EXEC-005 expired authorization rejected", !validateAuthorizationScope({ ...auth, scope: { ...auth.scope, expiresAt: Date.now() - 1 } }, intent, Date.now()).ok);
 check("TEST-EXEC-006 consumed authorization rejected", !validateAuthorizationScope({ ...auth, state: "CONSUMED" }, intent, Date.now()).ok);
 
-const pc = runPrechecks(intent, { systemEnabled: true, killSwitchEngaged: false, mode: "PAPER", providerState: "AVAILABLE", marketStatus: "OPEN", dataAgeMs: 1000, maxDataAgeMs: 7200000, now: Date.now(), existingIdempotencyKeys: [], unresolvedUnknownOrders: 0 });
+const pc = runPrechecks(intent, { systemEnabled: true, killSwitchEngaged: false, mode: "PAPER", providerState: "AVAILABLE", marketStatus: "OPEN", dataAgeMs: 1000, maxDataAgeMs: 7200000, now: Date.now(), existingIdempotencyKeys: [], unresolvedOrders: 0 });
 check("TEST-EXEC-007 precheck passes clean", pc.ok);
-const pc2 = runPrechecks(intent, { systemEnabled: true, killSwitchEngaged: false, mode: "PAPER", providerState: "AVAILABLE", marketStatus: "OPEN", dataAgeMs: 1000, maxDataAgeMs: 7200000, now: Date.now(), existingIdempotencyKeys: ["k1"], unresolvedUnknownOrders: 0 });
+const pc2 = runPrechecks(intent, { systemEnabled: true, killSwitchEngaged: false, mode: "PAPER", providerState: "AVAILABLE", marketStatus: "OPEN", dataAgeMs: 1000, maxDataAgeMs: 7200000, now: Date.now(), existingIdempotencyKeys: ["k1"], unresolvedOrders: 0 });
 check("TEST-EXEC-008 idempotency duplicate -> precheck fails", !pc2.ok);
-const pc3 = runPrechecks(intent, { systemEnabled: true, killSwitchEngaged: false, mode: "PAPER", providerState: "DEGRADED", marketStatus: "OPEN", dataAgeMs: 1000, maxDataAgeMs: 7200000, now: Date.now(), existingIdempotencyKeys: [], unresolvedUnknownOrders: 0 });
+const pc3 = runPrechecks(intent, { systemEnabled: true, killSwitchEngaged: false, mode: "PAPER", providerState: "DEGRADED", marketStatus: "OPEN", dataAgeMs: 1000, maxDataAgeMs: 7200000, now: Date.now(), existingIdempotencyKeys: [], unresolvedOrders: 0 });
 check("TEST-EXEC-009 degraded provider -> precheck fails (unknown -> blocked)", !pc3.ok);
 
 // TEST-DATA semantics
@@ -469,9 +486,9 @@ check(
   "TEST-RISK-013 CONTROLLED_LIVE mode -> BLOCK (live execution not authorized in this build)",
   d13.outcome === "BLOCK" && !vetoAllows(d13.outcome),
 );
-const d14 = evaluateRisk(proposal, { ...baseCtx, unresolvedUnknownOrders: 2 }, policy);
+const d14 = evaluateRisk(proposal, { ...baseCtx, unresolvedOrders: 2 }, policy);
 check(
-  "TEST-RISK-014 unresolved UNKNOWN orders -> BLOCK (new exposure blocked)",
+  "TEST-RISK-014 unresolved submission orders (SUBMITTING/SUBMITTED/UNKNOWN) -> BLOCK (new exposure blocked)",
   d14.outcome === "BLOCK" && d14.checks.some((c) => c.check === "reconciliation_state" && c.status === "BLOCK"),
 );
 // P0 fail-closed completeness: bounded-scan saturation at the data layer must
@@ -491,14 +508,14 @@ check(
 );
 
 // TEST-EXEC mode gate + reconciliation gate + partial fills
-const pc4 = runPrechecks(intent, { systemEnabled: true, killSwitchEngaged: false, mode: "CONTROLLED_LIVE", providerState: "AVAILABLE", marketStatus: "OPEN", dataAgeMs: 1000, maxDataAgeMs: 7200000, now: Date.now(), existingIdempotencyKeys: [], unresolvedUnknownOrders: 0 });
+const pc4 = runPrechecks(intent, { systemEnabled: true, killSwitchEngaged: false, mode: "CONTROLLED_LIVE", providerState: "AVAILABLE", marketStatus: "OPEN", dataAgeMs: 1000, maxDataAgeMs: 7200000, now: Date.now(), existingIdempotencyKeys: [], unresolvedOrders: 0 });
 check(
   "TEST-EXEC-011 CONTROLLED_LIVE mode -> submission precheck fails",
   !pc4.ok && pc4.checks.some((c) => c.check === "mode" && c.status === "BLOCK"),
 );
-const pc5 = runPrechecks(intent, { systemEnabled: true, killSwitchEngaged: false, mode: "PAPER", providerState: "AVAILABLE", marketStatus: "OPEN", dataAgeMs: 1000, maxDataAgeMs: 7200000, now: Date.now(), existingIdempotencyKeys: [], unresolvedUnknownOrders: 1 });
+const pc5 = runPrechecks(intent, { systemEnabled: true, killSwitchEngaged: false, mode: "PAPER", providerState: "AVAILABLE", marketStatus: "OPEN", dataAgeMs: 1000, maxDataAgeMs: 7200000, now: Date.now(), existingIdempotencyKeys: [], unresolvedOrders: 1 });
 check(
-  "TEST-EXEC-012 unresolved UNKNOWN order -> precheck fails (exposure blocked)",
+  "TEST-EXEC-012 unresolved submission order -> precheck fails (exposure blocked)",
   !pc5.ok && pc5.checks.some((c) => c.check === "reconciliation_state" && c.status === "BLOCK"),
 );
 const t2 = normalizeProviderResponse({ kind: "partial_fill", providerOrderId: "P1", filled: 0.5, remaining: 0.5, price: 100 });
@@ -749,13 +766,15 @@ for (const path of [
   "fitnessVerdict", "marketId", "marketStatus", "providerState", "dataAgeMs",
   "dataQualityState", "spreadBps", "openPositions", "realizedPnlToday", "equity",
   "peakEquity", "consecutiveLosses", "existingOrderIdempotencyKeys",
-  "proposalIdempotencyKey", "unresolvedUnknownOrders", "accountStateComplete",
+  "proposalIdempotencyKey", "unresolvedOrders", "accountStateComplete",
+  "valuationComplete",
 ])
   fuzzRisk(
     `ctx.${path}`,
     (v) => ({ p: proposal, c: withValue(baseCtx, path, v), r: policy }),
     (f) =>
-      (path === "accountStateComplete" && f.label === "undefined") ||
+      ((path === "accountStateComplete" || path === "valuationComplete") &&
+        f.label === "undefined") ||
       (path === "realizedPnlToday" && f.label === "negative"),
   );
 for (const path of ["policyId", "version", "status"])
@@ -829,7 +848,7 @@ const preCtx: PrecheckContext = {
   maxDataAgeMs: 7200000,
   now: Date.now(),
   existingIdempotencyKeys: [],
-  unresolvedUnknownOrders: 0,
+  unresolvedOrders: 0,
 };
 const preViolations: string[] = [];
 let preCases = 0;
@@ -851,7 +870,7 @@ for (const path of [
   fuzzPre(`intent.${path}`, (v) => [withValue(intent, path, v), preCtx]);
 for (const path of [
   "systemEnabled", "killSwitchEngaged", "mode", "providerState", "marketStatus",
-  "dataAgeMs", "maxDataAgeMs", "now", "existingIdempotencyKeys", "unresolvedUnknownOrders",
+  "dataAgeMs", "maxDataAgeMs", "now", "existingIdempotencyKeys", "unresolvedOrders",
 ])
   fuzzPre(`ctx.${path}`, (v) => [intent, withValue(preCtx, path, v)]);
 
@@ -944,6 +963,154 @@ check(
   "TEST-POLREF-006 malformed policy identity never fabricates a plausible reference (fail closed)",
   polrefGarbage.outcome === "BLOCK" && polrefGarbage.policyRef === "INVALID-POLICY@v0",
   `${polrefGarbage.outcome} ${polrefGarbage.policyRef}`,
+);
+
+// ---------------------------------------------------------------------------
+// TEST-ORDSTATE / TEST-RECON / TEST-STREAK / TEST-MTM / TEST-OUTCOME —
+// targeted risk & execution fix (findings A–D) pure logic.
+// ---------------------------------------------------------------------------
+
+// Finding A: ONE order-state policy shared by gate, risk context and
+// reconciliation.
+check(
+  "TEST-ORDSTATE-001 only SUBMITTING/SUBMITTED/UNKNOWN are unresolved submissions",
+  UNRESOLVED_SUBMISSION_STATES.join(",") === "SUBMITTING,SUBMITTED,UNKNOWN" &&
+    ["SUBMITTING", "SUBMITTED", "UNKNOWN"].every((s) => isUnresolvedSubmissionState(s)) &&
+    ["CREATED", "VALIDATING", "AUTHORIZED", "READY", "ACKNOWLEDGED", "PARTIALLY_FILLED", "FILLED", "REJECTED", "CANCELLED", "EXPIRED"].every(
+      (s) => !isUnresolvedSubmissionState(s),
+    ),
+);
+
+// Finding B: exhaustive reconciliation classification.
+const rc1 = classifyOrderReconciliation({ state: "UNKNOWN", providerTruth: "ACCEPTED", quantity: 1 });
+check(
+  "TEST-RECON-101 authoritative ACCEPTED evidence resolves any pending state to ACKNOWLEDGED",
+  rc1.kind === "RESOLVED" &&
+    rc1.to === "ACKNOWLEDGED" &&
+    classifyOrderReconciliation({ state: "SUBMITTING", providerTruth: "ACCEPTED", quantity: 1 }).kind === "RESOLVED" &&
+    classifyOrderReconciliation({ state: "SUBMITTED", providerTruth: "ACCEPTED", quantity: 1 }).kind === "RESOLVED",
+);
+const rc2 = classifyOrderReconciliation({ state: "SUBMITTED", providerTruth: "REJECTED", quantity: 1 });
+check(
+  "TEST-RECON-102 authoritative REJECTED evidence resolves to REJECTED",
+  rc2.kind === "RESOLVED" && rc2.to === "REJECTED",
+);
+const rc3 = classifyOrderReconciliation({ state: "SUBMITTING", providerTruth: "NONE", quantity: 1 });
+const rc3b = classifyOrderReconciliation({ state: "SUBMITTED", quantity: 1 });
+check(
+  "TEST-RECON-103 pending submissions without evidence stay UNRESOLVED (PENDING_SUBMISSION, never assumed failed)",
+  rc3.kind === "UNRESOLVED" &&
+    rc3.category === "PENDING_SUBMISSION" &&
+    rc3b.kind === "UNRESOLVED" &&
+    rc3b.category === "PENDING_SUBMISSION",
+);
+const rc4 = classifyOrderReconciliation({ state: "UNKNOWN", providerTruth: "NONE", quantity: 1 });
+check(
+  "TEST-RECON-104 UNKNOWN without evidence stays UNRESOLVED (AMBIGUOUS, never guessed)",
+  rc4.kind === "UNRESOLVED" && rc4.category === "AMBIGUOUS",
+);
+const rc5 = classifyOrderReconciliation({ state: "UNKNOWN", providerTruth: "REJECTED", quantity: 1, fillQuantity: 1, fillPrice: 100 });
+const rc5b = classifyOrderReconciliation({ state: "SUBMITTED", providerTruth: "ACCEPTED", quantity: 1, fillQuantity: 99, fillPrice: 100 });
+const rc5c = classifyOrderReconciliation({ state: "UNKNOWN", providerTruth: "ACCEPTED", quantity: 1, fillQuantity: 1, fillPrice: 0 });
+check(
+  "TEST-RECON-105 contradictory evidence never manufactures a terminal result",
+  [rc5, rc5b, rc5c].every(
+    (r) => r.kind === "UNRESOLVED" && r.category === "CONTRADICTORY_EVIDENCE",
+  ),
+);
+const rc6 = classifyOrderReconciliation({ state: "WEIRD_STATE", providerTruth: "ACCEPTED", quantity: 1 });
+const rc7 = classifyOrderReconciliation({ state: "UNKNOWN", providerTruth: "MAYBE" as never, quantity: 1 });
+const rc8 = classifyOrderReconciliation({ state: "UNKNOWN", providerTruth: "NONE", quantity: NaN });
+check(
+  "TEST-RECON-106 unrecognized states / unknown evidence values / invalid fields fail closed (never RESOLVED)",
+  rc6.kind === "UNRESOLVED" &&
+    rc6.category === "UNRECOGNIZED_STATE" &&
+    rc7.kind === "UNRESOLVED" &&
+    rc8.kind === "UNRESOLVED" &&
+    rc8.category === "CONTRADICTORY_EVIDENCE",
+);
+
+// Finding C: loss-streak policy (newest-first rows with per-owner seq).
+const st = (rows: [number, string][], complete = true) =>
+  computeLossStreak(rows.map(([seq, outcome]) => ({ seq, outcome })), complete);
+check(
+  "TEST-STREAK-201 one loss -> streak 1; two losses -> streak 2",
+  st([[1, "LOSS"]]).streak === 1 &&
+    st([[2, "LOSS"], [1, "LOSS"]]).streak === 2 &&
+    st([[2, "LOSS"], [1, "LOSS"]]).complete,
+);
+check(
+  "TEST-STREAK-202 a WIN resets the streak (losses since the last win)",
+  st([[3, "WIN"], [2, "LOSS"], [1, "LOSS"]]).streak === 0 &&
+    st([[4, "LOSS"], [3, "WIN"], [2, "LOSS"], [1, "LOSS"]]).streak === 1,
+);
+check(
+  "TEST-STREAK-203 a BREAKEVEN neither extends nor resets the streak (documented policy)",
+  st([[2, "BREAKEVEN"], [1, "LOSS"]]).streak === 1 &&
+    st([[4, "LOSS"], [3, "BREAKEVEN"], [2, "LOSS"], [1, "LOSS"]]).streak === 3 &&
+    st([[2, "BREAKEVEN"], [1, "WIN"]]).streak === 0,
+);
+check(
+  "TEST-STREAK-204 empty history is streak 0 (no completed outcomes), never fabricated",
+  st([]).streak === 0 && st([]).complete,
+);
+check(
+  "TEST-STREAK-205 a seq gap (missing history) fails closed — never a silent zero",
+  !st([[3, "LOSS"], [1, "LOSS"]]).complete &&
+    !st([[2, "LOSS"], [1, "LOSS"]], false).complete,
+);
+check(
+  "TEST-STREAK-206 a truncated window over an all-loss run reports a lower bound, not zero",
+  (() => {
+    const r = st(Array.from({ length: 10 }, (_, i) => [10 - i, "LOSS"]), false);
+    return r.streak === 10 && !r.complete;
+  })(),
+);
+check(
+  "TEST-STREAK-207 unknown outcome values / malformed seq fail closed",
+  !st([[1, "MYSTERY"]]).complete && !st([[1, "LOSS"], [0.5, "WIN"]]).complete,
+);
+
+// Finding D: mark-to-market valuation arithmetic (price-side conventions).
+const mkPos = (side: "LONG" | "SHORT" | "FLAT", quantity: number, avgEntryPrice: number) =>
+  ({ side, quantity, avgEntryPrice });
+check(
+  "TEST-MTM-301 unrealized PnL follows the position-direction price convention",
+  unrealizedPnl(mkPos("LONG", 2, 100), 110) === 20 &&
+    unrealizedPnl(mkPos("LONG", 2, 100), 90) === -20 &&
+    unrealizedPnl(mkPos("SHORT", 2, 100), 90) === 20 &&
+    unrealizedPnl(mkPos("SHORT", 2, 100), 110) === -20,
+);
+check(
+  "TEST-MTM-302 flat/zero-quantity positions are worth 0; absent or invalid marks are NEVER 0",
+  unrealizedPnl(mkPos("LONG", 0, 100), 110) === 0 &&
+    unrealizedPnl(mkPos("LONG", 1, 100), null) === null &&
+    unrealizedPnl(mkPos("LONG", 1, 100), 0) === null &&
+    unrealizedPnl(mkPos("LONG", 1, 100), NaN) === null &&
+    unrealizedPnl(mkPos("FLAT", 1, 100), 110) === null,
+);
+check(
+  "TEST-MTM-303 invalid position accounting input is never valued (fail closed)",
+  unrealizedPnl(mkPos("LONG", -1, 100), 110) === null &&
+    unrealizedPnl(mkPos("LONG", 1, 0), 110) === null &&
+    unrealizedPnl(mkPos("LONG", 1, NaN), 110) === null,
+);
+
+// Realized-outcome event classification + closed-portion accounting.
+check(
+  "TEST-OUTCOME-401 a realization event is classified by the sign of the realized delta (no epsilon)",
+  classifyRealizedOutcome(-0.05, 1) === "LOSS" &&
+    classifyRealizedOutcome(0.05, 1) === "WIN" &&
+    classifyRealizedOutcome(0, 1) === "BREAKEVEN" &&
+    classifyRealizedOutcome(5, 0) === null &&
+    classifyRealizedOutcome(NaN, 1) === null,
+);
+check(
+  "TEST-OUTCOME-402 only closing fills produce outcomes (closed-portion accounting)",
+  closedQuantity({ side: "LONG", quantity: 2, avgEntryPrice: 100, realizedPnl: 0 }, { side: "SELL", quantity: 1, price: 100 }) === 1 &&
+    closedQuantity({ side: "LONG", quantity: 2, avgEntryPrice: 100, realizedPnl: 0 }, { side: "BUY", quantity: 1, price: 100 }) === 0 &&
+    closedQuantity({ side: "SHORT", quantity: 1, avgEntryPrice: 100, realizedPnl: 0 }, { side: "BUY", quantity: 2, price: 100 }) === 1 &&
+    closedQuantity(null, { side: "SELL", quantity: 1, price: 100 }) === 0,
 );
 
 console.log(`\n${pass} passed, ${fail} failed`);

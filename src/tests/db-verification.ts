@@ -28,7 +28,7 @@
 import { convexTest } from "convex-test";
 import schema from "../convex/schema";
 import { api, internal } from "../convex/_generated/api";
-import { loadRiskContext } from "../convex/workflows";
+import { loadRiskContext, recordRealizedOutcome } from "../convex/workflows";
 import { evaluateRisk, vetoAllows, type RiskPolicy, type TradeProposal } from "../convex/lib/risk";
 
 // Bun has no `import.meta.glob`, so the module map for convex-test is built
@@ -173,6 +173,7 @@ async function seedAuthorization(
     ownerUserId?: string;
     side?: "BUY" | "SELL";
     quantity?: number;
+    marketId?: string;
   },
 ) {
   const now = Date.now();
@@ -184,7 +185,7 @@ async function seedAuthorization(
       scope: {
         account: "PAPER:paper-account",
         strategyVersionId: "SV-T",
-        marketId: "MKT-T",
+        marketId: opts.marketId ?? "MKT-T",
         side: opts.side ?? "BUY",
         quantity: opts.quantity ?? 2,
         orderType: "MARKET",
@@ -218,9 +219,12 @@ const ordersIn = (t: T) =>
 
 type OrderRow = {
   orderId: string;
-  state: "UNKNOWN" | "ACKNOWLEDGED";
+  state: string;
   providerTruth?: "ACCEPTED" | "REJECTED" | "NONE";
   ownerUserId?: string;
+  quantity?: number;
+  fillQuantity?: number;
+  fillPrice?: number;
 };
 
 /** Schema-complete fixture orders, inserted in one transaction. */
@@ -237,13 +241,15 @@ async function insertOrderRows(t: T, rows: OrderRow[]) {
         marketId: "MKT-T",
         symbol: "BTC/USD",
         side: "BUY",
-        quantity: 1,
+        quantity: r.quantity ?? 1,
         orderType: "MARKET",
         timeInForce: "GTC",
         mode: "PAPER",
-        state: r.state,
+        state: r.state as never,
         providerTruth: r.providerTruth,
-        history: [{ state: r.state, at: now, note: "fixture row (bounds regression)" }],
+        fillQuantity: r.fillQuantity,
+        fillPrice: r.fillPrice,
+        history: [{ state: r.state as never, at: now, note: "fixture row (bounds regression)" }],
         ownerUserId: r.ownerUserId,
         createdAt: now,
         updatedAt: now,
@@ -1402,8 +1408,8 @@ async function seedUsers(t: T) {
   );
   check(
     "DB-BOUNDS-001a risk context detects the UNKNOWN order beyond the old take(500) boundary",
-    riskCtx.unresolvedUnknownOrders >= 1,
-    `unresolvedUnknownOrders=${riskCtx.unresolvedUnknownOrders}`,
+    riskCtx.unresolvedOrders >= 1,
+    `unresolvedOrders=${riskCtx.unresolvedOrders}`,
   );
 
   // 2) The deterministic veto over that REAL DB-derived context blocks
@@ -2718,6 +2724,29 @@ async function backendRepairBattery() {
   const dayKey = new Date().toISOString().slice(0, 10);
   await t.run(async (ctx) => {
     const now = Date.now();
+    // Fresh mark for the second fixture market (finding D: every open
+    // position must have a valid, fresh mark or the valuation is honestly
+    // INCOMPLETE and the peak is left untouched). close = 100 = every fixture
+    // entry price -> unrealized exactly 0, so every pre-existing G2 equity /
+    // peak / daily-PnL number below is unchanged.
+    await ctx.db.insert("candles", {
+      marketId: "MKT-G2-2",
+      symbol: "ETH/USD",
+      assetClass: "CRYPTO",
+      venue: "SIM-VENUE",
+      timeframe: "1h",
+      eventTime: now - HOUR,
+      open: CLOSE,
+      high: CLOSE + 1,
+      low: CLOSE - 1,
+      close: CLOSE,
+      volume: 10,
+      source: "SIMULATED",
+      providerTimestamp: now - HOUR,
+      receivedTime: now - HOUR,
+      availabilityTime: now,
+      qualityStatus: "VALID",
+    });
     const insertPos = (positionId: string, ownerUserId: string | undefined, marketId: string, symbol: string, realizedPnl: number) =>
       ctx.db.insert("positions", {
         positionId,
@@ -2860,6 +2889,944 @@ async function backendRepairBattery() {
     verdictA3.checks.find((c) => c.check === "daily_loss")?.status === "PASS" &&
     scopeA3.ctx.killSwitchEngaged === false,
     JSON.stringify({ today: scopeA3.ctx.realizedPnlToday, checks: verdictA3.checks.filter((c) => c.status !== "PASS") }));
+}
+
+// ---------------------------------------------------------------------------
+// TARGETED RISK & EXECUTION FIX REGRESSIONS (findings A–D)
+//
+// DB-GATE-*    finding A — the unresolved-submission gate covers SUBMITTING,
+//              SUBMITTED and UNKNOWN (one shared order-state policy), scoped
+//              to the caller's visibility (own + shared SYSTEM), fail-closed
+//              on saturated scans.
+// DB-RECON-01x finding B — reconciliation classifies EVERY scanned state;
+//              missing/contradictory evidence never manufactures a terminal
+//              result; incomplete scans never report healthy; repeats are
+//              idempotent; output agrees with the execution gate.
+// DB-STREAK-*  finding C — owner-scoped consecutive-loss streak from
+//              persisted, idempotent realized trade outcomes (never a
+//              hardcoded zero; unestablishable history fails closed).
+// DB-EQUITY-*  finding D — mark-to-market equity/drawdown with honest
+//              incomplete-valuation fail-closed handling.
+// ---------------------------------------------------------------------------
+
+const FIXTURE_APPROVED: RiskPolicy = {
+  policyId: "TEST-FIXTURE-NOT-RATIFIED",
+  version: 1,
+  status: "APPROVED",
+  limits: SEEDED_POLICY.limits,
+};
+
+const cleanProposal: TradeProposal = {
+  proposalId: "PROP-FIX",
+  side: "BUY",
+  quantity: 0.1,
+  referencePrice: CLOSE,
+  orderType: "MARKET",
+  mode: "PAPER",
+};
+
+const ctxOf = (t: T, owner: string, key: string) =>
+  t.run(async (ctx) =>
+    loadRiskContext(ctx, {
+      strategyVersionId: "SV-T",
+      marketId: "MKT-T",
+      proposalIdempotencyKey: key,
+      accountOwnerUserId: owner,
+    }),
+  );
+
+/** Fixture open position with a chosen entry price (finding C/D setup). */
+async function insertOpenPosition(
+  t: T,
+  positionId: string,
+  ownerUserId: string | undefined,
+  avgEntryPrice: number,
+  quantity = 1,
+  realizedPnl = 0,
+  marketId = "MKT-T",
+  side: "LONG" | "SHORT" = "LONG",
+) {
+  await t.run(async (ctx) =>
+    ctx.db.insert("positions", {
+      positionId,
+      account: "PAPER:paper-account",
+      marketId,
+      symbol: marketId === "MKT-T" ? "BTC/USD" : "ETH/USD",
+      side,
+      quantity,
+      avgEntryPrice,
+      realizedPnl,
+      source: "PAPER",
+      updatedAt: Date.now(),
+      ...(ownerUserId !== undefined ? { ownerUserId } : {}),
+    }),
+  );
+}
+
+/** Market record (OPEN/AVAILABLE) so placeOrder can submit on a second market. */
+async function ensureMarket(t: T, marketId: string) {
+  await t.run(async (ctx) =>
+    ctx.db.insert("markets", {
+      marketId,
+      symbol: marketId === "MKT-T" ? "BTC/USD" : "ETH/USD",
+      assetClass: "CRYPTO",
+      venue: "SIM-VENUE",
+      provider: "SIMULATED",
+      baseAsset: marketId === "MKT-T" ? "BTC" : "ETH",
+      quoteAsset: "USD",
+      timezone: "UTC",
+      status: "OPEN",
+      providerState: "AVAILABLE",
+    }),
+  );
+}
+
+/** 1h mark candle for a market with a chosen close and age (finding D setup). */
+async function insertMark(t: T, marketId: string, close: number, ageMs: number) {
+  const at = Date.now() - ageMs;
+  await t.run(async (ctx) =>
+    ctx.db.insert("candles", {
+      marketId,
+      symbol: marketId === "MKT-T" ? "BTC/USD" : "ETH/USD",
+      assetClass: "CRYPTO",
+      venue: "SIM-VENUE",
+      timeframe: "1h",
+      eventTime: at - HOUR,
+      open: close,
+      high: close,
+      low: close,
+      close,
+      volume: 10,
+      source: "SIMULATED",
+      providerTimestamp: at,
+      receivedTime: at,
+      availabilityTime: at,
+      qualityStatus: "VALID",
+    }),
+  );
+}
+
+// ---- finding A: the unresolved-submission gate -----------------------------
+
+{
+  const t = fresh();
+  const { userA } = await seedWorkspace(t, "ACK");
+  const asA = t.withIdentity({ subject: userA });
+  await insertOrderRows(t, [
+    { orderId: "ORD-G1-PENDING", state: "SUBMITTING", providerTruth: "NONE", ownerUserId: userA },
+  ]);
+  await seedAuthorization(t, { authorizationId: "AUTH-G1", ownerUserId: userA });
+  const bundle = await ctxOf(t, userA, "IK-GATE-1");
+  const verdict = evaluateRisk(cleanProposal, bundle.ctx, FIXTURE_APPROVED);
+  check(
+    "DB-GATE-001 an unresolved SUBMITTING order cannot bypass the risk-increasing gate",
+    bundle.ctx.unresolvedOrders === 1 &&
+      !vetoAllows(verdict.outcome) &&
+      verdict.checks.some((c) => c.check === "reconciliation_state" && c.status === "BLOCK"),
+    JSON.stringify(verdict.checks.filter((c) => c.status !== "PASS")),
+  );
+  const placed = await asA.mutation(api.workflows.placeOrder, placeArgs("AUTH-G1", "IK-GATE-1P"));
+  check(
+    "DB-GATE-001b the submission precheck enforces the same gate (fail closed, nothing submitted)",
+    placed.state === "REJECTED" && placed.note.includes("reconciliation_state"),
+    placed.note,
+  );
+}
+
+{
+  const t = fresh();
+  const { userA } = await seedWorkspace(t, "ACK");
+  const asA = t.withIdentity({ subject: userA });
+  await insertOrderRows(t, [
+    { orderId: "ORD-G2-PENDING", state: "SUBMITTED", providerTruth: "NONE", ownerUserId: userA },
+  ]);
+  await seedAuthorization(t, { authorizationId: "AUTH-G2", ownerUserId: userA });
+  const bundle = await ctxOf(t, userA, "IK-GATE-2");
+  const verdict = evaluateRisk(cleanProposal, bundle.ctx, FIXTURE_APPROVED);
+  check(
+    "DB-GATE-002 an unresolved SUBMITTED order cannot bypass the risk-increasing gate",
+    bundle.ctx.unresolvedOrders === 1 &&
+      !vetoAllows(verdict.outcome) &&
+      verdict.checks.some((c) => c.check === "reconciliation_state" && c.status === "BLOCK"),
+    JSON.stringify(verdict.checks.filter((c) => c.status !== "PASS")),
+  );
+  const placed = await asA.mutation(api.workflows.placeOrder, placeArgs("AUTH-G2", "IK-GATE-2P"));
+  check(
+    "DB-GATE-002b the submission precheck enforces the same gate for SUBMITTED",
+    placed.state === "REJECTED" && placed.note.includes("reconciliation_state"),
+    placed.note,
+  );
+}
+
+{
+  const t = fresh();
+  const { userA } = await seedWorkspace(t, "ACK");
+  const asA = t.withIdentity({ subject: userA });
+  await insertOrderRows(t, [
+    { orderId: "ORD-G3-AMBIG", state: "UNKNOWN", providerTruth: "NONE", ownerUserId: userA },
+  ]);
+  await seedAuthorization(t, { authorizationId: "AUTH-G3", ownerUserId: userA });
+  const bundle = await ctxOf(t, userA, "IK-GATE-3");
+  const verdict = evaluateRisk(cleanProposal, bundle.ctx, FIXTURE_APPROVED);
+  const placed = await asA.mutation(api.workflows.placeOrder, placeArgs("AUTH-G3", "IK-GATE-3P"));
+  check(
+    "DB-GATE-003 an UNKNOWN order retains its existing protection (gate and precheck)",
+    bundle.ctx.unresolvedOrders === 1 &&
+      verdict.checks.some((c) => c.check === "reconciliation_state" && c.status === "BLOCK") &&
+      placed.state === "REJECTED" &&
+      placed.note.includes("reconciliation_state"),
+    JSON.stringify({ placed: placed.state, note: placed.note }),
+  );
+}
+
+{
+  const t = fresh();
+  const { userA } = await seedWorkspace(t, "TIMEOUT");
+  const asA = t.withIdentity({ subject: userA });
+  await seedAuthorization(t, { authorizationId: "AUTH-G4A", ownerUserId: userA });
+  await seedAuthorization(t, { authorizationId: "AUTH-G4B", ownerUserId: userA });
+  const first = await asA.mutation(api.workflows.placeOrder, placeArgs("AUTH-G4A", "IK-G4-FIRST"));
+  const blocked = await asA.mutation(api.workflows.placeOrder, placeArgs("AUTH-G4B", "IK-G4-BLK"));
+  const recon = await asA.mutation(api.workflows.reconcile, {});
+  await t.run(async (ctx) => {
+    const state = await ctx.db.query("systemState").first();
+    if (state) await ctx.db.patch(state._id, { simulatedProviderBehavior: "ACK" });
+  });
+  const after = await asA.mutation(api.workflows.placeOrder, placeArgs("AUTH-G4B", "IK-G4-AFTER"));
+  check(
+    "DB-GATE-004 a resolved former-UNKNOWN order no longer blocks (resolution, not a forever-block)",
+    first.state === "UNKNOWN" &&
+      blocked.state === "REJECTED" &&
+      recon.healthy === true &&
+      after.state === "ACKNOWLEDGED",
+    JSON.stringify({ first: first.state, blocked: blocked.state, recon: recon.healthy, after: after.state }),
+  );
+}
+
+{
+  const t = fresh();
+  const { userA } = await seedWorkspace(t, "ACK");
+  await insertOrderRows(t, [
+    { orderId: "ORD-G4-ACKD", state: "ACKNOWLEDGED", providerTruth: "ACCEPTED", ownerUserId: userA },
+    { orderId: "ORD-G4-PFILLED", state: "PARTIALLY_FILLED", providerTruth: "ACCEPTED", ownerUserId: userA, fillQuantity: 1, fillPrice: CLOSE },
+    { orderId: "ORD-G4-FILLED", state: "FILLED", providerTruth: "ACCEPTED", ownerUserId: userA, fillQuantity: 1, fillPrice: CLOSE },
+    { orderId: "ORD-G4-REJECTED", state: "REJECTED", providerTruth: "REJECTED", ownerUserId: userA },
+    { orderId: "ORD-G4-CANCELLED", state: "CANCELLED", providerTruth: "NONE", ownerUserId: userA },
+    { orderId: "ORD-G4-EXPIRED", state: "EXPIRED", providerTruth: "NONE", ownerUserId: userA },
+  ]);
+  const asA = t.withIdentity({ subject: userA });
+  await seedAuthorization(t, { authorizationId: "AUTH-G4C", ownerUserId: userA });
+  const bundle = await ctxOf(t, userA, "IK-GATE-4C");
+  const placed = await asA.mutation(api.workflows.placeOrder, placeArgs("AUTH-G4C", "IK-GATE-4CP"));
+  check(
+    "DB-GATE-004b resolved/terminal states never block merely because of a former state",
+    bundle.ctx.unresolvedOrders === 0 && placed.state === "ACKNOWLEDGED",
+    JSON.stringify({ count: bundle.ctx.unresolvedOrders, placed: placed.state, note: placed.note }),
+  );
+}
+
+{
+  const t = fresh();
+  const { userA, userB } = await seedWorkspace(t, "ACK");
+  const asA = t.withIdentity({ subject: userA });
+  await insertOrderRows(t, [
+    { orderId: "ORD-G5-B1", state: "SUBMITTING", providerTruth: "NONE", ownerUserId: userB },
+    { orderId: "ORD-G5-B2", state: "SUBMITTED", providerTruth: "NONE", ownerUserId: userB },
+    { orderId: "ORD-G5-B3", state: "UNKNOWN", providerTruth: "NONE", ownerUserId: userB },
+  ]);
+  const bundleA = await ctxOf(t, userA, "IK-GATE-5A");
+  const bundleB = await ctxOf(t, userB, "IK-GATE-5B");
+  const verdictA = evaluateRisk(cleanProposal, bundleA.ctx, FIXTURE_APPROVED);
+  await seedAuthorization(t, { authorizationId: "AUTH-G5", ownerUserId: userA });
+  const placed = await asA.mutation(api.workflows.placeOrder, placeArgs("AUTH-G5", "IK-GATE-5P"));
+  check(
+    "DB-GATE-005 cross-customer records never leak into another customer's decision",
+    bundleA.ctx.unresolvedOrders === 0 &&
+      bundleB.ctx.unresolvedOrders === 3 &&
+      !verdictA.checks.some((c) => c.check === "reconciliation_state" && c.status !== "PASS") &&
+      placed.state === "ACKNOWLEDGED",
+    JSON.stringify({ a: bundleA.ctx.unresolvedOrders, b: bundleB.ctx.unresolvedOrders, placed: placed.state }),
+  );
+}
+
+{
+  const t = fresh();
+  const { userA } = await seedWorkspace(t, "ACK");
+  const asA = t.withIdentity({ subject: userA });
+  // No ownerUserId -> shared SYSTEM record: in EVERY scope (canViewRecord).
+  await insertOrderRows(t, [{ orderId: "ORD-G5-SHARED", state: "SUBMITTED", providerTruth: "NONE" }]);
+  await seedAuthorization(t, { authorizationId: "AUTH-G5S", ownerUserId: userA });
+  const bundle = await ctxOf(t, userA, "IK-GATE-5S");
+  const placed = await asA.mutation(api.workflows.placeOrder, placeArgs("AUTH-G5S", "IK-GATE-5SP"));
+  check(
+    "DB-GATE-005b a shared SYSTEM unresolved submission is in every scope and blocks (fail closed)",
+    bundle.ctx.unresolvedOrders === 1 &&
+      placed.state === "REJECTED" &&
+      placed.note.includes("reconciliation_state"),
+    JSON.stringify({ count: bundle.ctx.unresolvedOrders, placed: placed.state }),
+  );
+}
+
+{
+  const t = fresh();
+  const { userA } = await seedWorkspace(t, "ACK");
+  const rows: OrderRow[] = [];
+  for (let i = 0; i < 2000; i++)
+    rows.push({ orderId: `ORD-G6-${i}`, state: "SUBMITTING", providerTruth: "NONE", ownerUserId: userA });
+  await insertOrderRows(t, rows);
+  const bundle = await ctxOf(t, userA, "IK-GATE-6");
+  const verdict = evaluateRisk(cleanProposal, bundle.ctx, FIXTURE_APPROVED);
+  check(
+    "DB-GATE-006 a saturated scan is never a complete, safe account state (fail closed)",
+    bundle.ctx.unresolvedOrders === 2000 &&
+      bundle.ctx.accountStateComplete === false &&
+      !vetoAllows(verdict.outcome) &&
+      verdict.checks.some((c) => c.check === "account_state_completeness" && c.status === "UNKNOWN"),
+    JSON.stringify(verdict.checks.filter((c) => c.status !== "PASS")),
+  );
+}
+
+// ---- finding B: exhaustive reconciliation classification -------------------
+
+{
+  const t = fresh();
+  const { userA } = await seedWorkspace(t, "ACK");
+  const asA = t.withIdentity({ subject: userA });
+  await insertOrderRows(t, [
+    { orderId: "ORD-R11-S1", state: "SUBMITTING", providerTruth: "NONE", ownerUserId: userA },
+    { orderId: "ORD-R11-S2", state: "SUBMITTED", providerTruth: "NONE", ownerUserId: userA },
+    { orderId: "ORD-R11-U1", state: "UNKNOWN", providerTruth: "NONE", ownerUserId: userA },
+  ]);
+  const recon = await asA.mutation(api.workflows.reconcile, {});
+  const states = await t.run(async (ctx) => {
+    const all = await ctx.db.query("orders").collect();
+    return Object.fromEntries(all.map((o) => [o.orderId, o.state])) as Record<string, string>;
+  });
+  const byId = (id: string) => recon.unresolved.find((u) => u.orderId === id);
+  check(
+    "DB-RECON-011 an unresolved SUBMITTING order is visible in reconciliation output (never a false healthy)",
+    recon.healthy === false &&
+      byId("ORD-R11-S1")?.category === "PENDING_SUBMISSION" &&
+      states["ORD-R11-S1"] === "SUBMITTING",
+    JSON.stringify(recon),
+  );
+  check(
+    "DB-RECON-012 an unresolved SUBMITTED order is classified and remains until its resolution condition",
+    byId("ORD-R11-S2")?.category === "PENDING_SUBMISSION" &&
+      states["ORD-R11-S2"] === "SUBMITTED" &&
+      recon.unresolved.length === 3,
+    JSON.stringify(recon.unresolved),
+  );
+  check(
+    "DB-RECON-013 an unresolved UNKNOWN order remains unresolved (AMBIGUOUS, never guessed)",
+    byId("ORD-R11-U1")?.category === "AMBIGUOUS" && states["ORD-R11-U1"] === "UNKNOWN",
+    JSON.stringify(byId("ORD-R11-U1")),
+  );
+}
+
+{
+  const t = fresh();
+  const { userA } = await seedWorkspace(t, "ACK");
+  const asA = t.withIdentity({ subject: userA });
+  await insertOrderRows(t, [
+    { orderId: "ORD-R14-S1", state: "SUBMITTING", providerTruth: "ACCEPTED", ownerUserId: userA },
+    { orderId: "ORD-R14-S2", state: "SUBMITTED", providerTruth: "ACCEPTED", ownerUserId: userA },
+    { orderId: "ORD-R14-S3", state: "SUBMITTED", providerTruth: "REJECTED", ownerUserId: userA },
+    { orderId: "ORD-R14-U1", state: "UNKNOWN", providerTruth: "ACCEPTED", ownerUserId: userA },
+    { orderId: "ORD-R14-U2", state: "UNKNOWN", providerTruth: "REJECTED", ownerUserId: userA },
+  ]);
+  const recon = await asA.mutation(api.workflows.reconcile, {});
+  const states = await t.run(async (ctx) => {
+    const all = await ctx.db.query("orders").collect();
+    return Object.fromEntries(all.map((o) => [o.orderId, o.state])) as Record<string, string>;
+  });
+  check(
+    "DB-RECON-014 authoritative accepted/rejected provider evidence resolves every pending state per contract",
+    recon.healthy === true &&
+      recon.scanComplete === true &&
+      recon.resolved.length === 5 &&
+      recon.unresolved.length === 0 &&
+      states["ORD-R14-S1"] === "ACKNOWLEDGED" &&
+      states["ORD-R14-S2"] === "ACKNOWLEDGED" &&
+      states["ORD-R14-S3"] === "REJECTED" &&
+      states["ORD-R14-U1"] === "ACKNOWLEDGED" &&
+      states["ORD-R14-U2"] === "REJECTED",
+    JSON.stringify({ recon, states }),
+  );
+}
+
+{
+  const t = fresh();
+  const { userA } = await seedWorkspace(t, "ACK");
+  const asA = t.withIdentity({ subject: userA });
+  await insertOrderRows(t, [
+    { orderId: "ORD-R15-C1", state: "UNKNOWN", providerTruth: "REJECTED", ownerUserId: userA, fillQuantity: 1, fillPrice: CLOSE },
+    { orderId: "ORD-R15-C2", state: "SUBMITTED", providerTruth: "ACCEPTED", ownerUserId: userA, quantity: 1, fillQuantity: 99, fillPrice: CLOSE },
+    { orderId: "ORD-R15-C3", state: "UNKNOWN", providerTruth: "ACCEPTED", ownerUserId: userA, fillQuantity: 1, fillPrice: 0 },
+  ]);
+  const recon = await asA.mutation(api.workflows.reconcile, {});
+  const states = await t.run(async (ctx) => {
+    const all = await ctx.db.query("orders").collect();
+    return Object.fromEntries(all.map((o) => [o.orderId, o.state])) as Record<string, string>;
+  });
+  check(
+    "DB-RECON-015 missing or contradictory evidence never manufactures a terminal result",
+    recon.healthy === false &&
+      recon.resolved.length === 0 &&
+      recon.unresolved.length === 3 &&
+      recon.unresolved.every((u) => u.category === "CONTRADICTORY_EVIDENCE") &&
+      states["ORD-R15-C1"] === "UNKNOWN" &&
+      states["ORD-R15-C2"] === "SUBMITTED" &&
+      states["ORD-R15-C3"] === "UNKNOWN",
+    JSON.stringify({ recon, states }),
+  );
+}
+
+{
+  const t = fresh();
+  const { userA } = await seedWorkspace(t, "ACK");
+  const asA = t.withIdentity({ subject: userA });
+  const rows: OrderRow[] = [];
+  for (let i = 0; i < 2000; i++)
+    rows.push({ orderId: `ORD-R16-${i}`, state: "SUBMITTING", providerTruth: "NONE", ownerUserId: userA });
+  await insertOrderRows(t, rows);
+  const recon = await asA.mutation(api.workflows.reconcile, {});
+  const run = await t.run(async (ctx) =>
+    ctx.db
+      .query("auditEvents")
+      .filter((q) => q.eq(q.field("action"), "RECONCILIATION_RUN"))
+      .first(),
+  );
+  check(
+    "DB-RECON-016 a saturated scan reports incomplete/degraded health, never fully healthy",
+    recon.healthy === false &&
+      recon.scanComplete === false &&
+      recon.unresolved.length === 2000 &&
+      (run?.detail ?? "").includes("INCOMPLETE SCAN"),
+    JSON.stringify({ healthy: recon.healthy, scanComplete: recon.scanComplete, n: recon.unresolved.length }),
+  );
+}
+
+{
+  const t = fresh();
+  const { userA } = await seedWorkspace(t, "TIMEOUT");
+  const asA = t.withIdentity({ subject: userA });
+  await seedAuthorization(t, { authorizationId: "AUTH-R17", ownerUserId: userA });
+  await asA.mutation(api.workflows.placeOrder, placeArgs("AUTH-R17", "IK-R17"));
+  const snapshotOf = async () =>
+    await t.run(async (ctx) => ({
+      positions: await ctx.db.query("positions").collect(),
+      accounts: await ctx.db.query("riskAccountState").collect(),
+      outcomes: await ctx.db.query("realizedTradeOutcomes").collect(),
+    }));
+  const before = await snapshotOf();
+  const recon1 = await asA.mutation(api.workflows.reconcile, {});
+  const recon2 = await asA.mutation(api.workflows.reconcile, {});
+  const after = await snapshotOf();
+  const order = (await ordersIn(t)).find((o) => o.orderId === "ORD-IK-R17");
+  check(
+    "DB-RECON-017 repeated reconciliation is idempotent: no duplicate fills/accounting, stable transitions",
+    recon1.healthy === true &&
+      recon2.healthy === true &&
+      recon2.resolved.length === 0 &&
+      JSON.stringify(before) === JSON.stringify(after) &&
+      order?.state === "ACKNOWLEDGED" &&
+      order.history.filter((h) => h.note.includes("RECONCILIATION")).length === 1,
+    JSON.stringify({ r1: recon1.resolved, r2: recon2.resolved, state: order?.state }),
+  );
+}
+
+{
+  const t = fresh();
+  const { userA } = await seedWorkspace(t, "ACK");
+  await insertOrderRows(t, [
+    { orderId: "ORD-R18-DONE", state: "UNKNOWN", providerTruth: "ACCEPTED", ownerUserId: userA },
+    { orderId: "ORD-R18-PEND", state: "SUBMITTED", providerTruth: "NONE", ownerUserId: userA },
+  ]);
+  const asA = t.withIdentity({ subject: userA });
+  const recon = await asA.mutation(api.workflows.reconcile, {});
+  const bundle = await ctxOf(t, userA, "IK-R18");
+  check(
+    "DB-RECON-018 reconciliation output agrees with the actual execution gate",
+    recon.healthy === false &&
+      recon.scanComplete === true &&
+      recon.unresolved.length === 1 &&
+      bundle.ctx.unresolvedOrders === recon.unresolved.length,
+    JSON.stringify({ unresolved: recon.unresolved, gate: bundle.ctx.unresolvedOrders }),
+  );
+}
+
+// ---- finding C: owner-scoped loss streak from realized outcomes ------------
+
+{
+  const t = fresh();
+  const { userA } = await seedWorkspace(t, "FILL");
+  const asA = t.withIdentity({ subject: userA });
+  await insertOpenPosition(t, "POS-S1", userA, 110, 1);
+  await seedAuthorization(t, { authorizationId: "AUTH-S1", ownerUserId: userA, side: "SELL", quantity: 1 });
+  await asA.mutation(api.workflows.placeOrder, placeArgs("AUTH-S1", "IK-S1", "SELL", 1));
+  const bundle = await ctxOf(t, userA, "IK-STREAK-1");
+  const rows = await t.run(async (ctx) => ctx.db.query("realizedTradeOutcomes").collect());
+  check(
+    "DB-STREAK-001 a completed losing trade increases the streak",
+    bundle.ctx.consecutiveLosses === 1 &&
+      rows.length === 1 &&
+      rows[0].outcome === "LOSS" &&
+      rows[0].seq === 1 &&
+      rows[0].ownerUserId === userA,
+    JSON.stringify({ streak: bundle.ctx.consecutiveLosses, rows }),
+  );
+}
+
+{
+  const t = fresh();
+  const { userA } = await seedWorkspace(t, "FILL");
+  const asA = t.withIdentity({ subject: userA });
+  await insertOpenPosition(t, "POS-S2", userA, 110, 2);
+  for (const [auth, key] of [["AUTH-S2A", "IK-S2A"], ["AUTH-S2B", "IK-S2B"]] as const) {
+    await seedAuthorization(t, { authorizationId: auth, ownerUserId: userA, side: "SELL", quantity: 1 });
+    await asA.mutation(api.workflows.placeOrder, placeArgs(auth, key, "SELL", 1));
+  }
+  const bundle = await ctxOf(t, userA, "IK-STREAK-2");
+  const rows = await t.run(async (ctx) =>
+    ctx.db.query("realizedTradeOutcomes").order("asc").collect(),
+  );
+  check(
+    "DB-STREAK-002 consecutive losing trades increase the streak correctly",
+    bundle.ctx.consecutiveLosses === 2 && rows.length === 2 && rows[1].seq === 2,
+    JSON.stringify({ streak: bundle.ctx.consecutiveLosses, seqs: rows.map((r) => r.seq) }),
+  );
+}
+
+{
+  const t = fresh();
+  const { userA } = await seedWorkspace(t, "FILL");
+  const asA = t.withIdentity({ subject: userA });
+  await insertOpenPosition(t, "POS-S3", userA, 110, 2);
+  await insertOpenPosition(t, "POS-S3W", userA, 90, 1, 0, "MKT-G2-2");
+  await ensureMarket(t, "MKT-G2-2");
+  await insertMark(t, "MKT-G2-2", CLOSE, 0);
+  for (const [auth, key, market] of [
+    ["AUTH-S3A", "IK-S3A", "MKT-T"],
+    ["AUTH-S3B", "IK-S3B", "MKT-T"],
+    ["AUTH-S3C", "IK-S3C", "MKT-G2-2"],
+  ] as const) {
+    await seedAuthorization(t, {
+      authorizationId: auth, ownerUserId: userA, side: "SELL", quantity: 1, marketId: market,
+    });
+    await asA.mutation(api.workflows.placeOrder, {
+      ...placeArgs(auth, key, "SELL", 1),
+      marketId: market,
+    });
+  }
+  const bundle = await ctxOf(t, userA, "IK-STREAK-3");
+  const rows = await t.run(async (ctx) => ctx.db.query("realizedTradeOutcomes").collect());
+  check(
+    "DB-STREAK-003 a completed winning trade resets the streak (losses since the last win)",
+    bundle.ctx.consecutiveLosses === 0 &&
+      rows.length === 3 &&
+      rows.filter((r) => r.outcome === "LOSS").length === 2 &&
+      rows.filter((r) => r.outcome === "WIN").length === 1,
+    JSON.stringify({ streak: bundle.ctx.consecutiveLosses, rows: rows.map((r) => r.outcome) }),
+  );
+}
+
+{
+  const t = fresh();
+  const { userA } = await seedWorkspace(t, "FILL");
+  const asA = t.withIdentity({ subject: userA });
+  // SELL fills at (CLOSE - CLOSE*0.0005) -> entry 110 realizes a loss; an
+  // entry bit-identical to the fill price realizes exactly 0 = BREAKEVEN
+  // (documented policy: neither extends nor resets the streak — no invented
+  // breakeven epsilon; the entry expression mirrors the fill-price expression
+  // so the breakeven is exact, not approximate).
+  const breakevenEntry = CLOSE - CLOSE * 0.0005;
+  await insertOpenPosition(t, "POS-S4L", userA, 110, 1);
+  await insertOpenPosition(t, "POS-S4B", userA, breakevenEntry, 1, 0, "MKT-G2-2");
+  await ensureMarket(t, "MKT-G2-2");
+  await insertMark(t, "MKT-G2-2", CLOSE, 0);
+  for (const [auth, key, market] of [
+    ["AUTH-S4A", "IK-S4A", "MKT-T"],
+    ["AUTH-S4B", "IK-S4B", "MKT-G2-2"],
+  ] as const) {
+    await seedAuthorization(t, {
+      authorizationId: auth, ownerUserId: userA, side: "SELL", quantity: 1, marketId: market,
+    });
+    await asA.mutation(api.workflows.placeOrder, { ...placeArgs(auth, key, "SELL", 1), marketId: market });
+  }
+  const bundle = await ctxOf(t, userA, "IK-STREAK-4");
+  const rows = await t.run(async (ctx) => ctx.db.query("realizedTradeOutcomes").collect());
+  check(
+    "DB-STREAK-004 a breakeven trade follows the documented policy (neither extends nor resets the streak)",
+    bundle.ctx.consecutiveLosses === 1 &&
+      rows.length === 2 &&
+      rows.some((r) => r.outcome === "BREAKEVEN") &&
+      rows.some((r) => r.outcome === "LOSS"),
+    JSON.stringify({ streak: bundle.ctx.consecutiveLosses, rows: rows.map((r) => r.outcome) }),
+  );
+}
+
+{
+  const t = fresh();
+  const { userA } = await seedWorkspace(t, "PARTIAL");
+  const asA = t.withIdentity({ subject: userA });
+  await insertOpenPosition(t, "POS-S5", userA, 110, 2);
+  await seedAuthorization(t, { authorizationId: "AUTH-S5", ownerUserId: userA, side: "SELL", quantity: 2 });
+  await asA.mutation(api.workflows.placeOrder, placeArgs("AUTH-S5", "IK-S5", "SELL", 2));
+  // Same realization event re-applied (retried mutation / duplicate fill
+  // event) with the SAME stable outcome id -> must never count twice.
+  const replay = await t.run(async (ctx) =>
+    recordRealizedOutcome(ctx, {
+      outcomeId: "OUT-ORD-IK-S5-1",
+      ownerUserId: userA,
+      orderId: "ORD-IK-S5",
+      marketId: "MKT-T",
+      realizedPnl: -10.05,
+      outcome: "LOSS",
+      closedQuantity: 1,
+      at: Date.now(),
+    }),
+  );
+  const bundle = await ctxOf(t, userA, "IK-STREAK-5");
+  const rows = await t.run(async (ctx) => ctx.db.query("realizedTradeOutcomes").collect());
+  const pos = await t.run(async (ctx) => ctx.db.query("positions").first());
+  check(
+    "DB-STREAK-005 partial fills/exits never count the same trade outcome twice (stable event id)",
+    replay.recorded === false &&
+      rows.length === 1 &&
+      bundle.ctx.consecutiveLosses === 1 &&
+      Math.abs((rows[0].realizedPnl ?? 0) - ((pos?.realizedPnl ?? 0) as number)) < 1e-9,
+    JSON.stringify({ replay, rows, realized: pos?.realizedPnl }),
+  );
+}
+
+{
+  const t = fresh();
+  const { userA } = await seedWorkspace(t, "FILL");
+  const asA = t.withIdentity({ subject: userA });
+  await insertOpenPosition(t, "POS-S6", userA, 110, 1);
+  await seedAuthorization(t, { authorizationId: "AUTH-S6", ownerUserId: userA, side: "SELL", quantity: 1 });
+  await asA.mutation(api.workflows.placeOrder, placeArgs("AUTH-S6", "IK-S6", "SELL", 1));
+  const retry = await asA.mutation(api.workflows.placeOrder, placeArgs("AUTH-S6", "IK-S6", "SELL", 1));
+  const rows = await t.run(async (ctx) => ctx.db.query("realizedTradeOutcomes").collect());
+  check(
+    "DB-STREAK-006 a retried mutation (same idempotency key) records exactly one accounting event",
+    retry.deduped === true && rows.length === 1,
+    JSON.stringify({ retry, rows: rows.length }),
+  );
+}
+
+{
+  const t = fresh();
+  const { userA, userB } = await seedWorkspace(t, "FILL");
+  const asB = t.withIdentity({ subject: userB });
+  await insertOpenPosition(t, "POS-S7B", userB, 110, 3);
+  for (let i = 0; i < 3; i++) {
+    await seedAuthorization(t, { authorizationId: `AUTH-S7-${i}`, ownerUserId: userB, side: "SELL", quantity: 1 });
+    await asB.mutation(api.workflows.placeOrder, placeArgs(`AUTH-S7-${i}`, `IK-S7-${i}`, "SELL", 1));
+  }
+  const bundleA = await ctxOf(t, userA, "IK-STREAK-7A");
+  const bundleB = await ctxOf(t, userB, "IK-STREAK-7B");
+  check(
+    "DB-STREAK-007 one customer's results never affect another customer's streak",
+    bundleA.ctx.consecutiveLosses === 0 && bundleB.ctx.consecutiveLosses === 3,
+    JSON.stringify({ a: bundleA.ctx.consecutiveLosses, b: bundleB.ctx.consecutiveLosses }),
+  );
+}
+
+{
+  const t = fresh();
+  const { userA } = await seedWorkspace(t, "FILL");
+  const asA = t.withIdentity({ subject: userA });
+  await insertOpenPosition(t, "POS-S8", userA, 110, 4);
+  for (let i = 0; i < 4; i++) {
+    await seedAuthorization(t, { authorizationId: `AUTH-S8-${i}`, ownerUserId: userA, side: "SELL", quantity: 1 });
+    await asA.mutation(api.workflows.placeOrder, placeArgs(`AUTH-S8-${i}`, `IK-S8-${i}`, "SELL", 1));
+  }
+  const bundle = await ctxOf(t, userA, "IK-STREAK-8");
+  const verdict = evaluateRisk(cleanProposal, bundle.ctx, FIXTURE_APPROVED);
+  check(
+    "DB-STREAK-008 the configured maxConsecutiveLosses threshold (4) actually blocks new risk-increasing action",
+    bundle.ctx.consecutiveLosses === 4 &&
+      verdict.checks.some((c) => c.check === "consecutive_losses" && c.status === "BLOCK") &&
+      !vetoAllows(verdict.outcome),
+    JSON.stringify(verdict.checks.filter((c) => c.status !== "PASS")),
+  );
+}
+
+{
+  const t = fresh();
+  const { userA } = await seedWorkspace(t, "FILL");
+  const asA = t.withIdentity({ subject: userA });
+  await insertOpenPosition(t, "POS-S9", userA, 110, 3);
+  for (let i = 0; i < 3; i++) {
+    await seedAuthorization(t, { authorizationId: `AUTH-S9-${i}`, ownerUserId: userA, side: "SELL", quantity: 1 });
+    await asA.mutation(api.workflows.placeOrder, placeArgs(`AUTH-S9-${i}`, `IK-S9-${i}`, "SELL", 1));
+  }
+  // DELETE the middle outcome row -> the persisted history has a GAP.
+  await t.run(async (ctx) => {
+    const rows = await ctx.db.query("realizedTradeOutcomes").order("asc").collect();
+    await ctx.db.delete(rows[1]._id);
+  });
+  const bundle = await ctxOf(t, userA, "IK-STREAK-9");
+  const verdict = evaluateRisk(cleanProposal, bundle.ctx, FIXTURE_APPROVED);
+  check(
+    "DB-STREAK-009 missing/incomplete outcome history fails safely (never treated as zero losses)",
+    bundle.ctx.accountStateComplete === false &&
+      bundle.ctx.consecutiveLosses > 0 &&
+      !vetoAllows(verdict.outcome) &&
+      verdict.checks.some((c) => c.check === "account_state_completeness" && c.status === "UNKNOWN"),
+    JSON.stringify({ streak: bundle.ctx.consecutiveLosses, complete: bundle.ctx.accountStateComplete }),
+  );
+}
+
+{
+  const t = fresh();
+  const { userA } = await seedWorkspace(t, "ACK");
+  // Saturated outcome history (SCAN_CAP = 2000 losses): the streak is a lower
+  // bound and the read is INCOMPLETE -> fail closed, never a silent zero.
+  await t.run(async (ctx) => {
+    for (let i = 1; i <= 2000; i++) {
+      await ctx.db.insert("realizedTradeOutcomes", {
+        outcomeId: `OUT-SAT-${i}`,
+        ownerUserId: userA,
+        orderId: `ORD-SAT-${i}`,
+        marketId: "MKT-T",
+        realizedPnl: -1,
+        outcome: "LOSS",
+        closedQuantity: 1,
+        seq: i,
+        createdAt: Date.now() - i,
+      });
+    }
+  });
+  const bundle = await ctxOf(t, userA, "IK-STREAK-10");
+  const verdict = evaluateRisk(cleanProposal, bundle.ctx, FIXTURE_APPROVED);
+  check(
+    "DB-STREAK-010 a saturated outcome history reports a lower-bound streak and fails closed",
+    bundle.ctx.consecutiveLosses === 2000 &&
+      bundle.ctx.accountStateComplete === false &&
+      !vetoAllows(verdict.outcome),
+    JSON.stringify({ streak: bundle.ctx.consecutiveLosses, complete: bundle.ctx.accountStateComplete }),
+  );
+}
+
+// ---- finding D: mark-to-market equity, valuation completeness, drawdown ----
+
+{
+  const t = fresh();
+  const { userA } = await seedWorkspace(t, "ACK");
+  const bundle = await ctxOf(t, userA, "IK-EQ-1");
+  const verdict = evaluateRisk(cleanProposal, bundle.ctx, FIXTURE_APPROVED);
+  check(
+    "DB-EQUITY-001 equity with no open positions is the contribution base + realized (valuation complete)",
+    bundle.ctx.equity === 100000 &&
+      bundle.ctx.valuationComplete === true &&
+      verdict.checks.some((c) => c.check === "equity_valuation" && c.status === "PASS") &&
+      verdict.checks.some((c) => c.check === "drawdown" && c.status === "PASS"),
+    JSON.stringify({ equity: bundle.ctx.equity, valuation: bundle.ctx.valuationComplete }),
+  );
+}
+
+{
+  const t = fresh();
+  const { userA } = await seedWorkspace(t, "ACK");
+  await insertOpenPosition(t, "POS-E2", userA, 90, 1); // mark 100 -> +10 unrealized
+  const bundle = await ctxOf(t, userA, "IK-EQ-2");
+  check(
+    "DB-EQUITY-002 equity includes POSITIVE unrealized PnL of an open position (mark-to-market)",
+    bundle.ctx.equity === 100000 + 10 && bundle.ctx.valuationComplete === true,
+    JSON.stringify({ equity: bundle.ctx.equity }),
+  );
+}
+
+{
+  const t = fresh();
+  const { userA } = await seedWorkspace(t, "ACK");
+  await insertOpenPosition(t, "POS-E3", userA, 110, 1); // mark 100 -> -10 unrealized
+  const bundle = await ctxOf(t, userA, "IK-EQ-3");
+  check(
+    "DB-EQUITY-003 equity includes NEGATIVE unrealized PnL of an open position",
+    bundle.ctx.equity === 100000 - 10 && bundle.ctx.valuationComplete === true,
+    JSON.stringify({ equity: bundle.ctx.equity }),
+  );
+}
+
+{
+  // Near the limit: peak 100000, realized -13990, unrealized -10 -> equity
+  // 86000, drawdown 14% (within the declared 15%). Beyond: equity 80000 ->
+  // 20% -> BLOCK. The drawdown basis is mark-to-market equity.
+  const tNear = fresh();
+  const { userA: nearA } = await seedWorkspace(tNear, "ACK");
+  await insertOpenPosition(tNear, "POS-E4N", nearA, 110, 1, -13990);
+  await tNear.run(async (ctx) =>
+    ctx.db.insert("riskAccountState", {
+      ownerUserId: nearA, peakEquity: 100000, updatedAt: Date.now(),
+    }),
+  );
+  const near = await ctxOf(tNear, nearA, "IK-EQ-4N");
+  const nearVerdict = evaluateRisk(cleanProposal, near.ctx, FIXTURE_APPROVED);
+
+  const tOver = fresh();
+  const { userA: overA } = await seedWorkspace(tOver, "ACK");
+  await insertOpenPosition(tOver, "POS-E4O", overA, 110, 1, -19990);
+  await tOver.run(async (ctx) =>
+    ctx.db.insert("riskAccountState", {
+      ownerUserId: overA, peakEquity: 100000, updatedAt: Date.now(),
+    }),
+  );
+  const over = await ctxOf(tOver, overA, "IK-EQ-4O");
+  const overVerdict = evaluateRisk(cleanProposal, over.ctx, FIXTURE_APPROVED);
+  check(
+    "DB-EQUITY-004 drawdown near the limit passes, beyond the limit blocks (mark-to-market basis)",
+    near.ctx.equity === 86000 &&
+      nearVerdict.checks.some((c) => c.check === "drawdown" && c.status === "PASS") &&
+      over.ctx.equity === 80000 &&
+      overVerdict.checks.some((c) => c.check === "drawdown" && c.status === "BLOCK") &&
+      !vetoAllows(overVerdict.outcome),
+    JSON.stringify({ near: near.ctx.equity, over: over.ctx.equity }),
+  );
+}
+
+{
+  const t = fresh();
+  const { userA } = await seedWorkspace(t, "ACK");
+  // Open position on a market with NO price data at all -> the valuation is
+  // honestly INCOMPLETE; the unpriced position is never treated as 0 PnL or
+  // as proof of safety.
+  await insertOpenPosition(t, "POS-E5", userA, 100, 1, 0, "MKT-G2-2");
+  const bundle = await ctxOf(t, userA, "IK-EQ-5");
+  const verdict = evaluateRisk(cleanProposal, bundle.ctx, FIXTURE_APPROVED);
+  check(
+    "DB-EQUITY-005 a missing price marks the valuation incomplete and fails closed",
+    bundle.ctx.valuationComplete === false &&
+      bundle.ctx.equity === 100000 &&
+      verdict.checks.some((c) => c.check === "equity_valuation" && c.status === "UNKNOWN") &&
+      !vetoAllows(verdict.outcome),
+    JSON.stringify({ equity: bundle.ctx.equity, valuation: bundle.ctx.valuationComplete }),
+  );
+}
+
+{
+  const t = fresh();
+  const { userA } = await seedWorkspace(t, "ACK");
+  await insertOpenPosition(t, "POS-E6", userA, 100, 1, 0, "MKT-G2-2");
+  await insertMark(t, "MKT-G2-2", CLOSE, 3 * HOUR); // stale beyond the 2h bound
+  const bundle = await ctxOf(t, userA, "IK-EQ-6");
+  const verdict = evaluateRisk(cleanProposal, bundle.ctx, FIXTURE_APPROVED);
+  check(
+    "DB-EQUITY-006 a stale price is never assumed fresh — valuation incomplete, fail closed",
+    bundle.ctx.valuationComplete === false &&
+      verdict.checks.some((c) => c.check === "equity_valuation" && c.status === "UNKNOWN") &&
+      !vetoAllows(verdict.outcome),
+    JSON.stringify({ valuation: bundle.ctx.valuationComplete }),
+  );
+}
+
+{
+  const t = fresh();
+  const { userA } = await seedWorkspace(t, "ACK");
+  await insertOpenPosition(t, "POS-E7", userA, 100, 1, 0, "MKT-G2-2");
+  await insertMark(t, "MKT-G2-2", 0, 0); // invalid price (non-positive)
+  const bundle = await ctxOf(t, userA, "IK-EQ-7");
+  const verdict = evaluateRisk(cleanProposal, bundle.ctx, FIXTURE_APPROVED);
+  check(
+    "DB-EQUITY-007 an invalid price is never valued — valuation incomplete, fail closed",
+    bundle.ctx.valuationComplete === false &&
+      verdict.checks.some((c) => c.check === "equity_valuation" && c.status === "UNKNOWN") &&
+      !vetoAllows(verdict.outcome),
+    JSON.stringify({ valuation: bundle.ctx.valuationComplete }),
+  );
+}
+
+{
+  const t = fresh();
+  const { userA } = await seedWorkspace(t, "FILL");
+  const asA = t.withIdentity({ subject: userA });
+  await seedAuthorization(t, { authorizationId: "AUTH-E8", ownerUserId: userA, side: "BUY", quantity: 2 });
+  await asA.mutation(api.workflows.placeOrder, placeArgs("AUTH-E8", "IK-E8", "BUY", 2));
+  const o = (await ordersIn(t)).find((x) => x.orderId === "ORD-IK-E8");
+  const bundle = await ctxOf(t, userA, "IK-EQ-8");
+  // Fees are recorded on the order (existing accounting model). Equity is the
+  // documented GROSS figure (realized and unrealized both gross of fees); the
+  // fee is never silently netted into either component.
+  const grossEquity = 100000 + (CLOSE - 100.05) * 2; // unrealized -0.1, realized 0
+  check(
+    "DB-EQUITY-008 fees are recorded per the accounting model and equity stays the documented gross figure",
+    Math.abs((o?.fees ?? 0) - 100.05 * 2 * 0.001) < 1e-9 &&
+      Math.abs(bundle.ctx.equity - grossEquity) < 1e-9 &&
+      bundle.ctx.valuationComplete === true,
+    JSON.stringify({ fees: o?.fees, equity: bundle.ctx.equity }),
+  );
+}
+
+{
+  const t = fresh();
+  const { userA } = await seedWorkspace(t, "ACK");
+  await t.run(async (ctx) =>
+    ctx.db.insert("riskAccountState", {
+      ownerUserId: userA, peakEquity: 101000, updatedAt: Date.now(),
+    }),
+  );
+  // Unpriced open position -> incomplete valuation: the established peak is
+  // NEVER lowered (and never moved) by missing valuation data.
+  await insertOpenPosition(t, "POS-E9", userA, 100, 1, 0, "MKT-G2-2");
+  const missing = await ctxOf(t, userA, "IK-EQ-9M");
+  // A RELIABLE valuation may raise the peak (equity 101020 > 101000).
+  await insertMark(t, "MKT-G2-2", 120, 0);
+  await t.run(async (ctx) => {
+    const pos = (await ctx.db.query("positions").collect()).find((p) => p.positionId === "POS-E9");
+    if (pos) await ctx.db.patch(pos._id, { realizedPnl: 1200 });
+  });
+  const reliable = await ctxOf(t, userA, "IK-EQ-9R");
+  check(
+    "DB-EQUITY-009 peak equity is never lowered by missing valuation data, and may rise on a reliable one",
+    missing.ctx.peakEquity === 101000 &&
+      missing.ctx.valuationComplete === false &&
+      reliable.ctx.valuationComplete === true &&
+      reliable.ctx.equity === 101220 && // 100000 base + 1200 realized + 20 unrealized
+      reliable.ctx.peakEquity === 101220,
+    JSON.stringify({ missing: missing.ctx.peakEquity, reliable: { eq: reliable.ctx.equity, peak: reliable.ctx.peakEquity } }),
+  );
+}
+
+{
+  const t = fresh();
+  const { userA } = await seedWorkspace(t, "ACK");
+  const dayKey = new Date().toISOString().slice(0, 10);
+  await t.run(async (ctx) =>
+    ctx.db.insert("riskAccountState", {
+      ownerUserId: userA, peakEquity: 100000, pnlDay: dayKey, realizedPnlDay: -100, updatedAt: Date.now(),
+    }),
+  );
+  // Open position with LARGE unrealized profit — daily risk stays REALIZED-only.
+  await insertOpenPosition(t, "POS-E10", userA, 100, 100, 0, "MKT-G2-2");
+  await insertMark(t, "MKT-G2-2", 150, 0);
+  const bundle = await ctxOf(t, userA, "IK-EQ-10");
+  check(
+    "DB-EQUITY-010 daily realized PnL remains distinct from unrealized PnL",
+    bundle.ctx.realizedPnlToday === -100 &&
+      bundle.ctx.equity === 100000 + 5000 &&
+      bundle.ctx.valuationComplete === true,
+    JSON.stringify({ today: bundle.ctx.realizedPnlToday, equity: bundle.ctx.equity }),
+  );
+}
+
+{
+  const t = fresh();
+  const { userA } = await seedWorkspace(t, "ACK");
+  // Incomplete POSITION SCAN (bounded read saturation): fail closed — an
+  // incomplete scan is never a complete, safe account state.
+  await insertPositionRows(t, 2000, -1);
+  const bundle = await ctxOf(t, userA, "IK-EQ-11");
+  const verdict = evaluateRisk(cleanProposal, bundle.ctx, FIXTURE_APPROVED);
+  check(
+    "DB-EQUITY-011 an incomplete position scan fails closed (never a safe verdict)",
+    bundle.ctx.accountStateComplete === false &&
+      !vetoAllows(verdict.outcome) &&
+      verdict.checks.some((c) => c.check === "account_state_completeness" && c.status === "UNKNOWN"),
+    JSON.stringify({ complete: bundle.ctx.accountStateComplete }),
+  );
 }
 
 await backendRepairBattery();

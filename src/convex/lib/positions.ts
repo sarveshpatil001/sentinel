@@ -129,3 +129,122 @@ export function fillDelta(
   }
   return Math.max(0, cumulativeFilled - alreadyApplied);
 }
+
+/**
+ * Closed portion of a position for one fill application (the repository's
+ * accounting model realizes PnL per closed portion per fill):
+ *   - SELL against a LONG closes up to the long quantity;
+ *   - BUY against a SHORT closes up to the short quantity;
+ *   - adds/opens (and the reopen leg of an over-close) close nothing.
+ * Pure and validated; invalid input closes nothing (fail closed).
+ */
+export function closedQuantity(position: PositionState | null, fill: Fill): number {
+  if (!position || !Number.isFinite(fill.quantity) || fill.quantity <= 0) return 0;
+  if (!Number.isFinite(position.quantity) || position.quantity <= 0) return 0;
+  if (fill.side === "SELL" && position.side === "LONG") {
+    return Math.min(fill.quantity, position.quantity);
+  }
+  if (fill.side === "BUY" && position.side === "SHORT") {
+    return Math.min(fill.quantity, position.quantity);
+  }
+  return 0;
+}
+
+/**
+ * MARK-TO-MARKET unrealized PnL of one open position at `markPrice`, with the
+ * price-side convention appropriate to the position direction:
+ *   LONG  -> (mark - avgEntry) * qty
+ *   SHORT -> (avgEntry - mark) * qty
+ * Returns null when the position or the mark cannot be valued reliably
+ * (missing/invalid quantity, entry or price). null is NEVER coerced to 0:
+ * an unvalued position must fail the valuation closed at the caller.
+ */
+export function unrealizedPnl(
+  position: { side: PositionSide; quantity: number; avgEntryPrice: number },
+  markPrice: number | null | undefined,
+): number | null {
+  if (!Number.isFinite(markPrice) || (markPrice as number) <= 0) return null;
+  const mark = markPrice as number;
+  if (!Number.isFinite(position.quantity) || position.quantity < 0) return null;
+  if (position.quantity === 0) return 0; // nothing open (any side)
+  if (!Number.isFinite(position.avgEntryPrice) || position.avgEntryPrice <= 0) return null;
+  if (position.side === "LONG") return (mark - position.avgEntryPrice) * position.quantity;
+  if (position.side === "SHORT") return (position.avgEntryPrice - mark) * position.quantity;
+  return null; // unknown side -> not valuable (fail closed)
+}
+
+/**
+ * COMPLETED REALIZED TRADE OUTCOMES (consecutive-loss accounting).
+ *
+ * In this repository's accounting model a "completed realized trade outcome"
+ * is a REALIZATION EVENT: the application of a fill that CLOSES a positive
+ * portion of a position (see closedQuantity), i.e. exactly the moment realized
+ * PnL enters the ledger. Adds/opens produce no outcome. Partial exits across
+ * separate orders are distinct outcomes; re-applying the SAME fill event is
+ * idempotent (stable outcome id) and never counts twice.
+ *
+ * Classification is by the SIGN of the realized delta — no breakeven epsilon
+ * is invented: delta < 0 LOSS, delta > 0 WIN, delta === 0 BREAKEVEN.
+ * Returns null when there is no realization event (nothing closed) or the
+ * accounting inputs are invalid (never fabricated).
+ */
+export type RealizedOutcome = "WIN" | "LOSS" | "BREAKEVEN";
+
+export function classifyRealizedOutcome(
+  realizedDelta: number,
+  closedQty: number,
+): RealizedOutcome | null {
+  if (!Number.isFinite(closedQty) || closedQty <= 0) return null; // no close, no outcome
+  if (!Number.isFinite(realizedDelta)) return null; // corrupt accounting input -> never fabricated
+  if (realizedDelta < 0) return "LOSS";
+  if (realizedDelta > 0) return "WIN";
+  return "BREAKEVEN";
+}
+
+/**
+ * LOSS STREAK POLICY (documented, deterministic):
+ *   - a LOSS outcome extends the streak by 1;
+ *   - a WIN outcome resets the streak to 0;
+ *   - a BREAKEVEN outcome neither extends nor resets it (safer fail-closed
+ *     reading: a scratch trade is no evidence the losing run is over).
+ * The streak is therefore the number of losing outcomes since the most recent
+ * winning outcome.
+ *
+ * `rows` must be ordered NEWEST FIRST and carry a per-owner monotonic `seq`.
+ * Completeness is never assumed:
+ *   - a seq gap (missing outcome history) -> complete: false (fail closed),
+ *   - a non-finite/unknown outcome value  -> complete: false (fail closed),
+ *   - reaching the end of the supplied rows without finding a WIN while
+ *     `historyComplete` is false (the window was truncated by a bounded read)
+ *     -> complete: false: the streak is a LOWER bound and the reported value
+ *     is the counted lower bound — never a silently substituted 0.
+ *
+ * `historyComplete` states whether `rows` IS the owner's complete outcome
+ * history (the caller's bounded read did not saturate).
+ */
+export function computeLossStreak(
+  rows: { seq: number; outcome: string }[],
+  historyComplete: boolean,
+): { streak: number; complete: boolean } {
+  let streak = 0;
+  let expected = rows.length > 0 && Number.isInteger(rows[0].seq) ? rows[0].seq : null;
+  if (rows.length > 0 && expected === null) return { streak: 0, complete: false };
+  for (const row of rows) {
+    if (expected === null || row.seq !== expected) {
+      return { streak, complete: false }; // gap / malformed seq -> unreliable
+    }
+    expected -= 1;
+    if (row.outcome === "WIN") return { streak, complete: true }; // run ends here
+    if (row.outcome === "LOSS") {
+      streak += 1;
+    } else if (row.outcome === "BREAKEVEN") {
+      // neither extends nor resets (policy above)
+    } else {
+      return { streak, complete: false }; // unknown outcome value -> unreliable
+    }
+  }
+  // Reached the end of the supplied rows without a WIN. Complete only when the
+  // caller's read holds the whole history; otherwise the streak is a lower
+  // bound over a truncated window (fail closed upstream).
+  return { streak, complete: historyComplete };
+}

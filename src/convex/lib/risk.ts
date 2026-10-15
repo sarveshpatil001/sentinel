@@ -53,18 +53,37 @@ export interface RiskContext {
   realizedPnlToday: number;
   equity: number;
   peakEquity: number;
+  /**
+   * CURRENT LOSS STREAK: number of losing realized trade outcomes since the
+   * most recent winning outcome (breakeven outcomes neither extend nor reset
+   * it — see lib/positions.ts computeLossStreak). Persisted per owner from
+   * completed realized trade outcomes — never a hardcoded constant.
+   */
   consecutiveLosses: number;
   existingOrderIdempotencyKeys: string[];
   proposalIdempotencyKey: string;
-  /** Orders in UNKNOWN state awaiting reconciliation. > 0 blocks new exposure. */
-  unresolvedUnknownOrders: number;
+  /**
+   * Orders in an UNRESOLVED SUBMISSION state (SUBMITTING/SUBMITTED/UNKNOWN —
+   * see lib/execution.ts UNRESOLVED_SUBMISSION_STATES) awaiting
+   * reconciliation. > 0 blocks new exposure.
+   */
+  unresolvedOrders: number;
   /**
    * False when the account state could NOT be read completely (bounded-scan
-   * saturation at the data layer). Incompleteness must never silently
-   * undercount exposure: false forces an UNKNOWN verdict (no trade).
+   * saturation at the data layer, or a loss streak that could not be derived
+   * reliably from the persisted outcome history). Incompleteness must never
+   * silently undercount exposure: false forces an UNKNOWN verdict (no trade).
    * Omitted = complete (pure-function callers/tests that provide full inputs).
    */
   accountStateComplete?: boolean;
+  /**
+   * False when the MARK-TO-MARKET valuation of open positions could not be
+   * established (missing, stale or invalid prices, or an unbounded market
+   * fan-out). Absent prices are NEVER treated as zero unrealized PnL or as
+   * proof of safety: false forces an UNKNOWN verdict (no new exposure).
+   * Omitted = complete (pure-function callers/tests that provide full inputs).
+   */
+  valuationComplete?: boolean;
 }
 
 export interface TradeProposal {
@@ -198,6 +217,8 @@ function validateInputs(
     problems.push("ctx.existingOrderIdempotencyKeys must be an array of strings");
   if (ctx.accountStateComplete !== undefined && typeof ctx.accountStateComplete !== "boolean")
     problems.push("ctx.accountStateComplete must be a boolean when present");
+  if (ctx.valuationComplete !== undefined && typeof ctx.valuationComplete !== "boolean")
+    problems.push("ctx.valuationComplete must be a boolean when present");
 
   // Numerics — every numeric input passes Number.isFinite (never coerced).
   if (!finite(proposal.quantity) || proposal.quantity <= 0)
@@ -216,8 +237,8 @@ function validateInputs(
     problems.push("ctx.openPositions invalid");
   if (!finite(ctx.consecutiveLosses) || ctx.consecutiveLosses < 0)
     problems.push("ctx.consecutiveLosses invalid");
-  if (!finite(ctx.unresolvedUnknownOrders) || ctx.unresolvedUnknownOrders < 0)
-    problems.push("ctx.unresolvedUnknownOrders invalid");
+  if (!finite(ctx.unresolvedOrders) || ctx.unresolvedOrders < 0)
+    problems.push("ctx.unresolvedOrders invalid");
 
   // Policy shape — malformed policy is reported as policy_validity.
   let malformedPolicy = false;
@@ -316,30 +337,49 @@ export function evaluateRisk(
   }
 
   // --- Reconciliation state ----------------------------------------------
-  // Unresolved UNKNOWN order state makes risk evaluation unreliable; new
-  // exposure is blocked until reconciliation resolves it.
-  if (ctx.unresolvedUnknownOrders > 0) {
+  // An unresolved submission (SUBMITTING/SUBMITTED/UNKNOWN) means the order's
+  // external state is not established and an earlier submission may already
+  // have reached the provider; new exposure is blocked until reconciliation
+  // resolves it (one shared policy with the execution precheck —
+  // lib/execution.ts UNRESOLVED_SUBMISSION_STATES).
+  if (ctx.unresolvedOrders > 0) {
     push(
       "reconciliation_state",
       "BLOCK",
-      `${ctx.unresolvedUnknownOrders} order(s) in UNKNOWN state await reconciliation — new exposure is blocked until external state is known.`,
+      `${ctx.unresolvedOrders} order(s) in an unresolved submission state (SUBMITTING/SUBMITTED/UNKNOWN) await reconciliation — new exposure is blocked until external state is known.`,
     );
   } else {
-    push("reconciliation_state", "PASS", "No unresolved UNKNOWN order state.");
+    push("reconciliation_state", "PASS", "No unresolved submission order state.");
   }
 
   // --- Account-state completeness ---------------------------------------
   // Fail-closed: if the data layer could not establish that risk inputs are
-  // complete (bounded scan saturated), exposure may be undercounted. Unknown
-  // must never become approved.
+  // complete (bounded scan saturated, or the loss streak could not be derived
+  // reliably from the persisted outcome history), exposure may be
+  // undercounted. Unknown must never become approved.
   if (ctx.accountStateComplete === false) {
     push(
       "account_state_completeness",
       "UNKNOWN",
-      "Account state could not be read completely (scan saturation) — exposure may be undercounted; no new exposure until completeness is re-established.",
+      "Account state could not be read completely (bounded-scan saturation or an unestablishable loss-streak history) — exposure may be undercounted; no new exposure until completeness is re-established.",
     );
   } else {
     push("account_state_completeness", "PASS", "Account risk inputs read completely.");
+  }
+
+  // --- Mark-to-market valuation completeness ----------------------------
+  // Fail-closed: absent or stale prices are NEVER treated as zero unrealized
+  // PnL or as proof that the account is safe. When a reliable valuation
+  // cannot be established, equity/drawdown may misstate exposure and the
+  // context is incomplete -> UNKNOWN, no new exposure.
+  if (ctx.valuationComplete === false) {
+    push(
+      "equity_valuation",
+      "UNKNOWN",
+      "Mark-to-market valuation could not be established for every open position (missing, stale or invalid prices) — equity and drawdown may misstate exposure; no new exposure until a reliable valuation exists.",
+    );
+  } else {
+    push("equity_valuation", "PASS", "Mark-to-market equity valuation established from valid, fresh prices.");
   }
 
   // --- Strategy eligibility ----------------------------------------------
@@ -427,6 +467,9 @@ export function evaluateRisk(
     push("daily_loss", "PASS", `Daily loss ${dailyLoss.toFixed(2)} within limit.`);
   }
 
+  // Drawdown from MARK-TO-MARKET equity against the server-maintained peak.
+  // The peak is never lowered by a stale/absent valuation (the data layer
+  // leaves it untouched when the valuation is unreliable).
   const drawdown =
     ctx.peakEquity > 0 ? (ctx.peakEquity - ctx.equity) / ctx.peakEquity : null;
   if (drawdown === null) {
@@ -437,15 +480,26 @@ export function evaluateRisk(
     push("drawdown", "PASS", `Drawdown ${(drawdown * 100).toFixed(1)}% within limit.`);
   }
 
+  // Loss streak from PERSISTED completed realized trade outcomes (owner
+  // scoped; lib/positions.ts computeLossStreak policy). A hard-coded or
+  // silently-substituted zero can never disable this protection.
   if (
     policy.limits.maxConsecutiveLosses !== null &&
     ctx.consecutiveLosses >= policy.limits.maxConsecutiveLosses
   ) {
-    push("consecutive_losses", "BLOCK", `${ctx.consecutiveLosses} consecutive losses at limit.`);
+    push(
+      "consecutive_losses",
+      "BLOCK",
+      `Loss streak ${ctx.consecutiveLosses} (losing realized outcomes since the last winning outcome) at limit ${policy.limits.maxConsecutiveLosses}.`,
+    );
   } else if (policy.limits.maxConsecutiveLosses === null) {
     push("consecutive_losses", "UNKNOWN", "No consecutive-loss limit declared in policy.");
   } else {
-    push("consecutive_losses", "PASS", `${ctx.consecutiveLosses} consecutive losses within limit.`);
+    push(
+      "consecutive_losses",
+      "PASS",
+      `Loss streak ${ctx.consecutiveLosses} (losing realized outcomes since the last winning outcome) within limit ${policy.limits.maxConsecutiveLosses}.`,
+    );
   }
 
   // --- Duplicate order protection ---------------------------------------

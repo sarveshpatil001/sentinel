@@ -465,10 +465,15 @@ const schema = defineSchema(
       .index("by_orderId", ["orderId"])
       .index("by_idempotencyKey", ["idempotencyKey"])
       .index("by_ownerUserId", ["ownerUserId"])
-      // Exhaustive state lookup (UNKNOWN exposure gate, reconciliation):
+      // Exhaustive state lookup (global release gate, reconciliation scans):
       // indexed existence checks stay complete at any table size — safety
       // decisions must never depend on a bounded scan.
-      .index("by_state", ["state"]),
+      .index("by_state", ["state"])
+      // PER-OWNER, PER-STATE lookup (the unresolved-submission gate and the
+      // reconciliation scan): own + shared SYSTEM rows are read through this
+      // index, so another customer's row volume can never degrade this
+      // scope's scan completeness (same doctrine as positions.by_owner_market).
+      .index("by_owner_state", ["ownerUserId", "state"]),
 
     positions: defineTable({
       positionId: v.string(),
@@ -796,6 +801,38 @@ const schema = defineSchema(
       realizedPnlDay: v.optional(v.number()),
       updatedAt: v.number(),
     }).index("by_ownerUserId", ["ownerUserId"]),
+
+    // -----------------------------------------------------------------------
+    // REALIZED TRADE OUTCOMES (owner-scoped loss-streak accounting).
+    //
+    // Source of truth for completed realized trade outcomes: one row per
+    // REALIZATION EVENT (the application of a fill that closes a positive
+    // portion of a position — see lib/positions.ts), written in the SAME
+    // transaction as the position/ledger accounting it belongs to.
+    //
+    // Idempotency: `outcomeId` is a STABLE event identifier (order id +
+    // cumulative applied fill quantity), so repeated fills, retried mutations
+    // and repeated reconciliation can never count the same realized result
+    // more than once. `seq` is a per-owner monotonic sequence used to detect
+    // missing history (gaps fail the streak closed — never a silent zero).
+    // -----------------------------------------------------------------------
+    realizedTradeOutcomes: defineTable({
+      outcomeId: v.string(),
+      ownerUserId: v.string(),
+      orderId: v.string(),
+      marketId: v.string(),
+      // Realized PnL delta of this event (gross of fees, like positions.realizedPnl).
+      realizedPnl: v.number(),
+      outcome: v.union(v.literal("WIN"), v.literal("LOSS"), v.literal("BREAKEVEN")),
+      // Closed quantity of this realization event (auditability of partial exits).
+      closedQuantity: v.number(),
+      // Per-owner monotonic sequence (1, 2, 3, ...) — gap detection.
+      seq: v.number(),
+      createdAt: v.number(),
+    })
+      .index("by_owner_seq", ["ownerUserId", "seq"])
+      .index("by_outcomeId", ["outcomeId"])
+      .index("by_orderId", ["orderId"]),
 
     // -----------------------------------------------------------------------
     // SYSTEM STATE — mode, kill switch, controlled-live gates (Section 30)
