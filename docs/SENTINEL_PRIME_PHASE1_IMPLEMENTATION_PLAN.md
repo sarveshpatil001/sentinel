@@ -4,6 +4,10 @@
 Date: 2026-10-15. Phase: PLANNING ONLY — **no source code was modified** for this
 deliverable (this document is the only file created).
 
+> **STATUS UPDATE 2026-10-15:** Step 0 (G1 hotfix) has been IMPLEMENTED and
+> verified — see `docs/SENTINEL_PRIME_G1_HOTFIX_REPORT.md`. Steps 1–6 remain
+> unimplemented; G2+ untouched as instructed.
+
 Core product principle preserved throughout:
 **One product. Many customers. Multiple supported markets. Multiple supported
 providers. One trustworthy analysis experience.**
@@ -519,12 +523,18 @@ engine behavior, authorization lifecycle, credential secrecy, honest labels).
 
 ## 6. Ordered implementation plan (dependencies + acceptance criteria)
 
-**Step 0 — Immediate security fix (no schema change). P0.**
+**Step 0 — Immediate security fix. P0. — ✅ DONE 2026-10-15**
 Fix G1: validate `orderId` existence + ownership in `recordLearningEvent`;
 re-check parent `canViewRecord` in `proposeCandidateVersion`; reject cross-tenant
 genealogy. *Depends on*: nothing. *Acceptance*: `DB-TENANT-003` passes; new
 rows cannot reference foreign orders; existing tests green; ordering before
 everything else because it is exploitable today by any two registered users.
+**Implemented** (report: `docs/SENTINEL_PRIME_G1_HOTFIX_REPORT.md`): ownership
+checks at both boundaries + `orders.by_orderId` index + collision-proof
+`learningEventId` (the tests exposed a same-millisecond cross-user id
+collision on the destination record) + denial audits; regression battery
+`DB-G1-001..010` (covers the planned `DB-TENANT-003` semantics). Verified:
+codegen/tsc/lint/build exit 0; full suite 348 checks, 0 failures.
 
 **Step 1 — Tenancy foundation. P0.**
 Tables `tenants`/`memberships`/`tenantState`; `tenantId` columns + indexes;

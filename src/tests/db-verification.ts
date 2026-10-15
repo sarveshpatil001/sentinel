@@ -1645,6 +1645,10 @@ async function seedUsers(t: T) {
     orderId: order.orderId ?? undefined, failureClass: "REGIME_SHIFT",
     analysis: "Isolated test analysis", hypothesis: "Isolated candidate hypothesis",
   });
+  // G1 hotfix: recordLearningEvent now returns a discriminated result and
+  // rejects missing/foreign order references. The fixture's own order must
+  // still yield a learning event (same-customer behavior preserved).
+  if (!learning.learningEventId) throw new Error("Learning-event fixture failed; candidate lifecycle cannot be tested.");
   const original = (await asA.query(api.console.strategies)).versions.find((v) => v.strategyVersionId === "SV-T");
   const denied = await asB.mutation(api.workflows.proposeCandidateVersion, { learningEventId: learning.learningEventId, params: { fast: 3 } });
   const candidate = await asA.mutation(api.workflows.proposeCandidateVersion, {
@@ -2459,6 +2463,231 @@ async function backendRepairBattery() {
       !dump.includes("sk_live") && !dump.includes("api_key") && !dump.includes("Bearer ") &&
       !dump.includes("secret"));
   }
+}
+
+// ---------------------------------------------------------------------------
+// DB-G1-* — G1 HOTFIX REGRESSION: cross-customer strategy-disclosure.
+// Before the fix: (a) recordLearningEvent accepted ANY orderId with no
+// ownership check, and (b) proposeCandidateVersion followed
+// learning.sourceOrderId to a foreign order's parent strategy version with no
+// visibility check, copying the parent's private definition
+// (entry/exit/filters/sizing) into an attacker-owned record. Order ids are
+// predictable (ORD-<idempotencyKey>), so any two registered users could
+// exploit this. These checks exercise the real handlers with real identities.
+// ---------------------------------------------------------------------------
+{
+  const t = fresh();
+  const { userA, userB } = await seedWorkspace(t, "ACK");
+  const asA = t.withIdentity({ subject: userA });
+  const asB = t.withIdentity({ subject: userB });
+
+  // Disclosure target: B's PRIVATE strategy version with distinctive marker
+  // parameters, plus B's own order referencing it (the G1 pivot record).
+  await t.run(async (ctx) => {
+    await ctx.db.insert("strategyVersions", {
+      strategyVersionId: "SV-B-PRIV",
+      strategyId: "STRAT-B-PRIV",
+      version: 3,
+      status: "VERSION",
+      immutable: true,
+      definition: {
+        marketId: "MKT-B-PRIV",
+        symbol: "PRIV/X",
+        timeframe: "1h",
+        entry: { indicator: "ema_cross", fast: 131, slow: 277 },
+        exit: { stopLossPct: 0.02, takeProfitPct: 0.02, timeExitBars: 100 },
+        filters: { rsiMin: null, rsiMax: null },
+        sizing: { kind: "fixed_fraction", fraction: 1 },
+      },
+      provenance: {
+        authorType: "HUMAN",
+        authorRef: "test-fixture",
+        rationale: "B private fixture version (G1 disclosure target)",
+        createdAt: Date.now(),
+      },
+      ownerUserId: userB,
+    });
+    await ctx.db.insert("orders", {
+      orderId: "ORD-B-PRIV",
+      idempotencyKey: "IK-ORD-B-PRIV",
+      authorizationId: "AUTH-B-PRIV",
+      proposalId: "PROP-B-PRIV",
+      strategyVersionId: "SV-B-PRIV",
+      marketId: "MKT-T",
+      symbol: "BTC/USD",
+      side: "BUY",
+      quantity: 1,
+      orderType: "MARKET",
+      timeInForce: "GTC",
+      mode: "PAPER",
+      state: "FILLED",
+      history: [{ state: "FILLED", at: Date.now(), note: "G1 fixture (foreign order)" }],
+      ownerUserId: userB,
+      createdAt: Date.now(),
+      updatedAt: Date.now(),
+    });
+  });
+
+  // (1) Legitimate same-customer flow preserved: A's own order -> A's learning
+  // event -> candidate derived from a VISIBLE parent (shared SYSTEM SV-T).
+  await seedAuthorization(t, { authorizationId: "AUTH-G1", ownerUserId: userA });
+  const ownOrder = await asA.mutation(api.workflows.placeOrder, placeArgs("AUTH-G1", "IK-G1"));
+  const ownLearning = await asA.mutation(api.workflows.recordLearningEvent, {
+    orderId: ownOrder.orderId ?? undefined, failureClass: "REGIME_FAILURE",
+    analysis: "G1 own-order analysis", hypothesis: "G1 own-order hypothesis",
+  });
+  const ownCandidate = await asA.mutation(api.workflows.proposeCandidateVersion, {
+    learningEventId: ownLearning.learningEventId ?? "none", params: { fast: 5 },
+  });
+  const versions1 = await t.run(async (ctx) => ctx.db.query("strategyVersions").collect());
+  check("DB-G1-001 owner derives a candidate from their own order and a visible parent (legitimate flow preserved)",
+    ownOrder.orderId !== null && ownLearning.ok !== false && ownCandidate.ok === true &&
+    versions1.some((v) => ownCandidate.ok && v.strategyVersionId === ownCandidate.strategyVersionId &&
+      v.ownerUserId === userA && v.parentVersionId === "SV-T"));
+
+  // (2) Customer A cannot use Customer B's order id to disclose strategy
+  // parameters: rejected at recordLearningEvent, before anything is stored.
+  const foreignRef = await asA.mutation(api.workflows.recordLearningEvent, {
+    orderId: "ORD-B-PRIV", failureClass: "REGIME_FAILURE",
+    analysis: "G1 probe", hypothesis: "G1 probe",
+  });
+  check("DB-G1-002 referencing a foreign order id is rejected before storage (no strategy disclosure)",
+    foreignRef.ok === false && foreignRef.learningEventId === null &&
+    !JSON.stringify(foreignRef).includes("131") && !JSON.stringify(foreignRef).includes("PRIV"));
+
+  // (4) Missing records are rejected SAFELY and indistinguishably (no ID
+  // oracle: missing ≡ foreign), and no learning row is created for either.
+  const missingRef = await asA.mutation(api.workflows.recordLearningEvent, {
+    orderId: "ORD-DOES-NOT-EXIST", failureClass: "REGIME_FAILURE",
+    analysis: "G1 probe", hypothesis: "G1 probe",
+  });
+  const learningRows = await t.run(async (ctx) => ctx.db.query("learningEvents").collect());
+  check("DB-G1-003 missing and foreign order references are indistinguishable and nothing is stored",
+    JSON.stringify(foreignRef) === JSON.stringify(missingRef) &&
+    missingRef.ok === false && learningRows.length === 1);
+
+  // Defense in depth: a legacy/pre-fix learning row that already references a
+  // foreign order (inserted directly, bypassing the fixed mutation) must still
+  // be refused at the derivation boundary — before any parameter is copied.
+  await t.run(async (ctx) =>
+    ctx.db.insert("learningEvents", {
+      learningEventId: "LEARN-G1-LEGACY",
+      sourceOrderId: "ORD-B-PRIV",
+      failureClass: "REGIME_FAILURE",
+      analysis: "legacy row referencing a foreign order",
+      hypothesis: "legacy row",
+      liveMutationAttempted: false,
+      ownerUserId: userA,
+      createdAt: Date.now(),
+    }),
+  );
+  const deriveForeign = await asA.mutation(api.workflows.proposeCandidateVersion, {
+    learningEventId: "LEARN-G1-LEGACY", params: { fast: 9 },
+  });
+  const versions2 = await t.run(async (ctx) => ctx.db.query("strategyVersions").collect());
+  check("DB-G1-004 a learning row pivoting to a foreign order cannot reach the parent definition (defense in depth)",
+    deriveForeign.ok === false && !JSON.stringify(deriveForeign).includes("131") &&
+    !JSON.stringify(deriveForeign).includes("PRIV") && !versions2.some((v) => v.parentVersionId === "SV-B-PRIV"));
+
+  // (3) Customer A cannot reference Customer B's strategy version, even when
+  // the pivot order is A's OWN but its strategyVersionId points at B's private
+  // version (inconsistent association) — the parent visibility re-check holds.
+  await t.run(async (ctx) =>
+    ctx.db.insert("orders", {
+      orderId: "ORD-A-MISLINKED",
+      idempotencyKey: "IK-ORD-A-MISLINKED",
+      authorizationId: "AUTH-A-MISLINKED",
+      proposalId: "PROP-A-MISLINKED",
+      strategyVersionId: "SV-B-PRIV",
+      marketId: "MKT-T",
+      symbol: "BTC/USD",
+      side: "BUY",
+      quantity: 1,
+      orderType: "MARKET",
+      timeInForce: "GTC",
+      mode: "PAPER",
+      state: "FILLED",
+      history: [{ state: "FILLED", at: Date.now(), note: "G1 fixture (own order, foreign parent)" }],
+      ownerUserId: userA,
+      createdAt: Date.now(),
+      updatedAt: Date.now(),
+    }),
+  );
+  const mislinkedLearning = await asA.mutation(api.workflows.recordLearningEvent, {
+    orderId: "ORD-A-MISLINKED", failureClass: "REGIME_FAILURE",
+    analysis: "G1 mislinked analysis", hypothesis: "G1 mislinked hypothesis",
+  });
+  const deriveMislinked = await asA.mutation(api.workflows.proposeCandidateVersion, {
+    learningEventId: mislinkedLearning.learningEventId ?? "none", params: {},
+  });
+  check("DB-G1-005 an own order pointing at a foreign strategy version cannot copy its parameters",
+    mislinkedLearning.ok !== false && deriveMislinked.ok === false &&
+    !JSON.stringify(deriveMislinked).includes("131") && !JSON.stringify(deriveMislinked).includes("PRIV"));
+
+  // (4 continued) Missing and unauthorized LEARNING records are rejected with
+  // indistinguishable responses (existing no-oracle rule kept as regression).
+  const bLearning = await asB.mutation(api.workflows.recordLearningEvent, {
+    orderId: "ORD-B-PRIV", failureClass: "REGIME_FAILURE",
+    analysis: "B own analysis", hypothesis: "B own hypothesis",
+  });
+  const foreignLearning = await asA.mutation(api.workflows.proposeCandidateVersion, {
+    learningEventId: bLearning.learningEventId ?? "none", params: { fast: 1 },
+  });
+  const missingLearning = await asA.mutation(api.workflows.proposeCandidateVersion, {
+    learningEventId: "LEARN-DOES-NOT-EXIST", params: { fast: 1 },
+  });
+  check("DB-G1-006 foreign and missing learning events are rejected with indistinguishable responses",
+    bLearning.ok !== false && foreignLearning.ok === false && missingLearning.ok === false &&
+    foreignLearning.reason === missingLearning.reason &&
+    // Destination-record identity is collision-proof across users even when
+    // both events are created in the same millisecond.
+    bLearning.learningEventId !== mislinkedLearning.learningEventId &&
+    !JSON.stringify(foreignLearning).includes("131"));
+
+  // (1 continued) B's own flow on their OWN private parent still works — the
+  // fix narrows cross-customer access only, never same-customer behavior.
+  const bCandidate = await asB.mutation(api.workflows.proposeCandidateVersion, {
+    learningEventId: bLearning.learningEventId ?? "none", params: { fast: 7 },
+  });
+  const versions3 = await t.run(async (ctx) => ctx.db.query("strategyVersions").collect());
+  check("DB-G1-007 the owner derives from their own private parent (same-customer behavior preserved)",
+    bCandidate.ok === true && versions3.some((v) => bCandidate.ok &&
+      v.strategyVersionId === bCandidate.strategyVersionId &&
+      v.ownerUserId === userB && v.parentVersionId === "SV-B-PRIV"));
+
+  // Authentication is not weakened: signed-out callers still cannot record
+  // learning events or derive candidates.
+  const anonLearning = await t.mutation(api.workflows.recordLearningEvent, {
+    orderId: "ORD-B-PRIV", failureClass: "REGIME_FAILURE", analysis: "x", hypothesis: "x",
+  }).catch((e: unknown) => e);
+  const anonCandidate = await t.mutation(api.workflows.proposeCandidateVersion, {
+    learningEventId: "LEARN-G1-LEGACY", params: {},
+  }).catch((e: unknown) => e);
+  check("DB-G1-008 signed-out callers cannot record learning events or derive candidates",
+    anonLearning instanceof Error && anonLearning.message.includes("UNAUTHENTICATED") &&
+    anonCandidate instanceof Error && anonCandidate.message.includes("UNAUTHENTICATED"));
+
+  // Audit trail is not weakened: both denial paths are recorded, and the
+  // DENIAL records themselves carry no private parameters. (Scoped to the
+  // denial records on purpose: B's own successful derivation legitimately
+  // names B's own record ids in its audit entry — that is not a leak — and
+  // timestamp digits can coincidentally contain any 3-digit string.)
+  const denials = await t.run(async (ctx) =>
+    (await ctx.db.query("auditEvents").collect()).filter(
+      (a) => a.action === "LEARNING_EVENT_DENIED" || a.action === "CANDIDATE_CREATION_DENIED",
+    ),
+  );
+  check("DB-G1-009 denials are recorded in the audit trail without leaking private parameters",
+    denials.some((a) => a.action === "LEARNING_EVENT_DENIED") &&
+    denials.some((a) => a.action === "CANDIDATE_CREATION_DENIED") &&
+    !denials.some((a) =>
+      a.detail.includes("131") || a.detail.includes("277") ||
+      a.detail.includes("PRIV") || a.resourceId.includes("PRIV")));
+  // And no audit record anywhere contains B's private DEFINITION PARAMETER
+  // values (fixed fixture numbers), whatever the actor.
+  const auditAll = await t.run(async (ctx) => ctx.db.query("auditEvents").collect());
+  check("DB-G1-010 no audit record contains private strategy definition parameters",
+    !auditAll.some((a) => a.detail.includes("131") || a.detail.includes("277")));
 }
 
 await backendRepairBattery();

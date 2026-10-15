@@ -20,6 +20,7 @@ import { CostModel, StrategyDefinition } from "./lib/backtest";
 import { runValidationPipeline, SnapshotBinding } from "./lib/pipeline";
 import { validateAuthorizationScope, runPrechecks, normalizeProviderResponse, OrderIntent, OrderState } from "./lib/execution";
 import { canUseAuthorization, canViewRecord, requireRole } from "./lib/authz";
+import { sha256Hex } from "./lib/audit";
 import { applyFill, fillDelta, PositionState } from "./lib/positions";
 
 const HOUR = 3600_000;
@@ -938,7 +939,57 @@ export const recordLearningEvent = mutation({
   handler: async (ctx, args) => {
     const userId = await requireUser(ctx);
     const now = Date.now();
-    const learningEventId = `LEARN-${now}`;
+    // OWNERSHIP (G1 hotfix): a learning event may only reference an order the
+    // caller may view — their OWN order or a shared SYSTEM record. A missing,
+    // foreign-owned, or unresolvable order is rejected BEFORE anything is
+    // stored and BEFORE any private strategy parameters can be reached. The
+    // client-supplied order id is a REFERENCE, never proof of ownership — the
+    // caller's rights are recomputed server-side from stored ownership fields.
+    // Missing and foreign orders get the SAME sanitized response (no ID
+    // oracle); both are audited as denied.
+    const referencedOrderId = args.orderId;
+    if (referencedOrderId !== undefined) {
+      const referencedOrder = await ctx.db
+        .query("orders")
+        .withIndex("by_orderId", (q) => q.eq("orderId", referencedOrderId))
+        .first();
+      if (!referencedOrder || !canViewRecord(referencedOrder.ownerUserId, userId)) {
+        await appendAudit(
+          ctx,
+          {
+            actor: `user:${userId}`,
+            actorType: "USER",
+            action: "LEARNING_EVENT_DENIED",
+            resourceType: "learningEvent",
+            resourceId: "none",
+            outcome: "DENIED",
+            correlationId: `LEARN-${now}`,
+            detail:
+              "Refused: the referenced order is not resolvable for this caller (missing or not owned). Nothing stored.",
+          },
+          now,
+        );
+        return {
+          ok: false as const,
+          learningEventId: null as string | null,
+          reason: "Order not found.",
+        };
+      }
+    }
+    // Collision-proof destination-record identity: `LEARN-<ms>` alone collides
+    // when two events are created in the same millisecond (even by different
+    // callers), which would make the destination record ambiguous across users.
+    // The id binds the server-derived owner and probes for clashes (the
+    // analysis.ts executeAnalysis precedent).
+    let learningEventId = `LEARN-${now}-${sha256Hex(`${userId}|${referencedOrderId ?? ""}|${now}`).slice(0, 12)}`;
+    for (let i = 2; i <= 10; i++) {
+      const clash = await ctx.db
+        .query("learningEvents")
+        .withIndex("by_learningEventId", (q) => q.eq("learningEventId", learningEventId))
+        .first();
+      if (clash === null) break;
+      learningEventId = `LEARN-${now}-${sha256Hex(`${userId}|${referencedOrderId ?? ""}|${now}|${i}`).slice(0, 12)}`;
+    }
     await ctx.db.insert("learningEvents", {
       learningEventId,
       sourceOrderId: args.orderId,
@@ -963,7 +1014,7 @@ export const recordLearningEvent = mutation({
       },
       now,
     );
-    return { learningEventId };
+    return { ok: true as const, learningEventId };
   },
 });
 
@@ -999,10 +1050,18 @@ export const proposeCandidateVersion = mutation({
       return { ok: false as const, reason: "Learning event not found." };
     }
 
-    const sourceOrder = learning.sourceOrderId
+    // OWNERSHIP (G1 hotfix): every record on the path to the COPIED definition
+    // must be visible to the caller — the source order AND the parent strategy
+    // version. A missing, foreign-owned, or inconsistent record fails with the
+    // SAME sanitized response (no ID oracle) BEFORE any private strategy
+    // parameter is read or copied. Record ids are REFERENCES, never proof of
+    // ownership; rights are recomputed server-side from stored ownership
+    // fields. Indexed order lookup keeps the check complete at any table size.
+    const sourceOrderId = learning.sourceOrderId;
+    const sourceOrder = sourceOrderId
       ? await ctx.db
           .query("orders")
-          .filter((q) => q.eq(q.field("orderId"), learning.sourceOrderId))
+          .withIndex("by_orderId", (q) => q.eq("orderId", sourceOrderId))
           .first()
       : null;
     const parent = sourceOrder
@@ -1011,7 +1070,27 @@ export const proposeCandidateVersion = mutation({
           .withIndex("by_versionId", (q) => q.eq("strategyVersionId", sourceOrder.strategyVersionId))
           .first()
       : null;
-    if (!parent) {
+    if (
+      (sourceOrderId !== undefined &&
+        (!sourceOrder || !canViewRecord(sourceOrder.ownerUserId, userId))) ||
+      !parent ||
+      !canViewRecord(parent.ownerUserId, userId)
+    ) {
+      await appendAudit(
+        ctx,
+        {
+          actor: `user:${userId}`,
+          actorType: "USER",
+          action: "CANDIDATE_CREATION_DENIED",
+          resourceType: "strategyVersion",
+          resourceId: "none",
+          outcome: "DENIED",
+          correlationId: args.learningEventId,
+          detail:
+            "Refused: the source order or parent strategy version is not resolvable for this caller (missing, foreign-owned, or inconsistent). No definition read, nothing created.",
+        },
+        now,
+      );
       return { ok: false as const, reason: "No parent strategy version identifiable — candidate creation refused (no guessing)." };
     }
 

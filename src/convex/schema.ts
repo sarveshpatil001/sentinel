@@ -459,6 +459,10 @@ const schema = defineSchema(
       createdAt: v.number(),
       updatedAt: v.number(),
     })
+      // Exact order-id lookup (learning-event / candidate-derivation ownership
+      // checks): indexed lookups stay complete at any table size — an
+      // ownership check must never depend on a filtered scan.
+      .index("by_orderId", ["orderId"])
       .index("by_idempotencyKey", ["idempotencyKey"])
       .index("by_ownerUserId", ["ownerUserId"])
       // Exhaustive state lookup (UNKNOWN exposure gate, reconciliation):
